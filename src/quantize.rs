@@ -7,10 +7,10 @@
 // Media Patent License 1.0 was not distributed with this source code in the
 // PATENTS file, you can obtain it at www.aomedia.org/license/patent.
 
-#![cfg_attr(feature = "cargo-clippy", allow(cast_lossless))]
 #![allow(non_upper_case_globals)]
 
-use partition::TxSize;
+use crate::partition::TxSize;
+use crate::util::*;
 
 use num_traits::*;
 use std::convert::Into;
@@ -18,7 +18,7 @@ use std::mem;
 use std::ops::AddAssign;
 
 pub trait Coefficient:
-  PrimInt + Into<i32> + AsPrimitive<i32> + AddAssign + Signed + 'static {}
+  PrimInt + Into<i32> + AsPrimitive<i32> + CastFromPrimitive<i32> + AddAssign + Signed + 'static {}
 impl Coefficient for i16 {}
 impl Coefficient for i32 {}
 
@@ -50,6 +50,51 @@ pub fn ac_q(qindex: u8, delta_q: i8, bit_depth: usize) -> i16 {
   table[(qindex as isize + delta_q as isize).max(0).min(255) as usize]
 }
 
+// TODO: Handle lossless properly.
+fn select_qi(quantizer: i64, qlookup: &[i16; QINDEX_RANGE]) -> u8 {
+  if quantizer < qlookup[MINQ] as i64 {
+    MINQ as u8
+  } else if quantizer >= qlookup[MAXQ] as i64 {
+    MAXQ as u8
+  } else {
+    match qlookup.binary_search(&(quantizer as i16)) {
+      Ok(qi) => qi as u8,
+      Err(qi) => {
+        debug_assert!(qi > MINQ);
+        debug_assert!(qi <= MAXQ);
+        // Pick the closest quantizer in the log domain.
+        let qthresh = (qlookup[qi - 1] as i32) * (qlookup[qi] as i32);
+        let q2_i32 = (quantizer as i32) * (quantizer as i32);
+        if q2_i32 < qthresh {
+          (qi - 1) as u8
+        } else {
+          qi as u8
+        }
+      }
+    }
+  }
+}
+
+pub fn select_dc_qi(quantizer: i64, bit_depth: usize) -> u8 {
+  let qlookup = match bit_depth {
+    8 => &dc_qlookup_Q3,
+    10 => &dc_qlookup_10_Q3,
+    12 => &dc_qlookup_12_Q3,
+    _ => unimplemented!()
+  };
+  select_qi(quantizer, qlookup)
+}
+
+pub fn select_ac_qi(quantizer: i64, bit_depth: usize) -> u8 {
+  let qlookup = match bit_depth {
+    8 => &ac_qlookup_Q3,
+    10 => &ac_qlookup_10_Q3,
+    12 => &ac_qlookup_12_Q3,
+    _ => unimplemented!()
+  };
+  select_qi(quantizer, qlookup)
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct QuantizationContext {
   log_tx_scale: usize,
@@ -66,7 +111,7 @@ fn divu_gen(d: u32) -> (u32, u32, u32) {
   let nbits = (mem::size_of_val(&d) as u64) * 8;
   let m = nbits - d.leading_zeros() as u64 - 1;
   if (d & (d - 1)) == 0 {
-    (0xFFFFFFFF, 0xFFFFFFFF, m as u32)
+    (0xFFFF_FFFF, 0xFFFF_FFFF, m as u32)
   } else {
     let d = d as u64;
     let t = (1u64 << (m + nbits)) / d;
@@ -98,7 +143,7 @@ fn divu_pair(x: i32, d: (u32, u32, u32)) -> i32 {
 #[cfg(test)]
 mod test {
   use super::*;
-  use partition::TxSize::*;
+  use crate::partition::TxSize::*;
 
   #[test]
   fn test_divu_pair() {
@@ -166,48 +211,23 @@ impl QuantizationContext {
 
   #[inline]
   pub fn quantize<T>(&self, coeffs: &[T], qcoeffs: &mut [T], coded_tx_size: usize)
-    where T: Coefficient, i32: AsPrimitive<T>
+    where T: Coefficient
   {
     qcoeffs[0] = coeffs[0] << (self.log_tx_scale as usize);
-    qcoeffs[0] += qcoeffs[0].signum() * self.dc_offset.as_();
-    qcoeffs[0] = divu_pair(qcoeffs[0].as_(), self.dc_mul_add).as_();
+    qcoeffs[0] += qcoeffs[0].signum() * T::cast_from(self.dc_offset);
+    qcoeffs[0] = T::cast_from(divu_pair(qcoeffs[0].as_(), self.dc_mul_add));
 
     for (qc, c) in qcoeffs[1..].iter_mut().zip(coeffs[1..].iter()).take(coded_tx_size - 1) {
       *qc = *c << self.log_tx_scale;
-      *qc += qc.signum() * self.ac_offset.as_();
-      *qc = divu_pair((*qc).as_(), self.ac_mul_add).as_();
+      *qc += qc.signum() * T::cast_from(self.ac_offset);
+      *qc = T::cast_from(divu_pair((*qc).as_(), self.ac_mul_add));
     }
 
     if qcoeffs.len() > coded_tx_size {
       for qc in qcoeffs[coded_tx_size..].iter_mut() {
-        *qc = 0.as_();
+        *qc = T::cast_from(0);
       }
     }
-  }
-}
-
-// quantization without using Multiplication Factor
-pub fn quantize_wo_mf(
-  qindex: u8, coeffs: &[i32], qcoeffs: &mut [i32], tx_size: TxSize, bit_depth: usize,
-  dc_delta_q: i8, ac_delta_q: i8
-) {
-  let log_tx_scale = get_log_tx_scale(tx_size);
-
-  let dc_quant = dc_q(qindex, dc_delta_q, bit_depth) as i32;
-  let ac_quant = ac_q(qindex, ac_delta_q, bit_depth) as i32;
-
-  // using 21/64=0.328125 as rounding offset. To be tuned
-  let dc_offset = dc_quant * 21 / 64 as i32;
-  let ac_offset = ac_quant * 21 / 64 as i32;
-
-  qcoeffs[0] = coeffs[0] << log_tx_scale;
-  qcoeffs[0] += qcoeffs[0].signum() * dc_offset;
-  qcoeffs[0] /= dc_quant;
-
-  for (qc, c) in qcoeffs[1..].iter_mut().zip(coeffs[1..].iter()) {
-    *qc = *c << log_tx_scale;
-    *qc += qc.signum() * ac_offset;
-    *qc /= ac_quant;
   }
 }
 
@@ -232,6 +252,7 @@ const MINQ: usize = 0;
 const MAXQ: usize = 255;
 const QINDEX_RANGE: usize = MAXQ - MINQ + 1;
 
+#[rustfmt::skip]
 static dc_qlookup_Q3: [i16;QINDEX_RANGE] = [
   4,    8,    8,    9,    10,  11,  12,  12,  13,  14,  15,   16,   17,   18,
   19,   19,   20,   21,   22,  23,  24,  25,  26,  26,  27,   28,   29,   30,
@@ -254,6 +275,7 @@ static dc_qlookup_Q3: [i16;QINDEX_RANGE] = [
   1184, 1232, 1282, 1336,
 ];
 
+#[rustfmt::skip]
 static dc_qlookup_10_Q3: [i16;QINDEX_RANGE] = [
   4,    9,    10,   13,   15,   17,   20,   22,   25,   28,   31,   34,   37,
   40,   43,   47,   50,   53,   57,   60,   64,   68,   71,   75,   78,   82,
@@ -277,6 +299,7 @@ static dc_qlookup_10_Q3: [i16;QINDEX_RANGE] = [
   3953, 4089, 4236, 4394, 4559, 4737, 4929, 5130, 5347,
 ];
 
+#[rustfmt::skip]
 static dc_qlookup_12_Q3: [i16;QINDEX_RANGE] = [
   4,     12,    18,    25,    33,    41,    50,    60,    70,    80,    91,
   103,   115,   127,   140,   153,   166,   180,   194,   208,   222,   237,
@@ -304,6 +327,7 @@ static dc_qlookup_12_Q3: [i16;QINDEX_RANGE] = [
   19718, 20521, 21387,
 ];
 
+#[rustfmt::skip]
 static ac_qlookup_Q3: [i16;QINDEX_RANGE] = [
   4,    8,    9,    10,   11,   12,   13,   14,   15,   16,   17,   18,   19,
   20,   21,   22,   23,   24,   25,   26,   27,   28,   29,   30,   31,   32,
@@ -327,6 +351,7 @@ static ac_qlookup_Q3: [i16;QINDEX_RANGE] = [
   1567, 1597, 1628, 1660, 1692, 1725, 1759, 1793, 1828,
 ];
 
+#[rustfmt::skip]
 static ac_qlookup_10_Q3: [i16;QINDEX_RANGE] = [
   4,    9,    11,   13,   16,   18,   21,   24,   27,   30,   33,   37,   40,
   44,   48,   51,   55,   59,   63,   67,   71,   75,   79,   83,   88,   92,
@@ -350,6 +375,7 @@ static ac_qlookup_10_Q3: [i16;QINDEX_RANGE] = [
   6268, 6388, 6512, 6640, 6768, 6900, 7036, 7172, 7312,
 ];
 
+#[rustfmt::skip]
 static ac_qlookup_12_Q3: [i16;QINDEX_RANGE] = [
   4,     13,    19,    27,    35,    44,    54,    64,    75,    87,    99,
   112,   126,   139,   154,   168,   183,   199,   214,   230,   247,   263,

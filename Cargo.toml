@@ -2,54 +2,66 @@
 name = "rav1e"
 version = "0.1.0"
 authors = ["Thomas Daede <tdaede@xiph.org>"]
+edition = "2018"
 build = "build.rs"
-include = ["/src/**", "/aom_build/**", "/Cargo.toml"]
+include = ["/src/**", "/Cargo.toml", "/build.rs"]
+license = "BSD-2-Clause"
 autobenches = false
 autobins = false
 
 [features]
-repl = ["rustyline", "binaries"]
-comparative_bench = ["aom"]
-decode_test = ["bindgen", "aom"]
-binaries = ["y4m", "clap"]
-default = ["binaries", "nasm"]
-aom = ["cmake"]
+decode_test = ["aom-sys"]
+decode_test_dav1d = ["dav1d-sys"]
+binaries = ["ivf", "y4m", "clap", "scan_fmt", "serde_json"]
+default = ["binaries", "nasm", "signal_support"]
 nasm = ["nasm-rs"]
+signal_support = ["signal-hook"]
+dump_ivf = ["ivf"]
+quick_test = []
+desync_finder = []
 
 [dependencies]
+arg_enum_proc_macro = "0.1.1"
 bitstream-io = "0.8"
 clap = { version = "2", optional = true, default-features = false }
 libc = "0.2"
-rand = "0.5"
-rustyline = { version = "1", optional = true }
-y4m = { version = "0.3", optional = true }
+y4m = { version = "0.3.2", optional = true }
 backtrace = "0.3"
 syn = "^0.15.20"
 quote = "^0.6.10" # hack for proc-macro-hack
 num-traits = "0.2"
+num-derive = "0.2"
 paste = "0.1"
+serde = "1.0"
+serde_derive = "1.0"
+serde_json = { version = "1.0", optional = true }
+dav1d-sys = { version = "0.2", optional = true }
+aom-sys = { version = "0.1.2", optional = true }
+scan_fmt = { version = "0.2", optional = true }
+ivf = { path = "ivf/", optional = true }
+rayon = "1.0"
+bincode = "1.1"
+arrayvec = "0.4.10"
 
 [build-dependencies]
-cmake = { version = "0.1", optional = true }
-
-[target.'cfg(target_arch = "x86_64")'.build-dependencies]
-nasm-rs = { git = "https://github.com/tdaede/nasm-rs.git", optional = true }
+nasm-rs = { version = "0.1", path = "nasm_rs/", optional = true }
 
 [target.'cfg(unix)'.build-dependencies]
 pkg-config = "0.3.12"
-bindgen = { version = "0.37", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+signal-hook = { version = "0.1.9", optional = true }
 
 [dev-dependencies]
 criterion = "0.2"
+pretty_assertions = "0.6"
+interpolate_name = "0.2.2"
+rand = "0.6"
+rand_chacha = "0.1"
 
 [[bin]]
 name = "rav1e"
 required-features = ["binaries"]
-bench = false
-
-[[bin]]
-name = "rav1repl"
-required-features = ["repl"]
 bench = false
 
 [lib]
@@ -59,10 +71,18 @@ bench = false
 name = "bench"
 harness = false
 
+[profile.dev]
+opt-level = 2
+
 [profile.release]
 codegen-units = 1  # if > 1 enables parallel code generation which improves
                    # compile times, but prevents some optimizations.
                    # Passes `-C codegen-units`. Ignored when `lto = true`.
+lto = true
 
 [profile.bench]
 codegen-units = 1
+lto = true
+
+[workspace]
+members = ["ivf", "nasm_rs"]

@@ -10,23 +10,59 @@
 #![allow(non_camel_case_types)]
 #![allow(dead_code)]
 
+use std::ops;
 use self::BlockSize::*;
 use self::TxSize::*;
-use context::*;
-use encoder::{ChromaSampling, FrameInvariants};
-use plane::*;
-use predict::*;
-use util::*;
+use crate::context::*;
+use crate::encoder::FrameInvariants;
+use crate::mc::*;
+use crate::plane::*;
+use crate::predict::*;
+use crate::tiling::*;
+use crate::util::*;
 
-pub const NONE_FRAME: usize = 8;
-pub const INTRA_FRAME: usize = 0;
-pub const LAST_FRAME: usize = 1;
-pub const LAST2_FRAME: usize = 2;
-pub const LAST3_FRAME: usize = 3;
-pub const GOLDEN_FRAME: usize = 4;
-pub const BWDREF_FRAME: usize = 5;
-pub const ALTREF2_FRAME: usize = 6;
-pub const ALTREF_FRAME: usize = 7;
+// LAST_FRAME through ALTREF_FRAME correspond to slots 0-6.
+#[derive(PartialEq, Eq, Copy, Clone)]
+pub enum RefType {
+  INTRA_FRAME = 0,
+  LAST_FRAME = 1,
+  LAST2_FRAME = 2,
+  LAST3_FRAME = 3,
+  GOLDEN_FRAME = 4,
+  BWDREF_FRAME = 5,
+  ALTREF2_FRAME = 6,
+  ALTREF_FRAME = 7,
+  NONE_FRAME = 8,
+}
+
+impl RefType {
+  // convert to a ref list index, 0-6 (INTER_REFS_PER_FRAME)
+  pub fn to_index(self) -> usize {
+    match self {
+      NONE_FRAME => { panic!("Tried to get slot of NONE_FRAME"); },
+      INTRA_FRAME => { panic!("Tried to get slot of INTRA_FRAME"); },
+      _ => { (self as usize) - 1 }
+    }
+  }
+  pub fn is_fwd_ref(self) -> bool {
+    (self as usize) < 5
+  }
+  pub fn is_bwd_ref(self) -> bool {
+    (self as usize) >= 5
+  }
+}
+
+use self::RefType::*;
+
+pub const ALL_INTER_REFS: [RefType; 7] = [
+  LAST_FRAME,
+  LAST2_FRAME,
+  LAST3_FRAME,
+  GOLDEN_FRAME,
+  BWDREF_FRAME,
+  ALTREF2_FRAME,
+  ALTREF_FRAME
+];
 
 pub const LAST_LAST2_FRAMES: usize = 0; // { LAST_FRAME, LAST2_FRAME }
 pub const LAST_LAST3_FRAMES: usize = 1; // { LAST_FRAME, LAST3_FRAME }
@@ -43,11 +79,11 @@ pub const TOTAL_UNIDIR_COMP_REFS: usize = 9;
 //       that are explicitly signaled.
 pub const UNIDIR_COMP_REFS: usize = BWDREF_ALTREF_FRAMES + 1;
 
-pub const FWD_REFS: usize = GOLDEN_FRAME - LAST_FRAME + 1;
-pub const BWD_REFS: usize = ALTREF_FRAME - BWDREF_FRAME + 1;
-pub const SINGLE_REFS: usize = FWD_REFS + BWD_REFS;
-pub const TOTAL_REFS_PER_FRAME: usize = ALTREF_FRAME - INTRA_FRAME + 1;
-pub const INTER_REFS_PER_FRAME: usize = ALTREF_FRAME - LAST_FRAME + 1;
+pub const FWD_REFS: usize = 4;
+pub const BWD_REFS: usize = 3;
+pub const SINGLE_REFS: usize = 7;
+pub const TOTAL_REFS_PER_FRAME: usize = 8;
+pub const INTER_REFS_PER_FRAME: usize = 7;
 pub const TOTAL_COMP_REFS: usize =
   FWD_REFS * BWD_REFS + TOTAL_UNIDIR_COMP_REFS;
 
@@ -57,7 +93,7 @@ pub const REF_FRAMES: usize = 1 << REF_FRAMES_LOG2;
 pub const REF_CONTEXTS: usize = 3;
 pub const MVREF_ROW_COLS: usize = 3;
 
-#[derive(Copy, Clone, PartialEq, PartialOrd)]
+#[derive(Copy, Clone, PartialEq, PartialOrd, Debug)]
 pub enum PartitionType {
   PARTITION_NONE,
   PARTITION_HORZ,
@@ -107,6 +143,34 @@ impl BlockSize {
 
   const BLOCK_SIZE_HEIGHT_LOG2: [usize; BlockSize::BLOCK_SIZES_ALL] =
     [2, 3, 2, 3, 4, 3, 4, 5, 4, 5, 6, 5, 6, 7, 6, 7, 4, 2, 5, 3, 6, 4];
+
+  pub fn from_width_and_height(w: usize, h: usize) -> BlockSize {
+    match (w, h) {
+      (4, 4) => BLOCK_4X4,
+      (4, 8) => BLOCK_4X8,
+      (8, 4) => BLOCK_8X4,
+      (8, 8) => BLOCK_8X8,
+      (8, 16) => BLOCK_8X16,
+      (16, 8) => BLOCK_16X8,
+      (16, 16) => BLOCK_16X16,
+      (16, 32) => BLOCK_16X32,
+      (32, 16) => BLOCK_32X16,
+      (32, 32) => BLOCK_32X32,
+      (32, 64) => BLOCK_32X64,
+      (64, 32) => BLOCK_64X32,
+      (64, 64) => BLOCK_64X64,
+      (64, 128) => BLOCK_64X128,
+      (128, 64) => BLOCK_128X64,
+      (128, 128) => BLOCK_128X128,
+      (4, 16) => BLOCK_4X16,
+      (16, 4) => BLOCK_16X4,
+      (8, 32) => BLOCK_8X32,
+      (32, 8) => BLOCK_32X8,
+      (16, 64) => BLOCK_16X64,
+      (64, 16) => BLOCK_64X16,
+      _ => unreachable!()
+    }
+  }
 
   pub fn cfl_allowed(self) -> bool {
     // TODO: fix me when enabling EXT_PARTITION_TYPES
@@ -162,63 +226,29 @@ impl BlockSize {
     }
   }
 
-  pub fn largest_uv_tx_size(self, chroma_sampling: ChromaSampling) -> TxSize {
-    match chroma_sampling {
-      ChromaSampling::Cs444 => match self {
-        BLOCK_64X64 | BLOCK_64X32 | BLOCK_32X64 |
-        BLOCK_128X128 | BLOCK_128X64 | BLOCK_64X128 => TX_32X32,
-        BLOCK_64X16 => TX_32X16,
-        BLOCK_16X64 => TX_16X32,
-        _ => self.tx_size()
-      },
-      ChromaSampling::Cs422 => match self {
-        BLOCK_4X4 | BLOCK_8X4 => TX_4X4,
-        BLOCK_8X8 => TX_4X8,
-        BLOCK_16X8 => TX_8X8,
-        BLOCK_16X16 => TX_8X16,
-        BLOCK_32X16 => TX_16X16,
-        BLOCK_32X32 => TX_16X32,
-        BLOCK_64X32 | BLOCK_64X64 |
-        BLOCK_128X64 | BLOCK_128X128 => TX_32X32,
-        BLOCK_16X4 => TX_8X4,
-        BLOCK_32X8 => TX_16X8,
-        BLOCK_64X16 => TX_32X16,
-        _ => unreachable!() // vertical splits are illegal in 4:2:2
-      },
-      ChromaSampling::Cs420 => match self {
-        BLOCK_4X4 | BLOCK_8X4 | BLOCK_4X8 | BLOCK_8X8 => TX_4X4,
-        BLOCK_8X16 | BLOCK_4X16 => TX_4X8,
-        BLOCK_16X8 | BLOCK_16X4 => TX_8X4,
-        BLOCK_16X16 => TX_8X8,
-        BLOCK_16X32 => TX_8X16,
-        BLOCK_32X16 => TX_16X8,
-        BLOCK_32X32 => TX_16X16,
-        BLOCK_32X64 => TX_16X32,
-        BLOCK_64X32 => TX_32X16,
-        BLOCK_8X32 => TX_4X16,
-        BLOCK_32X8 => TX_16X4,
-        BLOCK_16X64 => TX_8X32,
-        BLOCK_64X16 => TX_32X8,
-        _ => TX_32X32
-      }
-    }
+  pub fn largest_uv_tx_size(self, xdec: usize, ydec: usize) -> TxSize {
+    let plane_bsize = get_plane_block_size(self, xdec, ydec);
+    debug_assert!((plane_bsize as usize) < BlockSize::BLOCK_SIZES_ALL);
+    let uv_tx = max_txsize_rect_lookup[plane_bsize as usize];
+
+    av1_get_coded_tx_size(uv_tx)
   }
 
   pub fn is_sqr(self) -> bool {
     self.width_log2() == self.height_log2()
   }
 
-  pub fn is_sub8x8(self) -> bool {
-    self.width_log2().min(self.height_log2()) < 3
+  pub fn is_sub8x8(self, xdec: usize, ydec: usize) -> bool {
+    xdec != 0 && self.width_log2() == 2 || ydec != 0 && self.height_log2() == 2
   }
 
-  pub fn sub8x8_offset(self) -> (isize, isize) {
-    let offset_x: isize = if self.width_log2() == 2 { -1 } else { 0 };
-    let offset_y: isize = if self.height_log2() == 2 { -1 } else { 0 };
+  pub fn sub8x8_offset(self, xdec: usize, ydec: usize) -> (isize, isize) {
+    let offset_x = if xdec != 0 && self.width_log2() == 2 { -1 } else { 0 };
+    let offset_y = if ydec != 0 && self.height_log2() == 2 { -1 } else { 0 };
 
     (offset_x, offset_y)
   }
-  
+
   pub fn greater_than(self, other: BlockSize) -> bool {
     (self.width() > other.width() && self.height() >= other.height()) ||
     (self.width() >= other.width() && self.height() > other.height())
@@ -229,7 +259,7 @@ impl BlockSize {
     (self.width() == other.width() && self.height() == other.height())
   }
 
-  #[cfg_attr(rustfmt, rustfmt_skip)]
+  #[rustfmt::skip]
   const SUBSIZE_LOOKUP: [[BlockSize; BlockSize::BLOCK_SIZES_ALL];
     EXT_PARTITION_TYPES] = [
     // PARTITION_NONE
@@ -427,6 +457,35 @@ impl BlockSize {
   pub fn subsize(self, partition: PartitionType) -> BlockSize {
     BlockSize::SUBSIZE_LOOKUP[partition as usize][self as usize]
   }
+
+  pub fn is_rect_tx_allowed(self) -> bool {
+    static LUT: [u8; BlockSize::BLOCK_SIZES_ALL] = [
+      0,  // BLOCK_4X4
+      1,  // BLOCK_4X8
+      1,  // BLOCK_8X4
+      0,  // BLOCK_8X8
+      1,  // BLOCK_8X16
+      1,  // BLOCK_16X8
+      0,  // BLOCK_16X16
+      1,  // BLOCK_16X32
+      1,  // BLOCK_32X16
+      0,  // BLOCK_32X32
+      1,  // BLOCK_32X64
+      1,  // BLOCK_64X32
+      0,  // BLOCK_64X64
+      0,  // BLOCK_64X128
+      0,  // BLOCK_128X64
+      0,  // BLOCK_128X128
+      1,  // BLOCK_4X16
+      1,  // BLOCK_16X4
+      1,  // BLOCK_8X32
+      1,  // BLOCK_32X8
+      1,  // BLOCK_16X64
+      1,  // BLOCK_64X16
+    ];
+
+    LUT[self as usize] == 1
+  }
 }
 
 /// Transform Size
@@ -561,27 +620,31 @@ impl TxSize {
 
   pub fn by_dims(w: usize, h: usize) -> TxSize {
     match (w, h) {
-      (4, 4) => TxSize::TX_4X4,
-      (8, 8) => TxSize::TX_8X8,
-      (16, 16) => TxSize::TX_16X16,
-      (32, 32) => TxSize::TX_32X32,
-      (64, 64) => TxSize::TX_64X64,
-      (4, 8) => TxSize::TX_4X8,
-      (8, 4) => TxSize::TX_8X4,
-      (8, 16) => TxSize::TX_8X16,
-      (16, 8) => TxSize::TX_16X8,
-      (16, 32) => TxSize::TX_16X32,
-      (32, 16) => TxSize::TX_32X16,
-      (32, 64) => TxSize::TX_32X64,
-      (64, 32) => TxSize::TX_64X32,
-      (4, 16) => TxSize::TX_4X16,
-      (16, 4) => TxSize::TX_16X4,
-      (8, 32) => TxSize::TX_8X32,
-      (32, 8) => TxSize::TX_32X8,
-      (16, 64) => TxSize::TX_16X64,
-      (64, 16) => TxSize::TX_64X16,
+      (4, 4) => TX_4X4,
+      (8, 8) => TX_8X8,
+      (16, 16) => TX_16X16,
+      (32, 32) => TX_32X32,
+      (64, 64) => TX_64X64,
+      (4, 8) => TX_4X8,
+      (8, 4) => TX_8X4,
+      (8, 16) => TX_8X16,
+      (16, 8) => TX_16X8,
+      (16, 32) => TX_16X32,
+      (32, 16) => TX_32X16,
+      (32, 64) => TX_32X64,
+      (64, 32) => TX_64X32,
+      (4, 16) => TX_4X16,
+      (16, 4) => TX_16X4,
+      (8, 32) => TX_8X32,
+      (32, 8) => TX_32X8,
+      (16, 64) => TX_16X64,
+      (64, 16) => TX_64X16,
       _ => unreachable!()
     }
+  }
+
+  pub fn is_rect(self) -> bool {
+    self.width_log2() != self.height_log2()
   }
 }
 
@@ -700,16 +763,46 @@ pub enum FilterIntraMode {
   FILTER_INTRA_MODES
 }
 
-#[derive(Copy, Clone)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MotionVector {
   pub row: i16,
   pub col: i16
 }
 
+impl ops::Add<MotionVector> for MotionVector {
+    type Output = MotionVector;
+
+    fn add(self, _rhs: MotionVector) -> MotionVector {
+        MotionVector{row: self.row + _rhs.row, col: self.col + _rhs.col}
+    }
+}
+
+impl ops::Div<i16> for MotionVector {
+    type Output = MotionVector;
+
+    fn div(self, _rhs: i16) -> MotionVector {
+        MotionVector{row: self.row  / _rhs, col: self.col / _rhs}
+    }
+}
+
+impl MotionVector {
+  pub fn quantize_to_fullpel(self) -> Self {
+    Self {
+      row: (self.row / 8) * 8,
+      col: (self.col / 8) * 8
+    }
+  }
+
+  pub fn is_zero(self) -> bool {
+    self.row == 0 && self.col == 0
+  }
+}
+
 pub const NEWMV_MODE_CONTEXTS: usize = 7;
 pub const GLOBALMV_MODE_CONTEXTS: usize = 2;
 pub const REFMV_MODE_CONTEXTS: usize = 6;
-pub const INTER_COMPOUND_MODES: usize = (1 + PredictionMode::NEW_NEWMV as usize - PredictionMode::NEAREST_NEARESTMV as usize);
+pub const INTER_COMPOUND_MODES: usize = 1 + PredictionMode::NEW_NEWMV as usize
+  - PredictionMode::NEAREST_NEARESTMV as usize;
 
 pub const REFMV_OFFSET: usize = 4;
 pub const GLOBALMV_OFFSET: usize = 3;
@@ -747,119 +840,6 @@ pub enum MvSubpelPrecision {
   MV_SUBPEL_HIGH_PRECISION
 }
 
-pub const SUBPEL_FILTER_SIZE: usize = 8;
-
-const SUBPEL_FILTERS: [[[i32; SUBPEL_FILTER_SIZE]; 16]; 6] = [
-  [
-    [0, 0, 0, 128, 0, 0, 0, 0],
-    [0, 2, -6, 126, 8, -2, 0, 0],
-    [0, 2, -10, 122, 18, -4, 0, 0],
-    [0, 2, -12, 116, 28, -8, 2, 0],
-    [0, 2, -14, 110, 38, -10, 2, 0],
-    [0, 2, -14, 102, 48, -12, 2, 0],
-    [0, 2, -16, 94, 58, -12, 2, 0],
-    [0, 2, -14, 84, 66, -12, 2, 0],
-    [0, 2, -14, 76, 76, -14, 2, 0],
-    [0, 2, -12, 66, 84, -14, 2, 0],
-    [0, 2, -12, 58, 94, -16, 2, 0],
-    [0, 2, -12, 48, 102, -14, 2, 0],
-    [0, 2, -10, 38, 110, -14, 2, 0],
-    [0, 2, -8, 28, 116, -12, 2, 0],
-    [0, 0, -4, 18, 122, -10, 2, 0],
-    [0, 0, -2, 8, 126, -6, 2, 0]
-  ],
-  [
-    [0, 0, 0, 128, 0, 0, 0, 0],
-    [0, 2, 28, 62, 34, 2, 0, 0],
-    [0, 0, 26, 62, 36, 4, 0, 0],
-    [0, 0, 22, 62, 40, 4, 0, 0],
-    [0, 0, 20, 60, 42, 6, 0, 0],
-    [0, 0, 18, 58, 44, 8, 0, 0],
-    [0, 0, 16, 56, 46, 10, 0, 0],
-    [0, -2, 16, 54, 48, 12, 0, 0],
-    [0, -2, 14, 52, 52, 14, -2, 0],
-    [0, 0, 12, 48, 54, 16, -2, 0],
-    [0, 0, 10, 46, 56, 16, 0, 0],
-    [0, 0, 8, 44, 58, 18, 0, 0],
-    [0, 0, 6, 42, 60, 20, 0, 0],
-    [0, 0, 4, 40, 62, 22, 0, 0],
-    [0, 0, 4, 36, 62, 26, 0, 0],
-    [0, 0, 2, 34, 62, 28, 2, 0]
-  ],
-  [
-    [0, 0, 0, 128, 0, 0, 0, 0],
-    [-2, 2, -6, 126, 8, -2, 2, 0],
-    [-2, 6, -12, 124, 16, -6, 4, -2],
-    [-2, 8, -18, 120, 26, -10, 6, -2],
-    [-4, 10, -22, 116, 38, -14, 6, -2],
-    [-4, 10, -22, 108, 48, -18, 8, -2],
-    [-4, 10, -24, 100, 60, -20, 8, -2],
-    [-4, 10, -24, 90, 70, -22, 10, -2],
-    [-4, 12, -24, 80, 80, -24, 12, -4],
-    [-2, 10, -22, 70, 90, -24, 10, -4],
-    [-2, 8, -20, 60, 100, -24, 10, -4],
-    [-2, 8, -18, 48, 108, -22, 10, -4],
-    [-2, 6, -14, 38, 116, -22, 10, -4],
-    [-2, 6, -10, 26, 120, -18, 8, -2],
-    [-2, 4, -6, 16, 124, -12, 6, -2],
-    [0, 2, -2, 8, 126, -6, 2, -2]
-  ],
-  [
-    [0, 0, 0, 128, 0, 0, 0, 0],
-    [0, 0, 0, 120, 8, 0, 0, 0],
-    [0, 0, 0, 112, 16, 0, 0, 0],
-    [0, 0, 0, 104, 24, 0, 0, 0],
-    [0, 0, 0, 96, 32, 0, 0, 0],
-    [0, 0, 0, 88, 40, 0, 0, 0],
-    [0, 0, 0, 80, 48, 0, 0, 0],
-    [0, 0, 0, 72, 56, 0, 0, 0],
-    [0, 0, 0, 64, 64, 0, 0, 0],
-    [0, 0, 0, 56, 72, 0, 0, 0],
-    [0, 0, 0, 48, 80, 0, 0, 0],
-    [0, 0, 0, 40, 88, 0, 0, 0],
-    [0, 0, 0, 32, 96, 0, 0, 0],
-    [0, 0, 0, 24, 104, 0, 0, 0],
-    [0, 0, 0, 16, 112, 0, 0, 0],
-    [0, 0, 0, 8, 120, 0, 0, 0]
-  ],
-  [
-    [0, 0, 0, 128, 0, 0, 0, 0],
-    [0, 0, -4, 126, 8, -2, 0, 0],
-    [0, 0, -8, 122, 18, -4, 0, 0],
-    [0, 0, -10, 116, 28, -6, 0, 0],
-    [0, 0, -12, 110, 38, -8, 0, 0],
-    [0, 0, -12, 102, 48, -10, 0, 0],
-    [0, 0, -14, 94, 58, -10, 0, 0],
-    [0, 0, -12, 84, 66, -10, 0, 0],
-    [0, 0, -12, 76, 76, -12, 0, 0],
-    [0, 0, -10, 66, 84, -12, 0, 0],
-    [0, 0, -10, 58, 94, -14, 0, 0],
-    [0, 0, -10, 48, 102, -12, 0, 0],
-    [0, 0, -8, 38, 110, -12, 0, 0],
-    [0, 0, -6, 28, 116, -10, 0, 0],
-    [0, 0, -4, 18, 122, -8, 0, 0],
-    [0, 0, -2, 8, 126, -4, 0, 0]
-  ],
-  [
-    [0, 0, 0, 128, 0, 0, 0, 0],
-    [0, 0, 30, 62, 34, 2, 0, 0],
-    [0, 0, 26, 62, 36, 4, 0, 0],
-    [0, 0, 22, 62, 40, 4, 0, 0],
-    [0, 0, 20, 60, 42, 6, 0, 0],
-    [0, 0, 18, 58, 44, 8, 0, 0],
-    [0, 0, 16, 56, 46, 10, 0, 0],
-    [0, 0, 14, 54, 48, 12, 0, 0],
-    [0, 0, 12, 52, 52, 12, 0, 0],
-    [0, 0, 12, 48, 54, 14, 0, 0],
-    [0, 0, 10, 46, 56, 16, 0, 0],
-    [0, 0, 8, 44, 58, 18, 0, 0],
-    [0, 0, 6, 42, 60, 20, 0, 0],
-    [0, 0, 4, 40, 62, 22, 0, 0],
-    [0, 0, 4, 36, 62, 26, 0, 0],
-    [0, 0, 2, 34, 62, 30, 0, 0]
-  ]
-];
-
 /* Symbols for coding which components are zero jointly */
 pub const MV_JOINTS: usize = 4;
 
@@ -871,73 +851,227 @@ pub enum MvJointType {
   MV_JOINT_HNZVNZ = 3  /* Both components nonzero */
 }
 
+pub fn get_intra_edges<T: Pixel>(
+  dst: &PlaneRegion<'_, T>,
+  po: PlaneOffset,
+  tx_size: TxSize,
+  bit_depth: usize,
+  opt_mode: Option<PredictionMode>
+) -> AlignedArray<[T; 4 * MAX_TX_SIZE + 1]> {
+  let plane_cfg = &dst.plane_cfg;
+
+  let mut edge_buf: AlignedArray<[T; 4 * MAX_TX_SIZE + 1]> =
+    UninitializedAlignedArray();
+  let base = 128u16 << (bit_depth - 8);
+
+  {
+    // left pixels are order from bottom to top and right-aligned
+    let (left, not_left) = edge_buf.array.split_at_mut(2*MAX_TX_SIZE);
+    let (top_left, above) = not_left.split_at_mut(1);
+
+    let x = po.x as usize;
+    let y = po.y as usize;
+
+    let mut needs_left = true;
+    let mut needs_topleft = true;
+    let mut needs_top = true;
+    let mut needs_topright = true;
+    let mut needs_bottomleft = true;
+
+    if let Some(mut mode) = opt_mode {
+      mode = match mode {
+        PredictionMode::PAETH_PRED => match (x, y) {
+          (0, 0) => PredictionMode::DC_PRED,
+          (_, 0) => PredictionMode::H_PRED,
+          (0, _) => PredictionMode::V_PRED,
+          _ => PredictionMode::PAETH_PRED
+        },
+        _ => mode
+      };
+
+      let dc_or_cfl =
+        mode == PredictionMode::DC_PRED || mode == PredictionMode::UV_CFL_PRED;
+
+      needs_left = mode != PredictionMode::V_PRED && (!dc_or_cfl || x != 0)
+        && !(mode == PredictionMode::D45_PRED || mode == PredictionMode::D63_PRED);
+      needs_topleft = mode == PredictionMode::PAETH_PRED || mode == PredictionMode::D117_PRED
+      || mode == PredictionMode::D135_PRED || mode == PredictionMode::D153_PRED;
+      needs_top = mode != PredictionMode::H_PRED && (!dc_or_cfl || y != 0);
+      needs_topright = mode == PredictionMode::D45_PRED || mode == PredictionMode::D63_PRED;
+      needs_bottomleft = mode == PredictionMode::D207_PRED;
+    }
+
+    // Needs left
+    if needs_left {
+      if x != 0 {
+        for i in 0..tx_size.height() {
+          left[2*MAX_TX_SIZE - tx_size.height() + i] = dst[y + tx_size.height() - 1 - i][x - 1];
+        }
+      } else {
+        let val = if y != 0 { dst[y - 1][0] } else { T::cast_from(base + 1) };
+        for v in left[2*MAX_TX_SIZE - tx_size.height()..].iter_mut() {
+          *v = val
+        }
+      }
+    }
+
+    // Needs top-left
+    if needs_topleft {
+      top_left[0] = match (x, y) {
+        (0, 0) => T::cast_from(base),
+        (_, 0) => dst[0][x - 1],
+        (0, _) => dst[y - 1][0],
+        _ => dst[y - 1][x - 1],
+      };
+    }
+
+    // Needs top
+    if needs_top {
+      if y != 0 {
+        above[..tx_size.width()].copy_from_slice(&dst[y - 1][x..x + tx_size.width()]);
+      } else {
+        let val = if x != 0 { dst[0][x - 1] } else { T::cast_from(base - 1) };
+        for v in above[..tx_size.width()].iter_mut() {
+          *v = val;
+        }
+      }
+    }
+
+    // Needs top right
+    if needs_topright {
+      debug_assert!(plane_cfg.xdec <= 1 && plane_cfg.ydec <= 1);
+
+      let bo = BlockOffset {
+        x: x >> (2 - plane_cfg.xdec),
+        y: y >> (2 - plane_cfg.ydec)
+      };
+
+      let bsize = BlockSize::from_width_and_height(
+          tx_size.width() << plane_cfg.xdec,
+          tx_size.height() << plane_cfg.ydec
+        );
+
+      let num_avail = if y != 0 && has_tr(bo, bsize) {
+        tx_size.width().min(dst.rect().width - x - tx_size.width())
+      } else {
+        0
+      };
+      if num_avail > 0 {
+        above[tx_size.width()..tx_size.width() + num_avail]
+        .copy_from_slice(&dst[y - 1][x + tx_size.width()..x + tx_size.width() + num_avail]);
+      }
+      if num_avail < tx_size.height() {
+        let val = above[tx_size.width() + num_avail - 1];
+        for v in above[tx_size.width() + num_avail..tx_size.width() + tx_size.height()].iter_mut() {
+          *v = val;
+        }
+      }
+    }
+
+    // Needs bottom left
+    if needs_bottomleft {
+      debug_assert!(plane_cfg.xdec <= 1 && plane_cfg.ydec <= 1);
+
+      let bo = BlockOffset {
+        x: x >> (2 - plane_cfg.xdec),
+        y: y >> (2 - plane_cfg.ydec)
+        };
+
+      let bsize = BlockSize::from_width_and_height(
+        tx_size.width() << plane_cfg.xdec,
+        tx_size.height() << plane_cfg.ydec
+        );
+
+      let num_avail = if x != 0 && has_bl(bo, bsize) {
+        tx_size.height().min(dst.rect().height - y - tx_size.height())
+      } else {
+        0
+      };
+      if num_avail > 0 {
+        for i in 0..num_avail {
+          left[2*MAX_TX_SIZE - tx_size.height() - 1 - i] = dst[y + tx_size.height() + i][x - 1];
+        }
+      }
+      if num_avail < tx_size.width() {
+        let val = left[2 * MAX_TX_SIZE - tx_size.height() - num_avail];
+        for v in left[(2 * MAX_TX_SIZE - tx_size.height() - tx_size.width())
+          ..(2 * MAX_TX_SIZE - tx_size.height() - num_avail)]
+          .iter_mut()
+        {
+          *v = val;
+        }
+      }
+    }
+
+  }
+  edge_buf
+}
+
 impl PredictionMode {
-  pub fn predict_intra<'a>(
-    self, dst: &'a mut PlaneMutSlice<'a>, tx_size: TxSize, bit_depth: usize,
-    ac: &[i16], alpha: i16
+  pub fn predict_intra<T: Pixel>(
+    self, tile_rect: TileRect, dst: &mut PlaneRegionMut<'_, T>, tx_size: TxSize, bit_depth: usize,
+    ac: &[i16], alpha: i16, edge_buf: &AlignedArray<[T; 4 * MAX_TX_SIZE + 1]>
   ) {
     assert!(self.is_intra());
 
     match tx_size {
       TxSize::TX_4X4 =>
-        self.predict_intra_inner::<Block4x4>(dst, bit_depth, ac, alpha),
+        self.predict_intra_inner::<Block4x4, _>(tile_rect, dst, bit_depth, ac, alpha, edge_buf),
       TxSize::TX_8X8 =>
-        self.predict_intra_inner::<Block8x8>(dst, bit_depth, ac, alpha),
+        self.predict_intra_inner::<Block8x8, _>(tile_rect, dst, bit_depth, ac, alpha, edge_buf),
       TxSize::TX_16X16 =>
-        self.predict_intra_inner::<Block16x16>(dst, bit_depth, ac, alpha),
+        self.predict_intra_inner::<Block16x16, _>(tile_rect, dst, bit_depth, ac, alpha, edge_buf),
       TxSize::TX_32X32 =>
-        self.predict_intra_inner::<Block32x32>(dst, bit_depth, ac, alpha),
+        self.predict_intra_inner::<Block32x32, _>(tile_rect, dst, bit_depth, ac, alpha, edge_buf),
       TxSize::TX_64X64 =>
-        self.predict_intra_inner::<Block64x64>(dst, bit_depth, ac, alpha),
+        self.predict_intra_inner::<Block64x64, _>(tile_rect, dst, bit_depth, ac, alpha, edge_buf),
 
       TxSize::TX_4X8 =>
-        self.predict_intra_inner::<Block4x8>(dst, bit_depth, ac, alpha),
+        self.predict_intra_inner::<Block4x8, _>(tile_rect, dst, bit_depth, ac, alpha, edge_buf),
       TxSize::TX_8X4 =>
-        self.predict_intra_inner::<Block8x4>(dst, bit_depth, ac, alpha),
+        self.predict_intra_inner::<Block8x4, _>(tile_rect, dst, bit_depth, ac, alpha, edge_buf),
       TxSize::TX_8X16 =>
-        self.predict_intra_inner::<Block8x16>(dst, bit_depth, ac, alpha),
+        self.predict_intra_inner::<Block8x16, _>(tile_rect, dst, bit_depth, ac, alpha, edge_buf),
       TxSize::TX_16X8 =>
-        self.predict_intra_inner::<Block16x8>(dst, bit_depth, ac, alpha),
+        self.predict_intra_inner::<Block16x8, _>(tile_rect, dst, bit_depth, ac, alpha, edge_buf),
       TxSize::TX_16X32 =>
-        self.predict_intra_inner::<Block16x32>(dst, bit_depth, ac, alpha),
+        self.predict_intra_inner::<Block16x32, _>(tile_rect, dst, bit_depth, ac, alpha, edge_buf),
       TxSize::TX_32X16 =>
-        self.predict_intra_inner::<Block32x16>(dst, bit_depth, ac, alpha),
+        self.predict_intra_inner::<Block32x16, _>(tile_rect, dst, bit_depth, ac, alpha, edge_buf),
       TxSize::TX_32X64 =>
-        self.predict_intra_inner::<Block32x64>(dst, bit_depth, ac, alpha),
+        self.predict_intra_inner::<Block32x64, _>(tile_rect, dst, bit_depth, ac, alpha, edge_buf),
       TxSize::TX_64X32 =>
-        self.predict_intra_inner::<Block64x32>(dst, bit_depth, ac, alpha),
+        self.predict_intra_inner::<Block64x32, _>(tile_rect, dst, bit_depth, ac, alpha, edge_buf),
 
       TxSize::TX_4X16 =>
-        self.predict_intra_inner::<Block4x16>(dst, bit_depth, ac, alpha),
+        self.predict_intra_inner::<Block4x16, _>(tile_rect, dst, bit_depth, ac, alpha, edge_buf),
       TxSize::TX_16X4 =>
-        self.predict_intra_inner::<Block16x4>(dst, bit_depth, ac, alpha),
+        self.predict_intra_inner::<Block16x4, _>(tile_rect, dst, bit_depth, ac, alpha, edge_buf),
       TxSize::TX_8X32 =>
-        self.predict_intra_inner::<Block8x32>(dst, bit_depth, ac, alpha),
+        self.predict_intra_inner::<Block8x32, _>(tile_rect, dst, bit_depth, ac, alpha, edge_buf),
       TxSize::TX_32X8 =>
-        self.predict_intra_inner::<Block32x8>(dst, bit_depth, ac, alpha),
+        self.predict_intra_inner::<Block32x8, _>(tile_rect, dst, bit_depth, ac, alpha, edge_buf),
       TxSize::TX_16X64 =>
-        self.predict_intra_inner::<Block16x64>(dst, bit_depth, ac, alpha),
+        self.predict_intra_inner::<Block16x64, _>(tile_rect, dst, bit_depth, ac, alpha, edge_buf),
       TxSize::TX_64X16 =>
-        self.predict_intra_inner::<Block64x16>(dst, bit_depth, ac, alpha),
+        self.predict_intra_inner::<Block64x16, _>(tile_rect, dst, bit_depth, ac, alpha, edge_buf),
     }
   }
 
   #[inline(always)]
-  fn predict_intra_inner<'a, B: Intra<u16>>(
-    self, dst: &'a mut PlaneMutSlice<'a>, bit_depth: usize, ac: &[i16],
-    alpha: i16
+  fn predict_intra_inner<B: Intra<T>, T: Pixel>(
+    self, tile_rect: TileRect, dst: &mut PlaneRegionMut<'_, T>, bit_depth: usize, ac: &[i16],
+    alpha: i16, edge_buf: &AlignedArray<[T; 4 * MAX_TX_SIZE + 1]>
   ) {
-    let base = 128u16 << (bit_depth - 8);
-
-    let mut edge_buf: AlignedArray<[u16; 2 * MAX_TX_SIZE + 1]> =
-      UninitializedAlignedArray();
     // left pixels are order from bottom to top and right-aligned
-    let (left, not_left) = edge_buf.array.split_at_mut(MAX_TX_SIZE);
-    let (top_left, above) = not_left.split_at_mut(1);
+    let (left, not_left) = edge_buf.array.split_at(2*MAX_TX_SIZE);
+    let (top_left, above) = not_left.split_at(1);
 
-    let stride = dst.plane.cfg.stride;
-    let x = dst.x;
-    let y = dst.y;
+    let &Rect { x: frame_x, y: frame_y, .. } = dst.rect();
+    debug_assert!(frame_x >= 0 && frame_y >= 0);
+    // x and y are expressed relative to the tile
+    let x = frame_x as usize - tile_rect.x;
+    let y = frame_y as usize - tile_rect.y;
 
     let mode: PredictionMode = match self {
       PredictionMode::PAETH_PRED => match (x, y) {
@@ -955,62 +1089,21 @@ impl PredictionMode {
       _ => self
     };
 
-    let dc_or_cfl =
-      mode == PredictionMode::DC_PRED || mode == PredictionMode::UV_CFL_PRED;
-
-    // Needs left
-    if mode != PredictionMode::V_PRED && (!dc_or_cfl || x != 0) {
-      if x != 0 {
-        let left_slice = dst.go_left(1);
-        for i in 0..B::H {
-          left[MAX_TX_SIZE - B::H + i] = left_slice.p(0, B::H - 1 - i);
-        }
-      } else {
-        let val = if y != 0 { dst.go_up(1).p(0, 0) } else { base + 1 };
-        for v in left[MAX_TX_SIZE - B::H..].iter_mut() {
-          *v = val
-        }
-      }
-    }
-
-    // Needs top-left
-    if mode == PredictionMode::PAETH_PRED {
-      top_left[0] = match (x, y) {
-        (0, 0) => base,
-        (_, 0) => dst.go_left(1).p(0, 0),
-        (0, _) => dst.go_up(1).p(0, 0),
-        _ => dst.go_up(1).go_left(1).p(0, 0)
-      };
-    }
-
-    // Needs top
-    if mode != PredictionMode::H_PRED && (!dc_or_cfl || y != 0) {
-      if y != 0 {
-        above[..B::W].copy_from_slice(&dst.go_up(1).as_slice()[..B::W]);
-      } else {
-        let val = if x != 0 { dst.go_left(1).p(0, 0) } else { base - 1 };
-        for v in above[..B::W].iter_mut() {
-          *v = val
-        }
-      }
-    }
-
-    let slice = dst.as_mut_slice();
-    let above_slice = &above[..B::W];
-    let left_slice = &left[MAX_TX_SIZE - B::H..];
+    let above_slice = &above[..B::W + B::H];
+    let left_slice = &left[2 * MAX_TX_SIZE - B::H..];
+    let left_and_left_below_slice = &left[2 * MAX_TX_SIZE - B::H - B::W..];
 
     match mode {
       PredictionMode::DC_PRED => match (x, y) {
-        (0, 0) => B::pred_dc_128(slice, stride, bit_depth),
-        (_, 0) => B::pred_dc_left(slice, stride, above_slice, left_slice),
-        (0, _) => B::pred_dc_top(slice, stride, above_slice, left_slice),
-        _ => B::pred_dc(slice, stride, above_slice, left_slice)
+        (0, 0) => B::pred_dc_128(dst, bit_depth),
+        (_, 0) => B::pred_dc_left(dst, above_slice, left_slice),
+        (0, _) => B::pred_dc_top(dst, above_slice, left_slice),
+        _ => B::pred_dc(dst, above_slice, left_slice)
       },
       PredictionMode::UV_CFL_PRED => match (x, y) {
-        (0, 0) => B::pred_cfl_128(slice, stride, &ac, alpha, bit_depth),
+        (0, 0) => B::pred_cfl_128(dst, &ac, alpha, bit_depth),
         (_, 0) => B::pred_cfl_left(
-          slice,
-          stride,
+          dst,
           &ac,
           alpha,
           bit_depth,
@@ -1018,8 +1111,7 @@ impl PredictionMode {
           left_slice
         ),
         (0, _) => B::pred_cfl_top(
-          slice,
-          stride,
+          dst,
           &ac,
           alpha,
           bit_depth,
@@ -1027,8 +1119,7 @@ impl PredictionMode {
           left_slice
         ),
         _ => B::pred_cfl(
-          slice,
-          stride,
+          dst,
           &ac,
           alpha,
           bit_depth,
@@ -1036,16 +1127,28 @@ impl PredictionMode {
           left_slice
         )
       },
-      PredictionMode::H_PRED => B::pred_h(slice, stride, left_slice),
-      PredictionMode::V_PRED => B::pred_v(slice, stride, above_slice),
+      PredictionMode::H_PRED => B::pred_h(dst, left_slice),
+      PredictionMode::V_PRED => B::pred_v(dst, above_slice),
       PredictionMode::PAETH_PRED =>
-        B::pred_paeth(slice, stride, above_slice, left_slice, top_left[0]),
+        B::pred_paeth(dst, above_slice, left_slice, top_left[0]),
       PredictionMode::SMOOTH_PRED =>
-        B::pred_smooth(slice, stride, above_slice, left_slice),
+        B::pred_smooth(dst, above_slice, left_slice),
       PredictionMode::SMOOTH_H_PRED =>
-        B::pred_smooth_h(slice, stride, above_slice, left_slice),
+        B::pred_smooth_h(dst, above_slice, left_slice),
       PredictionMode::SMOOTH_V_PRED =>
-        B::pred_smooth_v(slice, stride, above_slice, left_slice),
+        B::pred_smooth_v(dst, above_slice, left_slice),
+      PredictionMode::D45_PRED =>
+        B::pred_directional(dst, above_slice, left_and_left_below_slice, top_left, 45, bit_depth),
+      PredictionMode::D135_PRED =>
+        B::pred_directional(dst, above_slice, left_and_left_below_slice, top_left, 135, bit_depth),
+      PredictionMode::D117_PRED =>
+        B::pred_directional(dst, above_slice, left_and_left_below_slice, top_left, 113, bit_depth),
+      PredictionMode::D153_PRED =>
+        B::pred_directional(dst, above_slice, left_and_left_below_slice, top_left, 157, bit_depth),
+      PredictionMode::D207_PRED =>
+        B::pred_directional(dst, above_slice, left_and_left_below_slice, top_left, 203, bit_depth),
+      PredictionMode::D63_PRED =>
+        B::pred_directional(dst, above_slice, left_and_left_below_slice, top_left, 67, bit_depth),
       _ => unimplemented!()
     }
   }
@@ -1062,178 +1165,79 @@ impl PredictionMode {
     self >= PredictionMode::V_PRED && self <= PredictionMode::D63_PRED
   }
 
-  pub fn predict_inter<'a>(
-    self, fi: &FrameInvariants, p: usize, po: &PlaneOffset,
-    dst: &'a mut PlaneMutSlice<'a>, width: usize, height: usize,
-    ref_frames: [usize; 2], mvs: [MotionVector; 2], bit_depth: usize
+  pub fn predict_inter<T: Pixel>(
+    self, fi: &FrameInvariants<T>, tile_rect: TileRect, p: usize, po: PlaneOffset,
+    dst: &mut PlaneRegionMut<'_, T>, width: usize, height: usize,
+    ref_frames: [RefType; 2], mvs: [MotionVector; 2]
   ) {
     assert!(!self.is_intra());
+    let frame_po = tile_rect.to_frame_plane_offset(po);
 
-    let is_compound = ref_frames[1] > INTRA_FRAME && ref_frames[1] != NONE_FRAME;
+    let mode = FilterMode::REGULAR;
+    let is_compound =
+      ref_frames[1] != INTRA_FRAME && ref_frames[1] != NONE_FRAME;
 
-    let stride = dst.plane.cfg.stride;
-    let slice = dst.as_mut_slice();
+    fn get_params<'a, T: Pixel>(
+      rec_plane: &'a Plane<T>, po: PlaneOffset, mv: MotionVector
+    ) -> (i32, i32, PlaneSlice<'a, T>) {
+      let rec_cfg = &rec_plane.cfg;
+      let shift_row = 3 + rec_cfg.ydec;
+      let shift_col = 3 + rec_cfg.xdec;
+      let row_offset = mv.row as i32 >> shift_row;
+      let col_offset = mv.col as i32 >> shift_col;
+      let row_frac =
+        (mv.row as i32 - (row_offset << shift_row)) << (4 - shift_row);
+      let col_frac =
+        (mv.col as i32 - (col_offset << shift_col)) << (4 - shift_col);
+      let qo = PlaneOffset {
+        x: po.x + col_offset as isize - 3,
+        y: po.y + row_offset as isize - 3
+      };
+      (row_frac, col_frac, rec_plane.slice(qo).clamp().subslice(3, 3))
+    };
 
-    for i in 0..(1 + is_compound as usize) {
-      match fi.rec_buffer.frames[fi.ref_frames[ref_frames[i] - LAST_FRAME] as usize] {
-        Some(ref rec) => {
-          let rec_cfg = &rec.frame.planes[p].cfg;
-          let shift_row = 3 + rec_cfg.ydec;
-          let shift_col = 3 + rec_cfg.xdec;
-          let row_offset = mvs[i].row as i32 >> shift_row;
-          let col_offset = mvs[i].col as i32 >> shift_col;
-          let row_frac =
-            (mvs[i].row as i32 - (row_offset << shift_row)) << (4 - shift_row);
-          let col_frac =
-            (mvs[i].col as i32 - (col_offset << shift_col)) << (4 - shift_col);
-          let ref_stride = rec_cfg.stride;
-
-          let max_sample_val = ((1 << bit_depth) - 1) as i32;
-          let y_filter_idx = if height <= 4 { 4 } else { 0 };
-          let x_filter_idx = if width <= 4 { 4 } else { 0 };
-          let shifts = {
-            let shift_offset = if bit_depth == 12 { 2 } else { 0 };
-            let inter_round0 = 3 + shift_offset;
-            let inter_round1 = if is_compound { 7 } else { 11 } - shift_offset;
-            (inter_round0, inter_round1, 14 - inter_round0 - inter_round1)
-          };
-          let round_shift =
-            |n, shift| -> i32 { (n + (1 << (shift - 1))) >> shift };
-
-          match (col_frac, row_frac) {
-            (0, 0) => {
-              let qo = PlaneOffset {
-                x: po.x + col_offset as isize,
-                y: po.y + row_offset as isize
-              };
-              let ps = rec.frame.planes[p].slice(&qo);
-              let s = ps.as_slice_clamped();
-              for r in 0..height {
-                for c in 0..width {
-                  let output_index = r * stride + c;
-                  let mut val = s[r * ref_stride + c] as i32;
-                  if is_compound {
-                    val = val << shifts.2;
-                    if i == 1 {
-                      val = val + slice[output_index] as i32 - 32768;
-                      val = round_shift(val, shifts.2 + 1);
-                      val = val.max(0).min(max_sample_val);
-                    } else {
-                      val = val + 32768;
-                    }
-                  }
-                  slice[output_index] = val as u16;
-                }
-              }
-            }
-            (0, _) => {
-              let qo = PlaneOffset {
-                x: po.x + col_offset as isize,
-                y: po.y + row_offset as isize - 3
-              };
-              let ps = rec.frame.planes[p].slice(&qo);
-              let s = ps.as_slice_clamped();
-              for r in 0..height {
-                for c in 0..width {
-                  let mut sum: i32 = 0;
-                  for k in 0..8 {
-                    sum += s[(r + k) * ref_stride + c] as i32
-                      * SUBPEL_FILTERS[y_filter_idx][row_frac as usize][k];
-                  }
-                  let output_index = r * stride + c;
-                  let mut val = round_shift(sum, shifts.0 + shifts.1 - 7);
-                  if is_compound && i == 1 {
-                    val = val + slice[output_index] as i32 - 32768;
-                    val = round_shift(val, shifts.2 + 1);
-                    val = val.max(0).min(max_sample_val);
-                  } else if !is_compound {
-                    val = val.max(0).min(max_sample_val);
-                  } else {
-                    val = val + 32768;
-                  }
-                  slice[output_index] = val as u16;
-                }
-              }
-            }
-            (_, 0) => {
-              let qo = PlaneOffset {
-                x: po.x + col_offset as isize - 3,
-                y: po.y + row_offset as isize
-              };
-              let ps = rec.frame.planes[p].slice(&qo);
-              let s = ps.as_slice_clamped();
-              for r in 0..height {
-                for c in 0..width {
-                  let mut sum: i32 = 0;
-                  for k in 0..8 {
-                    sum += s[r * ref_stride + (c + k)] as i32
-                      * SUBPEL_FILTERS[x_filter_idx][col_frac as usize][k];
-                  }
-                  let output_index = r * stride + c;
-                  let mut val = round_shift(round_shift(sum, shifts.0) << 7, shifts.1);
-                  if is_compound && i == 1 {
-                    val = val + slice[output_index] as i32 - 32768;
-                    val = round_shift(val, shifts.2 + 1);
-                    val = val.max(0).min(max_sample_val);
-                  } else if !is_compound {
-                    val = val.max(0).min(max_sample_val);
-                  } else {
-                    val = val + 32768;
-                  }
-                  slice[output_index] = val as u16;
-                }
-              }
-            }
-            (_, _) => {
-              let mut intermediate = [0 as i16; 8 * (128 + 7)];
-
-              let qo = PlaneOffset {
-                x: po.x + col_offset as isize - 3,
-                y: po.y + row_offset as isize - 3
-              };
-              let ps = rec.frame.planes[p].slice(&qo);
-              let s = ps.as_slice_clamped();
-              for cg in (0..width).step_by(8) {
-                for r in 0..height + 7 {
-                  for c in cg..(cg + 8).min(width) {
-                    let mut sum: i32 = 0;
-                    for k in 0..8 {
-                      sum += s[r * ref_stride + (c + k)] as i32 * SUBPEL_FILTERS
-                        [x_filter_idx][col_frac as usize][k];
-                    }
-                    let val = round_shift(sum, shifts.0);
-                    intermediate[8 * r + (c - cg)] = val as i16;
-                  }
-                }
-
-                for r in 0..height {
-                  for c in cg..(cg + 8).min(width) {
-                    let mut sum: i32 = 0;
-                    for k in 0..8 {
-                      sum += intermediate[8 * (r + k) + c - cg] as i32
-                        * SUBPEL_FILTERS[y_filter_idx][row_frac as usize][k];
-                    }
-                    let output_index = r * stride + c;
-                    let mut val = round_shift(sum, shifts.1);
-                    if is_compound && i == 1 {
-                      val = val + slice[output_index] as i32 - 32768;
-                      val = round_shift(val, shifts.2 + 1);
-                      val = val.max(0).min(max_sample_val);
-                    } else if !is_compound {
-                      val = val.max(0).min(max_sample_val);
-                    } else {
-                      val = val + 32768;
-                    }
-
-                    slice[output_index] = val as u16;
-                  }
-                }
-              }
-            }
-          }
-        }
-        None => ()
+    if !is_compound {
+      if let Some(ref rec) = fi.rec_buffer.frames[fi.ref_frames[ref_frames[0].to_index()] as usize] {
+        let (row_frac, col_frac, src) = get_params(&rec.frame.planes[p], frame_po, mvs[0]);
+        put_8tap(
+          dst,
+          src,
+          width,
+          height,
+          col_frac,
+          row_frac,
+          mode,
+          mode,
+          fi.sequence.bit_depth
+        );
       }
+    } else {
+      let mut tmp: [AlignedArray<[i16; 128 * 128]>; 2] =
+        [UninitializedAlignedArray(), UninitializedAlignedArray()];
+      for i in 0..2 {
+        if let Some(ref rec) = fi.rec_buffer.frames[fi.ref_frames[ref_frames[i].to_index()] as usize] {
+          let (row_frac, col_frac, src) = get_params(&rec.frame.planes[p], frame_po, mvs[i]);
+          prep_8tap(
+            &mut tmp[i].array,
+            src,
+            width,
+            height,
+            col_frac,
+            row_frac,
+            mode,
+            mode,
+            fi.sequence.bit_depth
+          );
+        }
+      }
+      mc_avg(
+        dst,
+        &tmp[0].array,
+        &tmp[1].array,
+        width,
+        height,
+        fi.sequence.bit_depth
+      );
     }
   }
 }
@@ -1260,4 +1264,118 @@ pub enum TxSet {
   TX_SET_ALL16_16X16,
   // Discrete Trig transforms w/ flip (9) + Identity (1) + 1D Hor/Ver (6)
   TX_SET_ALL16
+}
+
+pub fn has_tr(bo: BlockOffset, bsize: BlockSize) -> bool {
+  let sb_mi_size = BLOCK_64X64.width_mi(); /* Assume 64x64 for now */
+  let mask_row = bo.y & LOCAL_BLOCK_MASK;
+  let mask_col = bo.x & LOCAL_BLOCK_MASK;
+  let target_n4_w = bsize.width_mi();
+  let target_n4_h = bsize.height_mi();
+
+  let mut bs = target_n4_w.max(target_n4_h);
+
+  if bs > BLOCK_64X64.width_mi() {
+    return false;
+  }
+
+  let mut has_tr = !((mask_row & bs) != 0 && (mask_col & bs) != 0);
+
+  /* TODO: assert its a power of two */
+
+  while bs < sb_mi_size {
+    if (mask_col & bs) != 0 {
+      if (mask_col & (2 * bs) != 0) && (mask_row & (2 * bs) != 0) {
+        has_tr = false;
+        break;
+      }
+    } else {
+      break;
+    }
+    bs <<= 1;
+  }
+
+  /* The left hand of two vertical rectangles always has a top right (as the
+    * block above will have been decoded) */
+  if (target_n4_w < target_n4_h) && (bo.x & target_n4_w) == 0 {
+    has_tr = true;
+  }
+
+  /* The bottom of two horizontal rectangles never has a top right (as the block
+    * to the right won't have been decoded) */
+  if (target_n4_w > target_n4_h) && (bo.y & target_n4_h) != 0 {
+    has_tr = false;
+  }
+
+  /* The bottom left square of a Vertical A (in the old format) does
+    * not have a top right as it is decoded before the right hand
+    * rectangle of the partition */
+/*
+  if blk.partition == PartitionType::PARTITION_VERT_A {
+    if blk.n4_w == blk.n4_h {
+      if (mask_row & bs) != 0 {
+        has_tr = false;
+      }
+    }
+  }
+*/
+
+  has_tr
+}
+
+pub fn has_bl(bo: BlockOffset, bsize: BlockSize) -> bool {
+  let sb_mi_size = BLOCK_64X64.width_mi(); /* Assume 64x64 for now */
+  let mask_row = bo.y & LOCAL_BLOCK_MASK;
+  let mask_col = bo.x & LOCAL_BLOCK_MASK;
+  let target_n4_w = bsize.width_mi();
+  let target_n4_h = bsize.height_mi();
+
+  let mut bs = target_n4_w.max(target_n4_h);
+
+  if bs > BLOCK_64X64.width_mi() {
+    return false;
+  }
+
+  let mut has_bl = (mask_row & bs) == 0 && (mask_col & bs) == 0 && bs < sb_mi_size;
+
+  /* TODO: assert its a power of two */
+
+  while 2 * bs < sb_mi_size {
+    if (mask_col & bs) == 0 {
+      if (mask_col & (2 * bs) == 0) && (mask_row & (2 * bs) == 0) {
+        has_bl = true;
+        break;
+      }
+    } else {
+      break;
+    }
+    bs <<= 1;
+  }
+
+  /* The right hand of two vertical rectangles never has a bottom left (as the
+    * block below won't have been decoded) */
+  if (target_n4_w < target_n4_h) && (bo.x & target_n4_w) != 0 {
+    has_bl = false;
+  }
+
+  /* The top of two horizontal rectangles always has a bottom left (as the block
+    * to the left will have been decoded) */
+  if (target_n4_w > target_n4_h) && (bo.y & target_n4_h) == 0 {
+    has_bl = true;
+  }
+
+  /* The bottom left square of a Vertical A (in the old format) does
+    * not have a top right as it is decoded before the right hand
+    * rectangle of the partition */
+/*
+  if blk.partition == PartitionType::PARTITION_VERT_A {
+    if blk.n4_w == blk.n4_h {
+      if (mask_row & bs) != 0 {
+        has_tr = false;
+      }
+    }
+  }
+*/
+
+  has_bl
 }

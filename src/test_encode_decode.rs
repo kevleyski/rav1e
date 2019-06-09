@@ -7,95 +7,134 @@
 // Media Patent License 1.0 was not distributed with this source code in the
 // PATENTS file, you can obtain it at www.aomedia.org/license/patent.
 
-#![allow(dead_code)]
-#![allow(non_camel_case_types)]
-#![allow(non_snake_case)]
-#![allow(non_upper_case_globals)]
-
-include!(concat!(env!("OUT_DIR"), "/aom.rs"));
-
 use super::*;
-use rand::{ChaChaRng, Rng, SeedableRng};
-use std::{mem, ptr, slice};
-use std::collections::VecDeque;
-use std::ffi::CStr;
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaChaRng;
 use std::sync::Arc;
+use crate::util::Pixel;
+#[cfg(feature="decode_test")]
+use crate::test_encode_decode_aom::AomDecoder;
+#[cfg(feature="decode_test_dav1d")]
+use crate::test_encode_decode_dav1d::Dav1dDecoder;
+use std::collections::VecDeque;
+use interpolate_name::interpolate_test;
 
-fn fill_frame(ra: &mut ChaChaRng, frame: &mut Frame) {
+fn fill_frame<T: Pixel>(ra: &mut ChaChaRng, frame: &mut Frame<T>) {
   for plane in frame.planes.iter_mut() {
     let stride = plane.cfg.stride;
     for row in plane.data.chunks_mut(stride) {
-      for mut pixel in row {
+      for pixel in row {
         let v: u8 = ra.gen();
-        *pixel = v as u16;
+        *pixel = T::cast_from(v);
       }
     }
   }
 }
 
-struct AomDecoder {
-  dec: aom_codec_ctx
+pub(crate) fn read_frame_batch<T: Pixel>(ctx: &mut Context<T>, ra: &mut ChaChaRng, limit: usize) {
+  for _ in  0..limit {
+    let mut input = ctx.new_frame();
+    fill_frame(ra, Arc::get_mut(&mut input).unwrap());
+
+    let _ = ctx.send_frame(Some(input));
+  }
+
+  ctx.flush();
 }
 
-fn setup_decoder(w: usize, h: usize) -> AomDecoder {
-  unsafe {
-    let interface = aom_codec_av1_dx();
-    let mut dec: AomDecoder = mem::uninitialized();
-    let cfg = aom_codec_dec_cfg_t {
-      threads: 1,
-      w: w as u32,
-      h: h as u32,
-      allow_lowbitdepth: 1,
-      cfg: cfg_options { ext_partition: 1 }
-    };
+pub(crate) enum DecodeResult {
+  Done,
+  NotDone,
+  Corrupted(usize),
+}
 
-    let ret = aom_codec_dec_init_ver(
-      &mut dec.dec,
-      interface,
-      &cfg,
-      0,
-      AOM_DECODER_ABI_VERSION as i32
-    );
-    if ret != 0 {
-      panic!("Cannot instantiate the decoder {}", ret);
+pub(crate) trait TestDecoder<T: Pixel> {
+  fn setup_decoder(w: usize, h: usize) -> Self where Self: Sized;
+  fn encode_decode(
+    &mut self, w: usize, h: usize, speed: usize, quantizer: usize,
+    limit: usize, bit_depth: usize, chroma_sampling: ChromaSampling,
+    min_keyint: u64, max_keyint: u64, low_latency: bool, bitrate: i32,
+    tile_cols_log2: usize, tile_rows_log2: usize,
+  ) {
+    let mut ra = ChaChaRng::from_seed([0; 32]);
+
+    let mut ctx: Context<T> =
+      setup_encoder(w, h, speed, quantizer, bit_depth, chroma_sampling,
+                    min_keyint, max_keyint, low_latency, bitrate,
+                    tile_cols_log2, tile_rows_log2);
+
+    println!("Encoding {}x{} speed {} quantizer {} bit-depth {}", w, h, speed, quantizer, bit_depth);
+    #[cfg(feature="dump_ivf")]
+    let mut out = std::fs::File::create(&format!("out-{}x{}-s{}-q{}-{:?}.ivf",
+                                                   w, h, speed, quantizer, chroma_sampling)).unwrap();
+    #[cfg(feature="dump_ivf")]
+    ivf::write_ivf_header(&mut out, w, h, 30, 1);
+
+    let mut rec_fifo = VecDeque::new();
+    read_frame_batch(&mut ctx, &mut ra, limit);
+
+    for _ in 0..limit {
+
+      let mut corrupted_count = 0;
+      loop {
+        let res = ctx.receive_packet();
+        if let Ok(pkt) = res {
+          println!("Encoded packet {}", pkt.number);
+
+          #[cfg(feature="dump_ivf")]
+          ivf::write_ivf_frame(&mut out, pkt.number, &pkt.data);
+
+          if let Some(pkt_rec) = pkt.rec {
+            rec_fifo.push_back(pkt_rec.clone());
+          }
+          let packet = pkt.data;
+          println!("Decoding frame {}", pkt.number);
+          match self.decode_packet(&packet, &mut rec_fifo, w, h, bit_depth) {
+            DecodeResult::Done => { break; }
+            DecodeResult::NotDone => {}
+            DecodeResult::Corrupted(corrupted) => { corrupted_count += corrupted; }
+          }
+        } else {
+          break;
+        }
+      }
+      assert_eq!(corrupted_count, 0);
     }
+  }
+  fn decode_packet(&mut self, packet: &[u8], rec_fifo: &mut VecDeque<Frame<T>>, w: usize, h: usize, bit_depth: usize) -> DecodeResult;
+}
 
-    dec
+pub(crate) fn compare_plane<T: Ord + std::fmt::Debug>(
+  rec: &[T], rec_stride: usize, dec: &[T], dec_stride: usize, width: usize,
+  height: usize
+) {
+  for line in rec.chunks(rec_stride).zip(dec.chunks(dec_stride)).take(height) {
+    assert_eq!(&line.0[..width], &line.1[..width]);
   }
 }
 
-impl Drop for AomDecoder {
-  fn drop(&mut self) {
-    unsafe { aom_codec_destroy(&mut self.dec) };
-  }
-}
-
-fn setup_encoder(
+pub(crate) fn setup_encoder<T: Pixel>(
   w: usize, h: usize, speed: usize, quantizer: usize, bit_depth: usize,
   chroma_sampling: ChromaSampling, min_keyint: u64, max_keyint: u64,
-  low_latency: bool
-) -> Context {
-  unsafe {
-    av1_rtcd();
-    aom_dsp_rtcd();
-  }
-
+  low_latency: bool, bitrate: i32, tile_cols_log2: usize, tile_rows_log2: usize,
+) -> Context<T> {
+  assert!(bit_depth == 8 || std::mem::size_of::<T>() > 1);
   let mut enc = EncoderConfig::with_speed_preset(speed);
   enc.quantizer = quantizer;
   enc.min_key_frame_interval = min_keyint;
   enc.max_key_frame_interval = max_keyint;
   enc.low_latency = low_latency;
+  enc.width = w;
+  enc.height = h;
+  enc.bit_depth = bit_depth;
+  enc.chroma_sampling = chroma_sampling;
+  enc.bitrate = bitrate;
+  enc.tile_cols_log2 = tile_cols_log2;
+  enc.tile_rows_log2 = tile_rows_log2;
 
   let cfg = Config {
-    frame_info: FrameInfo {
-      width: w,
-      height: h,
-      bit_depth,
-      chroma_sampling,
-      ..Default::default()
-    },
-    timebase: Rational::new(1, 1000),
-    enc
+    enc,
+    threads: 0,
   };
 
   cfg.new_context()
@@ -105,77 +144,150 @@ fn setup_encoder(
 static DIMENSION_OFFSETS: &[(usize, usize)] =
   &[(0, 0), (4, 4), (8, 8), (16, 16)];
 
-#[test]
-#[ignore]
-fn speed() {
+fn speed(s: usize, decoder: &str) {
   let quantizer = 100;
   let limit = 5;
   let w = 64;
   let h = 80;
 
   for b in DIMENSION_OFFSETS.iter() {
-    for s in 0..10 {
-      encode_decode(w + b.0, h + b.1, s, quantizer, limit, 8, 15, 15, true);
-    }
+      let w = w + b.0;
+      let h = h + b.1;
+      let mut dec = get_decoder::<u8>(decoder, w as usize, h as usize);
+      dec.encode_decode(w, h, s, quantizer, limit, 8, Default::default(), 15, 15, true, 0, 0, 0);
   }
 }
 
-static DIMENSIONS: &[(usize, usize)] = &[
-  (8, 8),
-  (16, 16),
-  (32, 32),
-  (64, 64),
-  (128, 128),
-  (256, 256),
-  (512, 512),
-  (1024, 1024),
-  (2048, 2048),
-  (258, 258),
-  (260, 260),
-  (262, 262),
-  (264, 264),
-  (265, 265)
-];
+macro_rules! test_speeds {
+  ($($S:expr),+) => {
+    $(
+        paste::item!{
+            #[cfg_attr(feature = "decode_test", interpolate_test(aom, "aom"))]
+            #[cfg_attr(feature = "decode_test_dav1d", interpolate_test(dav1d, "dav1d"))]
+            #[ignore]
+            fn [<speed_ $S>](decoder: &str) {
+                speed($S, decoder)
+            }
+        }
+    )*
+  }
+}
 
-#[test]
-#[ignore]
-fn dimensions() {
+test_speeds!{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }
+
+macro_rules! test_dimensions {
+  ($(($W:expr, $H:expr)),+) => {
+    $(
+        paste::item!{
+            #[cfg_attr(feature = "decode_test", interpolate_name::interpolate_test(aom, "aom"))]
+            #[cfg_attr(feature = "decode_test_dav1d", interpolate_name::interpolate_test(dav1d, "dav1d"))]
+            fn [<dimension_ $W x $H>](decoder: &str) {
+                super::dimension($W, $H, decoder)
+            }
+        }
+    )*
+  }
+}
+
+#[cfg(not(feature="quick_test"))]
+mod large_dimension {
+  test_dimensions!{
+    (512, 512),
+    (1024, 1024),
+    (2048, 2048)
+  }
+}
+
+mod small_dimension {
+  test_dimensions!{
+    (256, 256),
+    (258, 258),
+    (260, 260),
+    (262, 262),
+    (264, 264),
+    (265, 265)
+  }
+}
+
+mod tiny_dimension {
+  test_dimensions!{
+    (8, 8),
+    (16, 16),
+    (32, 32),
+    (64, 64),
+    (128, 128)
+  }
+}
+
+fn dimension(w: usize, h: usize, decoder: &str) {
   let quantizer = 100;
   let limit = 1;
-  let speed = 4;
+  let speed = 10;
 
-  for (w, h) in DIMENSIONS.iter() {
-    encode_decode(*w, *h, speed, quantizer, limit, 8, 15, 15, true);
-  }
+  let mut dec = get_decoder::<u8>(decoder, w as usize, h as usize);
+  dec.encode_decode(w, h, speed, quantizer, limit, 8, Default::default(), 15, 15, true, 0, 0, 0);
 }
 
-#[test]
-fn quantizer() {
+fn quantizer(decoder: &str, q: usize) {
   let limit = 5;
-  let w = 64;
-  let h = 80;
-  let speed = 4;
-
-  for b in DIMENSION_OFFSETS.iter() {
-    for &q in [80, 100, 120].iter() {
-      encode_decode(w + b.0, h + b.1, speed, q, limit, 8, 15, 15, true);
-    }
-  }
-}
-
-#[test]
-fn keyframes() {
-  let limit = 12;
   let w = 64;
   let h = 80;
   let speed = 10;
-  let q = 100;
 
-  encode_decode(w, h, speed, q, limit, 8, 6, 6, true);
+  for b in DIMENSION_OFFSETS.iter() {
+    let mut dec = get_decoder::<u8>(decoder, b.0, b.1);
+    dec.encode_decode(w + b.0, h + b.1, speed, q, limit, 8, Default::default(), 15, 15, true, 0, 0, 0);
+  }
 }
 
-#[test]
-fn reordering() {
+macro_rules! test_quantizer {
+  ($($Q:expr),+) => {
+    $(
+      paste::item!{
+        #[cfg_attr(feature = "decode_test", interpolate_test(aom, "aom"))]
+        #[cfg_attr(feature = "decode_test_dav1d", interpolate_test(dav1d, "dav1d"))]
+        fn [<quantizer_ $Q>](decoder: &str) {
+          quantizer(decoder, $Q);
+        }
+      }
+    )*
+  }
+}
+
+test_quantizer!{60, 80, 100, 120}
+
+#[cfg_attr(feature = "decode_test", interpolate_test(aom, "aom"))]
+#[cfg_attr(feature = "decode_test_dav1d", interpolate_test(dav1d, "dav1d"))]
+fn bitrate(decoder: &str) {
+  let limit = 5;
+  let w = 64;
+  let h = 80;
+  let speed = 10;
+
+  for &q in [172, 220, 252, 255].iter() {
+    for &r in [100, 1000, 10_000].iter() {
+      let mut dec = get_decoder::<u8>(decoder, w as usize, h as usize);
+      dec.encode_decode(w, h, speed, q, limit, 8, Default::default(), 15, 15, true, r, 0, 0);
+    }
+  }
+}
+
+#[cfg_attr(feature = "decode_test", interpolate_test(aom, "aom"))]
+#[cfg_attr(feature = "decode_test_dav1d", interpolate_test(dav1d, "dav1d"))]
+fn keyframes(decoder: &str) {
+  let limit = 12;
+  let w = 64;
+  let h = 80;
+  let speed = 9;
+  let q = 100;
+
+  let mut dec = get_decoder::<u8>(decoder, w as usize, h as usize);
+  dec.encode_decode(w, h, speed, q, limit, 8, Default::default(), 6, 6, true, 0, 0, 0);
+}
+
+#[cfg_attr(feature = "decode_test", interpolate_test(aom, "aom"))]
+#[cfg_attr(feature = "decode_test_dav1d", interpolate_test(dav1d, "dav1d"))]
+fn reordering(decoder: &str) {
   let limit = 12;
   let w = 64;
   let h = 80;
@@ -183,181 +295,131 @@ fn reordering() {
   let q = 100;
 
   for keyint in &[4, 5, 6] {
-    encode_decode(w, h, speed, q, limit, 8, *keyint, *keyint, false);
+    let mut dec = get_decoder::<u8>(decoder, w as usize, h as usize);
+    dec.encode_decode(w, h, speed, q, limit, 8, Default::default(), *keyint, *keyint, false, 0, 0, 0);
   }
 }
 
-#[test]
+#[cfg_attr(feature = "decode_test", interpolate_test(aom, "aom"))]
+#[cfg_attr(feature = "decode_test_dav1d", interpolate_test(dav1d, "dav1d"))]
+fn reordering_short_video(decoder: &str) {
+  // Regression test for https://github.com/xiph/rav1e/issues/890
+  let limit = 2;
+  let w = 64;
+  let h = 80;
+  let speed = 10;
+  let q = 100;
+  let keyint = 12;
+
+  let mut dec = get_decoder::<u8>(decoder, w as usize, h as usize);
+  dec.encode_decode(w, h, speed, q, limit, 8, Default::default(), keyint, keyint, false, 0, 0, 0);
+}
+
+#[cfg_attr(feature = "decode_test", interpolate_test(aom, "aom"))]
+#[cfg_attr(feature = "decode_test_dav1d", interpolate_test(dav1d, "dav1d"))]
 #[ignore]
-fn odd_size_frame_with_full_rdo() {
+fn odd_size_frame_with_full_rdo(decoder: &str) {
   let limit = 3;
   let w = 512 + 32 + 16 + 5;
   let h = 512 + 16 + 5;
   let speed = 0;
   let qindex = 100;
 
-  encode_decode(w, h, speed, qindex, limit, 8, 15, 15, true);
+  let mut dec = get_decoder::<u8>(decoder, w as usize, h as usize);
+  dec.encode_decode(w, h, speed, qindex, limit, 8, Default::default(), 15, 15, true, 0, 0, 0);
 }
 
-#[test]
-fn high_bd() {
+#[cfg_attr(feature = "decode_test", interpolate_test(aom, "aom"))]
+#[cfg_attr(feature = "decode_test_dav1d", interpolate_test(dav1d, "dav1d"))]
+fn low_bit_depth(decoder: &str) {
   let quantizer = 100;
   let limit = 3; // Include inter frames
   let speed = 0; // Test as many tools as possible
   let w = 64;
   let h = 80;
 
-  // 10-bit
-  encode_decode(w, h, speed, quantizer, limit, 10, 15, 15, true);
-
-  // 12-bit
-  encode_decode(w, h, speed, quantizer, limit, 12, 15, 15, true);
+  // 8-bit
+  let mut dec = get_decoder::<u8>(decoder, w as usize, h as usize);
+  dec.encode_decode(w, h, speed, quantizer, limit, 8, Default::default(), 15, 15, true, 0, 0, 0);
 }
 
-fn compare_plane<T: Ord + std::fmt::Debug>(
-  rec: &[T], rec_stride: usize, dec: &[T], dec_stride: usize, width: usize,
-  height: usize
-) {
-  for line in rec.chunks(rec_stride).zip(dec.chunks(dec_stride)).take(height) {
-    assert_eq!(&line.0[..width], &line.1[..width]);
-  }
+fn high_bit_depth(decoder: &str, depth: usize) {
+  let quantizer = 100;
+  let limit = 3; // Include inter frames
+  let speed = 0; // Test as many tools as possible
+  let w = 64;
+  let h = 80;
+
+  let mut dec = get_decoder::<u16>(decoder, w as usize, h as usize);
+  dec.encode_decode(w, h, speed, quantizer, limit, depth, Default::default(), 15, 15, true, 0, 0, 0);
 }
 
-fn compare_img(img: *const aom_image_t, frame: &Frame, bit_depth: usize, width: usize, height: usize) {
-  let img = unsafe { *img };
-  let img_iter = img.planes.iter().zip(img.stride.iter());
-
-  for (img_plane, frame_plane) in img_iter.zip(frame.planes.iter()) {
-    let w = width >> frame_plane.cfg.xdec;
-    let h = height >> frame_plane.cfg.ydec;
-    let rec_stride = frame_plane.cfg.stride;
-
-    if bit_depth > 8 {
-      let dec_stride = *img_plane.1 as usize / 2;
-
-      let dec = unsafe {
-        let data = *img_plane.0 as *const u16;
-        let size = dec_stride * h;
-
-        slice::from_raw_parts(data, size)
-      };
-
-      let rec: Vec<u16> =
-        frame_plane.data_origin().iter().map(|&v| v).collect();
-
-      compare_plane::<u16>(&rec[..], rec_stride, dec, dec_stride, w, h);
-    } else {
-      let dec_stride = *img_plane.1 as usize;
-
-      let dec = unsafe {
-        let data = *img_plane.0 as *const u8;
-        let size = dec_stride * h;
-
-        slice::from_raw_parts(data, size)
-      };
-
-      let rec: Vec<u8> =
-        frame_plane.data_origin().iter().map(|&v| v as u8).collect();
-
-      compare_plane::<u8>(&rec[..], rec_stride, dec, dec_stride, w, h);
-    }
-  }
-}
-
-fn encode_decode(
-  w: usize, h: usize, speed: usize, quantizer: usize, limit: usize,
-  bit_depth: usize, min_keyint: u64, max_keyint: u64, low_latency: bool
-) {
-  let mut ra = ChaChaRng::from_seed([0; 32]);
-
-  let mut dec = setup_decoder(w, h);
-  let mut ctx =
-    setup_encoder(w, h, speed, quantizer, bit_depth, ChromaSampling::Cs420,
-                  min_keyint, max_keyint, low_latency);
-
-  println!("Encoding {}x{} speed {} quantizer {}", w, h, speed, quantizer);
-
-  let mut iter: aom_codec_iter_t = ptr::null_mut();
-
-  let mut rec_fifo = VecDeque::new();
-
-  for _ in 0..limit {
-    let mut input = ctx.new_frame();
-    fill_frame(&mut ra, Arc::get_mut(&mut input).unwrap());
-
-    let _ = ctx.send_frame(input);
-
-    let mut done = false;
-    let mut corrupted_count = 0;
-    while !done {
-      let res = ctx.receive_packet();
-      if let Ok(pkt) = res {
-        println!("Encoded packet {}", pkt.number);
-
-        if let Some(pkt_rec) = pkt.rec {
-          rec_fifo.push_back(pkt_rec.clone());
+macro_rules! test_high_bit_depth {
+  ($($B:expr),+) => {
+    $(
+      paste::item_with_macros!{
+        #[cfg_attr(feature = "decode_test", interpolate_test(aom, "aom"))]
+        #[cfg_attr(feature = "decode_test_dav1d", interpolate_test(dav1d, "dav1d"))]
+        fn [<high_bit_depth_ $B>](decoder: &str) {
+          high_bit_depth(decoder, $B);
         }
-
-        let packet = pkt.data;
-
-        unsafe {
-          println!("Decoding frame {}", pkt.number);
-          let ret = aom_codec_decode(
-            &mut dec.dec,
-            packet.as_ptr(),
-            packet.len(),
-            ptr::null_mut()
-          );
-          println!("Decoded. -> {}", ret);
-          if ret != 0 {
-            let error_msg = aom_codec_error(&mut dec.dec);
-            println!(
-              "  Decode codec_decode failed: {}",
-              CStr::from_ptr(error_msg).to_string_lossy()
-            );
-            let detail = aom_codec_error_detail(&mut dec.dec);
-            if !detail.is_null() {
-              println!(
-                "  Decode codec_decode failed {}",
-                CStr::from_ptr(detail).to_string_lossy()
-              );
-            }
-
-            corrupted_count += 1;
-          }
-
-          if ret == 0 {
-            loop {
-              println!("Retrieving frame");
-              let img = aom_codec_get_frame(&mut dec.dec, &mut iter);
-              println!("Retrieved.");
-              if img.is_null() {
-                break;
-              }
-              let mut corrupted = 0;
-              let ret = aom_codec_control_(
-                &mut dec.dec,
-                aom_dec_control_id_AOMD_GET_FRAME_CORRUPTED as i32,
-                &mut corrupted
-              );
-              if ret != 0 {
-                let detail = aom_codec_error_detail(&mut dec.dec);
-                panic!(
-                  "Decode codec_control failed {}",
-                  CStr::from_ptr(detail).to_string_lossy()
-                );
-              }
-              corrupted_count += corrupted;
-
-              let rec = rec_fifo.pop_front().unwrap();
-              compare_img(img, &rec, bit_depth, w, h);
-            }
-          }
-        }
-      } else {
-        done = true;
       }
-    }
-    assert_eq!(corrupted_count, 0);
+    )*
+  }
+}
+
+test_high_bit_depth!{10, 12}
+
+fn chroma_sampling(decoder: &str, cs: ChromaSampling) {
+  let quantizer = 100;
+  let limit = 3; // Include inter frames
+  let speed = 0; // Test as many tools as possible
+  let w = 64;
+  let h = 80;
+
+  // TODO: bump keyint when inter is supported
+
+  let mut dec = get_decoder::<u8>(decoder, w as usize, h as usize);
+  dec.encode_decode(w, h, speed, quantizer, limit, 8, cs, 1, 1, true, 0, 0, 0);
+}
+
+macro_rules! test_chroma_sampling {
+  ($(($S:expr, $I:expr)),+) => {
+    $(
+      paste::item_with_macros!{
+        #[cfg_attr(feature = "decode_test", interpolate_test(aom, "aom"))]
+        #[cfg_attr(feature = "decode_test_dav1d", interpolate_test(dav1d, "dav1d"))]
+        fn [<chroma_sampling_ $S>](decoder: &str) {
+          chroma_sampling(decoder, $I);
+        }
+      }
+    )*
+  }
+}
+
+test_chroma_sampling!{(420, ChromaSampling::Cs420), (422, ChromaSampling::Cs422), (444, ChromaSampling::Cs444)}
+
+#[cfg_attr(feature = "decode_test", interpolate_test(aom, "aom"))]
+#[cfg_attr(feature = "decode_test_dav1d", interpolate_test(dav1d, "dav1d"))]
+fn tile_encoding_with_stretched_restoration_units(decoder: &str) {
+  let limit = 5;
+  let w = 256;
+  // the bottom tiles are small (their height is 140-128=12), so they will use stretched
+  // restoration units from their above neighbours
+  let h = 140;
+  let speed = 10;
+  let q = 100;
+
+  let mut dec = get_decoder::<u8>(decoder, w as usize, h as usize);
+  dec.encode_decode(w, h, speed, q, limit, 8, Default::default(), 15, 15, true, 0, 2, 2);
+}
+
+fn get_decoder<T: Pixel>(decoder: &str, w: usize, h: usize) -> Box<dyn TestDecoder<T>> {
+  match decoder {
+    #[cfg(feature="decode_test")]
+    "aom" => Box::new(AomDecoder::<T>::setup_decoder(w, h)),
+    #[cfg(feature="decode_test_dav1d")]
+    "dav1d" => Box::new(Dav1dDecoder::<T>::setup_decoder(w, h)),
+    _ => unimplemented!()
   }
 }

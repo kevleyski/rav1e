@@ -11,26 +11,28 @@
 #![allow(non_upper_case_globals)]
 #![allow(dead_code)]
 #![allow(non_camel_case_types)]
-#![cfg_attr(feature = "cargo-clippy", allow(cast_lossless))]
-#![cfg_attr(feature = "cargo-clippy", allow(unnecessary_mut_passed))]
-#![cfg_attr(feature = "cargo-clippy", allow(needless_range_loop))]
-#![cfg_attr(feature = "cargo-clippy", allow(collapsible_if))]
 
-use ec::Writer;
-use encoder::{FrameInvariants, ReferenceMode};
-use entropymode::*;
-use partition::BlockSize::*;
-use partition::PredictionMode::*;
-use partition::TxSize::*;
-use partition::TxType::*;
-use partition::*;
-use lrf::*;
-use plane::*;
-use scan_order::*;
-use token_cdfs::*;
-use util::{clamp, msb};
+use crate::ec::Writer;
+use crate::ec::OD_BITRES;
+use crate::encoder::FrameInvariants;
+use crate::entropymode::*;
+use crate::header::ReferenceMode;
+use crate::partition::BlockSize::*;
+use crate::partition::PredictionMode::*;
+use crate::partition::RefType::*;
+use crate::partition::TxSize::*;
+use crate::partition::TxType::*;
+use crate::partition::*;
+use crate::lrf::*;
+use crate::plane::*;
+use crate::scan_order::*;
+use crate::tiling::*;
+use crate::token_cdfs::*;
+use crate::util::{AlignedArray, clamp, msb, Pixel, UninitializedAlignedArray};
 
 use std::*;
+use std::ops::{Index, IndexMut};
+use arrayvec::*;
 
 pub const PLANES: usize = 3;
 
@@ -119,6 +121,51 @@ static av1_tx_ind: [[usize; TX_TYPES]; TX_SETS] = [
   [3, 4, 5, 8, 6, 7, 9, 10, 11, 0, 1, 2, 0, 0, 0, 0],
   [7, 8, 9, 12, 10, 11, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6],
   [7, 8, 9, 12, 10, 11, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6]
+];
+
+pub static max_txsize_rect_lookup: [TxSize; BlockSize::BLOCK_SIZES_ALL] = [
+      // 4X4
+      TX_4X4,
+      // 4X8,    8X4,      8X8
+      TX_4X8,    TX_8X4,   TX_8X8,
+      // 8X16,   16X8,     16X16
+      TX_8X16,   TX_16X8,  TX_16X16,
+      // 16X32,  32X16,    32X32
+      TX_16X32,  TX_32X16, TX_32X32,
+      // 32X64,  64X32,
+      TX_32X64,  TX_64X32,
+      // 64X64
+      TX_64X64,
+      // 64x128, 128x64,   128x128
+      TX_64X64,  TX_64X64, TX_64X64,
+      // 4x16,   16x4,
+      TX_4X16,   TX_16X4,
+      // 8x32,   32x8
+      TX_8X32,   TX_32X8,
+      // 16x64,  64x16
+      TX_16X64,  TX_64X16
+];
+
+pub static sub_tx_size_map: [TxSize; TxSize::TX_SIZES_ALL] = [
+  TX_4X4,    // TX_4X4
+  TX_4X4,    // TX_8X8
+  TX_8X8,    // TX_16X16
+  TX_16X16,  // TX_32X32
+  TX_32X32,  // TX_64X64
+  TX_4X4,    // TX_4X8
+  TX_4X4,    // TX_8X4
+  TX_8X8,    // TX_8X16
+  TX_8X8,    // TX_16X8
+  TX_16X16,  // TX_16X32
+  TX_16X16,  // TX_32X16
+  TX_32X32,  // TX_32X64
+  TX_32X32,  // TX_64X32
+  TX_4X8,    // TX_4X16
+  TX_8X4,    // TX_16X4
+  TX_8X16,   // TX_8X32
+  TX_16X8,   // TX_32X8
+  TX_16X32,  // TX_16X64
+  TX_32X16,  // TX_64X16
 ];
 
 static ss_size_lookup: [[[BlockSize; 2]; 2]; BlockSize::BLOCK_SIZES_ALL] = [
@@ -276,7 +323,7 @@ pub const seg_feature_bits: [u32; SegLvl::SEG_LVL_MAX as usize] =
 pub const seg_feature_is_signed: [bool; SegLvl::SEG_LVL_MAX as usize] =
     [ true, true, true, true, true, false, false, false, ];
 
-use context::TxClass::*;
+use crate::context::TxClass::*;
 
 static tx_type_to_class: [TxClass; TX_TYPES] = [
   TX_CLASS_2D,    // DCT_DCT
@@ -330,7 +377,7 @@ fn clip_max3(x: u8) -> u8 {
 // The ctx offset table when TX is TX_CLASS_2D.
 // TX col and row indices are clamped to 4
 
-#[cfg_attr(rustfmt, rustfmt_skip)]
+#[rustfmt::skip]
 static av1_nz_map_ctx_offset: [[[i8; 5]; 5]; TxSize::TX_SIZES_ALL] = [
   // TX_4X4
   [
@@ -509,7 +556,7 @@ static mag_ref_offset_with_txclass: [[[usize; 2]; CONTEXT_MAG_POSITION_NUM]; 3] 
 // End of Level Map
 
 pub fn has_chroma(
-  bo: &BlockOffset, bsize: BlockSize, subsampling_x: usize,
+  bo: BlockOffset, bsize: BlockSize, subsampling_x: usize,
   subsampling_y: usize
 ) -> bool {
   let bw = bsize.width_mi();
@@ -526,31 +573,37 @@ pub fn get_tx_set(
   let tx_size_sqr = tx_size.sqr();
 
   if tx_size.width() >= 64 || tx_size.height() >= 64 {
-    TxSet::TX_SET_DCTONLY
-  } else if tx_size_sqr_up == TxSize::TX_32X32 {
-    if is_inter {
+    return TxSet::TX_SET_DCTONLY;
+  }
+
+  if tx_size_sqr_up == TxSize::TX_32X32 {
+    return if is_inter {
       TxSet::TX_SET_DCT_IDTX
     } else {
       TxSet::TX_SET_DCTONLY
-    }
-  } else if use_reduced_set {
-    if is_inter {
+    };
+  }
+
+  if use_reduced_set {
+    return if is_inter {
       TxSet::TX_SET_DCT_IDTX
     } else {
       TxSet::TX_SET_DTT4_IDTX
-    }
-  } else if is_inter {
-    if tx_size_sqr == TxSize::TX_16X16 {
+    };
+  }
+
+  if is_inter {
+    return if tx_size_sqr == TxSize::TX_16X16 {
       TxSet::TX_SET_DTT9_IDTX_1DDCT
     } else {
       TxSet::TX_SET_ALL16
-    }
+    };
+  }
+
+  if tx_size_sqr == TxSize::TX_16X16 {
+    TxSet::TX_SET_DTT4_IDTX
   } else {
-    if tx_size_sqr == TxSize::TX_16X16 {
-      TxSet::TX_SET_DTT4_IDTX
-    } else {
-      TxSet::TX_SET_DTT4_IDTX_1DDCT
-    }
+    TxSet::TX_SET_DTT4_IDTX_1DDCT
   }
 }
 
@@ -702,6 +755,7 @@ pub struct CDFContext {
   intra_tx_cdf:
     [[[[u16; TX_TYPES + 1]; INTRA_MODES]; TX_SIZE_SQR_CONTEXTS]; TX_SETS_INTRA],
   inter_tx_cdf: [[[u16; TX_TYPES + 1]; TX_SIZE_SQR_CONTEXTS]; TX_SETS_INTER],
+  tx_size_cdf: [[[u16; MAX_TX_DEPTH + 1 + 1]; TX_SIZE_CONTEXTS]; MAX_TX_CATS],
   skip_cdfs: [[u16; 3]; SKIP_CONTEXTS],
   intra_inter_cdfs: [[u16; 3]; INTRA_INTER_CONTEXTS],
   angle_delta_cdf: [[u16; 2 * MAX_ANGLE_DELTA + 1 + 1]; DIRECTIONAL_MODES],
@@ -763,6 +817,7 @@ impl CDFContext {
       refmv_cdf: default_refmv_cdf,
       intra_tx_cdf: default_intra_ext_tx_cdf,
       inter_tx_cdf: default_inter_ext_tx_cdf,
+      tx_size_cdf: default_tx_size_cdf,
       skip_cdfs: default_skip_cdfs,
       intra_inter_cdfs: default_intra_inter_cdf,
       angle_delta_cdf: default_angle_delta_cdf,
@@ -806,13 +861,13 @@ impl CDFContext {
       ($field:expr) => (let r = $field.last_mut().unwrap(); *r = 0;)
     }
     macro_rules! reset_2d {
-      ($field:expr) => (for mut x in $field.iter_mut() { reset_1d!(x); })
+      ($field:expr) => (for x in $field.iter_mut() { reset_1d!(x); })
     }
     macro_rules! reset_3d {
-      ($field:expr) => (for mut x in $field.iter_mut() { reset_2d!(x); })
+      ($field:expr) => (for x in $field.iter_mut() { reset_2d!(x); })
     }
     macro_rules! reset_4d {
-      ($field:expr) => (for mut x in $field.iter_mut() { reset_3d!(x); })
+      ($field:expr) => (for x in $field.iter_mut() { reset_3d!(x); })
     }
 
     for i in 0..4 { self.partition_cdf[i][4] = 0; }
@@ -841,6 +896,11 @@ impl CDFContext {
       self.inter_tx_cdf[2][i][12] = 0;
       self.inter_tx_cdf[3][i][2] = 0;
     }
+
+    for i in 0..TX_SIZE_CONTEXTS { self.tx_size_cdf[0][i][MAX_TX_DEPTH] = 0; }
+    reset_2d!(self.tx_size_cdf[1]);
+    reset_2d!(self.tx_size_cdf[2]);
+    reset_2d!(self.tx_size_cdf[3]);
 
     reset_2d!(self.skip_cdfs);
     reset_2d!(self.intra_inter_cdfs);
@@ -1066,7 +1126,7 @@ impl CDFContext {
 }
 
 impl fmt::Debug for CDFContext {
-  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     write!(f, "CDFContext contains too many numbers to print :-(")
   }
 }
@@ -1108,7 +1168,7 @@ mod test {
   fn cfl_joint_sign() {
     use super::*;
 
-    let mut cfl = CFLParams::new();
+    let mut cfl = CFLParams::default();
     for (joint_sign, &signs) in cfl_alpha_signs.iter().enumerate() {
       cfl.sign = signs;
       assert!(cfl.joint_sign() as usize == joint_sign);
@@ -1128,7 +1188,7 @@ pub const LOCAL_BLOCK_MASK: usize = (1 << SUPERBLOCK_TO_BLOCK_SHIFT) - 1;
 
 /// Absolute offset in superblocks inside a plane, where a superblock is defined
 /// to be an N*N square where N = (1 << SUPERBLOCK_TO_PLANE_SHIFT).
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug)]
 pub struct SuperBlockOffset {
   pub x: usize,
   pub y: usize
@@ -1136,7 +1196,7 @@ pub struct SuperBlockOffset {
 
 impl SuperBlockOffset {
   /// Offset of a block inside the current superblock.
-  pub fn block_offset(&self, block_x: usize, block_y: usize) -> BlockOffset {
+  pub fn block_offset(self, block_x: usize, block_y: usize) -> BlockOffset {
     BlockOffset {
       x: (self.x << SUPERBLOCK_TO_BLOCK_SHIFT) + block_x,
       y: (self.y << SUPERBLOCK_TO_BLOCK_SHIFT) + block_y
@@ -1144,7 +1204,7 @@ impl SuperBlockOffset {
   }
 
   /// Offset of the top-left pixel of this block.
-  pub fn plane_offset(&self, plane: &PlaneConfig) -> PlaneOffset {
+  pub fn plane_offset(self, plane: &PlaneConfig) -> PlaneOffset {
     PlaneOffset {
       x: (self.x as isize) << (SUPERBLOCK_TO_PLANE_SHIFT - plane.xdec),
       y: (self.y as isize) << (SUPERBLOCK_TO_PLANE_SHIFT - plane.ydec)
@@ -1154,7 +1214,7 @@ impl SuperBlockOffset {
 
 /// Absolute offset in blocks inside a plane, where a block is defined
 /// to be an N*N square where N = (1 << BLOCK_TO_PLANE_SHIFT).
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug)]
 pub struct BlockOffset {
   pub x: usize,
   pub y: usize
@@ -1162,7 +1222,7 @@ pub struct BlockOffset {
 
 impl BlockOffset {
   /// Offset of the superblock in which this block is located.
-  pub fn sb_offset(&self) -> SuperBlockOffset {
+  pub fn sb_offset(self) -> SuperBlockOffset {
     SuperBlockOffset {
       x: self.x >> SUPERBLOCK_TO_BLOCK_SHIFT,
       y: self.y >> SUPERBLOCK_TO_BLOCK_SHIFT
@@ -1170,25 +1230,31 @@ impl BlockOffset {
   }
 
   /// Offset of the top-left pixel of this block.
-  pub fn plane_offset(&self, plane: &PlaneConfig) -> PlaneOffset {
-    let po = self.sb_offset().plane_offset(plane);
-
-    let x_offset = self.x & LOCAL_BLOCK_MASK;
-    let y_offset = self.y & LOCAL_BLOCK_MASK;
-
+  pub fn plane_offset(self, plane: &PlaneConfig) -> PlaneOffset {
     PlaneOffset {
-        x: po.x + (x_offset as isize >> plane.xdec << BLOCK_TO_PLANE_SHIFT),
-        y: po.y + (y_offset as isize >> plane.ydec << BLOCK_TO_PLANE_SHIFT)
+        x: (self.x >> plane.xdec << BLOCK_TO_PLANE_SHIFT) as isize,
+        y: (self.y >> plane.ydec << BLOCK_TO_PLANE_SHIFT) as isize,
     }
   }
 
-  pub fn y_in_sb(&self) -> usize {
+  /// Convert to plane offset without decimation
+  #[inline]
+  pub fn to_luma_plane_offset(self) -> PlaneOffset {
+    PlaneOffset {
+      x: (self.x as isize) << BLOCK_TO_PLANE_SHIFT,
+      y: (self.y as isize) << BLOCK_TO_PLANE_SHIFT,
+    }
+  }
+
+  pub fn y_in_sb(self) -> usize {
     self.y % MAX_MIB_SIZE
   }
 
-  pub fn with_offset(&self, col_offset: isize, row_offset: isize) -> BlockOffset {
+  pub fn with_offset(self, col_offset: isize, row_offset: isize) -> BlockOffset {
     let x = self.x as isize + col_offset;
     let y = self.y as isize + row_offset;
+    debug_assert!(x >= 0);
+    debug_assert!(y >= 0);
 
     BlockOffset {
       x: x as usize,
@@ -1197,19 +1263,20 @@ impl BlockOffset {
   }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 pub struct Block {
   pub mode: PredictionMode,
   pub partition: PartitionType,
   pub skip: bool,
-  pub ref_frames: [usize; 2],
+  pub ref_frames: [RefType; 2],
   pub mv: [MotionVector; 2],
-  pub neighbors_ref_counts: [usize; TOTAL_REFS_PER_FRAME],
+  // note: indexes are reflist index, NOT the same as libaom
+  pub neighbors_ref_counts: [usize; INTER_REFS_PER_FRAME],
   pub cdef_index: u8,
+  pub bsize: BlockSize,
   pub n4_w: usize, /* block width in the unit of mode_info */
   pub n4_h: usize, /* block height in the unit of mode_info */
-  pub tx_w: usize, /* transform width in the unit of mode_info */
-  pub tx_h: usize, /* transform height in the unit of mode_info */
+  pub txsize: TxSize,
   // The block-level deblock_deltas are left-shifted by
   // fi.deblock.block_delta_shift and added to the frame-configured
   // deltas
@@ -1224,13 +1291,13 @@ impl Block {
       partition: PartitionType::PARTITION_NONE,
       skip: false,
       ref_frames: [INTRA_FRAME; 2],
-      mv: [ MotionVector { row:0, col: 0 }; 2],
-      neighbors_ref_counts: [0; TOTAL_REFS_PER_FRAME],
+      mv: [ MotionVector::default(); 2],
+      neighbors_ref_counts: [0; INTER_REFS_PER_FRAME],
       cdef_index: 0,
+      bsize: BLOCK_64X64,
       n4_w: BLOCK_64X64.width_mi(),
       n4_h: BLOCK_64X64.height_mi(),
-      tx_w: TX_64X64.width_mi(),
-      tx_h: TX_64X64.height_mi(),
+      txsize: TX_64X64,
       deblock_deltas: [0, 0, 0, 0],
       segmentation_idx: 0,
     }
@@ -1239,7 +1306,7 @@ impl Block {
     self.mode >= PredictionMode::NEARESTMV
   }
   pub fn has_second_ref(&self) -> bool {
-    self.ref_frames[1] > INTRA_FRAME && self.ref_frames[1] != NONE_FRAME
+    self.ref_frames[1] != INTRA_FRAME && self.ref_frames[1] != NONE_FRAME
   }
 }
 
@@ -1248,117 +1315,134 @@ pub struct TXB_CTX {
   pub dc_sign_ctx: usize
 }
 
-#[derive(Clone, Default)]
-pub struct BlockContext {
+#[derive(Clone)]
+pub struct FrameBlocks {
+  blocks: Box<[Block]>,
   pub cols: usize,
   pub rows: usize,
+}
+
+impl FrameBlocks {
+  pub fn new(cols: usize, rows: usize) -> Self {
+    Self {
+      blocks: vec![Block::default(); cols * rows].into_boxed_slice(),
+      cols,
+      rows,
+    }
+  }
+
+  #[inline(always)]
+  pub fn as_tile_blocks(&self) -> TileBlocks<'_> {
+    TileBlocks::new(self, 0, 0, self.cols, self.rows)
+  }
+
+  #[inline(always)]
+  pub fn as_tile_blocks_mut(&mut self) -> TileBlocksMut<'_> {
+    TileBlocksMut::new(self, 0, 0, self.cols, self.rows)
+  }
+}
+
+impl Index<usize> for FrameBlocks {
+  type Output = [Block];
+  #[inline]
+  fn index(&self, index: usize) -> &Self::Output {
+    &self.blocks[index * self.cols..(index + 1) * self.cols]
+  }
+}
+
+impl IndexMut<usize> for FrameBlocks {
+  #[inline]
+  fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+    &mut self.blocks[index * self.cols..(index + 1) * self.cols]
+  }
+}
+
+// for convenience, also index by BlockOffset
+
+impl Index<BlockOffset> for FrameBlocks {
+  type Output = Block;
+  #[inline]
+  fn index(&self, bo: BlockOffset) -> &Self::Output {
+    &self[bo.y][bo.x]
+  }
+}
+
+impl IndexMut<BlockOffset> for FrameBlocks {
+  #[inline]
+  fn index_mut(&mut self, bo: BlockOffset) -> &mut Self::Output {
+    &mut self[bo.y][bo.x]
+  }
+}
+
+const PARTITION_CONTEXT_GRANULARITY: usize = 8;
+const PARTITION_CONTEXT_MAX_WIDTH: usize = MAX_TILE_WIDTH / PARTITION_CONTEXT_GRANULARITY;
+
+#[derive(Clone)]
+pub struct BlockContextCheckpoint {
+  cdef_coded: bool,
+  above_partition_context: [u8; PARTITION_CONTEXT_MAX_WIDTH],
+  left_partition_context: [u8; MAX_MIB_SIZE],
+  above_tx_context: [u8; PARTITION_CONTEXT_MAX_WIDTH],
+  left_tx_context: [u8; MAX_MIB_SIZE],
+  above_coeff_context: [[u8; PARTITION_CONTEXT_MAX_WIDTH]; PLANES],
+  left_coeff_context: [[u8; MAX_MIB_SIZE]; PLANES],
+}
+
+pub struct BlockContext<'a> {
   pub cdef_coded: bool,
   pub code_deltas: bool,
   pub update_seg: bool,
   pub preskip_segid: bool,
-  above_partition_context: Vec<u8>,
+  above_partition_context: [u8; PARTITION_CONTEXT_MAX_WIDTH],
   left_partition_context: [u8; MAX_MIB_SIZE],
-  above_coeff_context: [Vec<u8>; PLANES],
+  above_tx_context: [u8; PARTITION_CONTEXT_MAX_WIDTH],
+  left_tx_context: [u8; MAX_MIB_SIZE],
+  above_coeff_context: [[u8; PARTITION_CONTEXT_MAX_WIDTH]; PLANES],
   left_coeff_context: [[u8; MAX_MIB_SIZE]; PLANES],
-  blocks: Vec<Vec<Block>>
+  pub blocks: &'a mut TileBlocksMut<'a>,
 }
 
-impl BlockContext {
-  pub fn new(cols: usize, rows: usize) -> BlockContext {
-    // Align power of two
-    let aligned_cols = (cols + ((1 << MAX_MIB_SIZE_LOG2) - 1))
-      & !((1 << MAX_MIB_SIZE_LOG2) - 1);
-    let above_coeff_context_size =
-      cols << (MI_SIZE_LOG2 - TxSize::width_log2(TxSize::TX_4X4));
-
+impl<'a> BlockContext<'a> {
+  pub fn new(blocks: &'a mut TileBlocksMut<'a>) -> Self {
     BlockContext {
-      cols,
-      rows,
       cdef_coded: false,
       code_deltas: false,
       update_seg: false,
       preskip_segid: true,
-      above_partition_context: vec![0; aligned_cols],
+      above_partition_context: [0; PARTITION_CONTEXT_MAX_WIDTH],
       left_partition_context: [0; MAX_MIB_SIZE],
+      above_tx_context: [0; PARTITION_CONTEXT_MAX_WIDTH],
+      left_tx_context: [0; MAX_MIB_SIZE],
       above_coeff_context: [
-        vec![0; above_coeff_context_size],
-        vec![0; above_coeff_context_size],
-        vec![0; above_coeff_context_size]
+        [0; PARTITION_CONTEXT_MAX_WIDTH],
+        [0; PARTITION_CONTEXT_MAX_WIDTH],
+        [0; PARTITION_CONTEXT_MAX_WIDTH]
       ],
       left_coeff_context: [[0; MAX_MIB_SIZE]; PLANES],
-      blocks: vec![vec![Block::default(); cols]; rows]
+      blocks,
     }
   }
 
-  pub fn checkpoint(&mut self) -> BlockContext {
-    BlockContext {
-      cols: self.cols,
-      rows: self.rows,
+  pub fn checkpoint(&mut self) -> BlockContextCheckpoint {
+    BlockContextCheckpoint {
       cdef_coded: self.cdef_coded,
-      code_deltas: self.code_deltas,
-      update_seg: self.update_seg,
-      preskip_segid: self.preskip_segid,
-      above_partition_context: self.above_partition_context.clone(),
+      above_partition_context: self.above_partition_context,
       left_partition_context: self.left_partition_context,
-      above_coeff_context: self.above_coeff_context.clone(),
+      above_tx_context: self.above_tx_context,
+      left_tx_context: self.left_tx_context,
+      above_coeff_context: self.above_coeff_context,
       left_coeff_context: self.left_coeff_context,
-      blocks: vec![vec![Block::default(); 0]; 0]
     }
   }
 
-  pub fn rollback(&mut self, checkpoint: &BlockContext) {
-    self.cols = checkpoint.cols;
-    self.rows = checkpoint.rows;
+  pub fn rollback(&mut self, checkpoint: &BlockContextCheckpoint) {
     self.cdef_coded = checkpoint.cdef_coded;
-    self.above_partition_context = checkpoint.above_partition_context.clone();
+    self.above_partition_context = checkpoint.above_partition_context;
     self.left_partition_context = checkpoint.left_partition_context;
-    self.above_coeff_context = checkpoint.above_coeff_context.clone();
+    self.above_tx_context = checkpoint.above_tx_context;
+    self.left_tx_context = checkpoint.left_tx_context;
+    self.above_coeff_context = checkpoint.above_coeff_context;
     self.left_coeff_context = checkpoint.left_coeff_context;
-  }
-
-  pub fn at_mut(&mut self, bo: &BlockOffset) -> &mut Block {
-    &mut self.blocks[bo.y][bo.x]
-  }
-
-  pub fn at(&self, bo: &BlockOffset) -> &Block {
-    &self.blocks[bo.y][bo.x]
-  }
-
-  pub fn above_of(&mut self, bo: &BlockOffset) -> Block {
-    if bo.y > 0 {
-      self.blocks[bo.y - 1][bo.x]
-    } else {
-      Block::default()
-    }
-  }
-
-  pub fn left_of(&mut self, bo: &BlockOffset) -> Block {
-    if bo.x > 0 {
-      self.blocks[bo.y][bo.x - 1]
-    } else {
-      Block::default()
-    }
-  }
-
-  pub fn above_left_of(&mut self, bo: &BlockOffset) -> Block {
-    if bo.x > 0 && bo.y > 0 {
-      self.blocks[bo.y - 1][bo.x - 1]
-    } else {
-      Block::default()
-    }
-  }
-
-  pub fn for_each<F>(&mut self, bo: &BlockOffset, bsize: BlockSize, f: F)
-  where
-    F: Fn(&mut Block) -> ()
-  {
-    let bw = bsize.width_mi();
-    let bh = bsize.height_mi();
-    for y in 0..bh {
-      for x in 0..bw {
-        f(&mut self.blocks[bo.y + y as usize][bo.x + x as usize]);
-      }
-    }
   }
 
   pub fn set_dc_sign(&mut self, cul_level: &mut u32, dc_val: i32) {
@@ -1370,7 +1454,7 @@ impl BlockContext {
   }
 
   fn set_coeff_context(
-    &mut self, plane: usize, bo: &BlockOffset, tx_size: TxSize, xdec: usize,
+    &mut self, plane: usize, bo: BlockOffset, tx_size: TxSize, xdec: usize,
     ydec: usize, value: u8
   ) {
     for bx in 0..tx_size.width_mi() {
@@ -1393,10 +1477,41 @@ impl BlockContext {
       *c = 0;
     }
   }
-  //TODO(anyone): Add reset_left_tx_context() here then call it in reset_left_contexts()
+
+  pub fn update_tx_size_context(
+    &mut self, bo: BlockOffset, bsize: BlockSize, tx_size: TxSize, skip: bool
+  ) {
+    let n4_w = bsize.width_mi();
+    let n4_h = bsize.height_mi();
+
+    let (tx_w, tx_h) = if skip {
+      (n4_w as u8, n4_h as u8)
+    } else {
+      (tx_size.width() as u8, tx_size.height() as u8)
+    };
+
+    let above_ctx =
+      &mut self.above_tx_context[bo.x..bo.x + n4_w as usize];
+    let left_ctx = &mut self.left_tx_context
+      [bo.y_in_sb()..bo.y_in_sb() + n4_h as usize];
+
+    for v in above_ctx[0..n4_w].iter_mut() {
+      *v = tx_w;
+    }
+
+    for v in left_ctx[0..n4_h].iter_mut()  {
+      *v = tx_h;
+    }
+  }
+
+  fn reset_left_tx_context(&mut self) {
+    for c in &mut self.left_tx_context {
+      *c = 0;
+    }
+  }
 
   pub fn reset_skip_context(
-    &mut self, bo: &BlockOffset, bsize: BlockSize, xdec: usize, ydec: usize
+    &mut self, bo: BlockOffset, bsize: BlockSize, xdec: usize, ydec: usize
   ) {
     const num_planes: usize = 3;
     let nplanes = if bsize >= BLOCK_8X8 {
@@ -1442,33 +1557,11 @@ impl BlockContext {
     }
     BlockContext::reset_left_partition_context(self);
 
-    //TODO(anyone): Call reset_left_tx_context() here.
-  }
-
-  pub fn set_mode(
-    &mut self, bo: &BlockOffset, bsize: BlockSize, mode: PredictionMode
-  ) {
-    self.for_each(bo, bsize, |block| block.mode = mode);
-  }
-
-  pub fn set_block_size(&mut self, bo: &BlockOffset, bsize: BlockSize) {
-    let n4_w = bsize.width_mi();
-    let n4_h = bsize.height_mi();
-    self.for_each(bo, bsize, |block| { block.n4_w = n4_w; block.n4_h = n4_h } );
-  }
-
-  pub fn set_tx_size(&mut self, bo: &BlockOffset, txsize: TxSize) {
-    let tx_w = txsize.width_mi();
-    let tx_h = txsize.height_mi();
-    self.for_each(bo, txsize.block_size(), |block| { block.tx_w = tx_w; block.tx_h = tx_h } );
-  }
-
-  pub fn get_mode(&mut self, bo: &BlockOffset) -> PredictionMode {
-    self.blocks[bo.y][bo.x].mode
+    BlockContext::reset_left_tx_context(self);
   }
 
   fn partition_plane_context(
-    &self, bo: &BlockOffset, bsize: BlockSize
+    &self, bo: BlockOffset, bsize: BlockSize
   ) -> usize {
     // TODO: this should be way simpler without sub8x8
     let above_ctx = self.above_partition_context[bo.x];
@@ -1483,9 +1576,11 @@ impl BlockContext {
   }
 
   pub fn update_partition_context(
-    &mut self, bo: &BlockOffset, subsize: BlockSize, bsize: BlockSize
+    &mut self, bo: BlockOffset, subsize: BlockSize, bsize: BlockSize
   ) {
     #[allow(dead_code)]
+    assert!(bsize.is_sqr());
+
     let bw = bsize.width_mi();
     let bh = bsize.height_mi();
 
@@ -1506,60 +1601,10 @@ impl BlockContext {
     }
   }
 
-  fn skip_context(&mut self, bo: &BlockOffset) -> usize {
-    let above_skip = if bo.y > 0 {
-      self.above_of(bo).skip as usize
-    } else {
-      0
-    };
-    let left_skip = if bo.x > 0 {
-      self.left_of(bo).skip as usize
-    } else {
-      0
-    };
-    above_skip + left_skip
-  }
-
-  pub fn set_skip(&mut self, bo: &BlockOffset, bsize: BlockSize, skip: bool) {
-    self.for_each(bo, bsize, |block| block.skip = skip);
-  }
-
-  pub fn set_segmentation_idx(&mut self, bo: &BlockOffset, bsize: BlockSize, idx: u8) {
-    self.for_each(bo, bsize, |block| block.segmentation_idx = idx);
-  }
-
-  pub fn set_ref_frames(&mut self, bo: &BlockOffset, bsize: BlockSize, r: [usize; 2]) {
-    let bw = bsize.width_mi();
-    let bh = bsize.height_mi();
-
-    for y in 0..bh {
-      for x in 0..bw {
-        self.blocks[bo.y + y as usize][bo.x + x as usize].ref_frames = r;
-      }
-    }
-  }
-
-  pub fn set_motion_vectors(&mut self, bo: &BlockOffset, bsize: BlockSize, mvs: [MotionVector; 2]) {
-    let bw = bsize.width_mi();
-    let bh = bsize.height_mi();
-
-    for y in 0..bh {
-      for x in 0..bw {
-        self.blocks[bo.y + y as usize][bo.x + x as usize].mv = mvs;
-      }
-    }
-  }
-
-  pub fn set_cdef(&mut self, sbo: &SuperBlockOffset, cdef_index: u8) {
-    let bo = sbo.block_offset(0, 0);
-    // Checkme: Is 16 still the right block unit for 128x128 superblocks?
-    let bw = cmp::min (bo.x + MAX_MIB_SIZE, self.blocks[bo.y as usize].len());
-    let bh = cmp::min (bo.y + MAX_MIB_SIZE, self.blocks.len());
-    for y in bo.y..bh {
-      for x in bo.x..bw {
-        self.blocks[y as usize][x as usize].cdef_index = cdef_index;
-      }
-    }
+  fn skip_context(&mut self, bo: BlockOffset) -> usize {
+    let above_skip = bo.y > 0 && self.blocks.above_of(bo).skip;
+    let left_skip = bo.x > 0 && self.blocks.left_of(bo).skip;
+    above_skip as usize + left_skip as usize
   }
 
   // The mode info data structure has a one element border above and to the
@@ -1569,33 +1614,29 @@ impl BlockContext {
   // 1 - intra/inter, inter/intra
   // 2 - intra/--, --/intra
   // 3 - intra/intra
-  pub fn intra_inter_context(&mut self, bo: &BlockOffset) -> usize {
+  pub fn intra_inter_context(&mut self, bo: BlockOffset) -> usize {
     let has_above = bo.y > 0;
     let has_left = bo.x > 0;
 
     match (has_above, has_left) {
       (true, true) => {
-        let above_intra = !self.above_of(bo).is_inter();
-        let left_intra = !self.left_of(bo).is_inter();
+        let above_intra = !self.blocks.above_of(bo).is_inter();
+        let left_intra = !self.blocks.left_of(bo).is_inter();
         if above_intra && left_intra {
           3
         } else {
           (above_intra || left_intra) as usize
         }
       }
-      (true, _) | (_, true) =>
-        2 * if has_above {
-          !self.above_of(bo).is_inter() as usize
-        } else {
-          !self.left_of(bo).is_inter() as usize
-        },
-      (_, _) => 0
+      (true, false) => if self.blocks.above_of(bo).is_inter() { 0 } else { 2 },
+      (false, true) => if self.blocks.left_of(bo).is_inter() { 0 } else { 2 },
+      _ => 0
     }
   }
 
   pub fn get_txb_ctx(
     &mut self, plane_bsize: BlockSize, tx_size: TxSize, plane: usize,
-    bo: &BlockOffset, xdec: usize, ydec: usize
+    bo: BlockOffset, xdec: usize, ydec: usize
   ) -> TXB_CTX {
     let mut txb_ctx = TXB_CTX {
       txb_skip_ctx: 0,
@@ -1709,7 +1750,7 @@ impl CFLSign {
   }
 }
 
-use context::CFLSign::*;
+use crate::context::CFLSign::*;
 const CFL_SIGNS: usize = 3;
 static cfl_sign_value: [i16; CFL_SIGNS] = [ 0, -1, 1 ];
 
@@ -1719,13 +1760,16 @@ pub struct CFLParams {
   scale: [u8; 2]
 }
 
-impl CFLParams {
-  pub fn new() -> CFLParams {
-    CFLParams {
+impl Default for CFLParams {
+  fn default() -> Self {
+    Self {
       sign: [CFL_SIGN_NEG, CFL_SIGN_ZERO],
       scale: [1, 0]
     }
   }
+}
+
+impl CFLParams {
   pub fn joint_sign(self) -> u32 {
     assert!(self.sign[0] != CFL_SIGN_ZERO || self.sign[1] != CFL_SIGN_ZERO);
     (self.sign[0] as u32) * (CFL_SIGNS as u32) + (self.sign[1] as u32) - 1
@@ -1760,20 +1804,20 @@ impl FieldMap {
     for (name, start, end) in &self.map {
       // eprintln!("{} {} {} val {}", name, start, end, addr);
       if addr >= *start && addr < *end {
-        eprintln!(" CDF {}", name);
-        eprintln!("");
+        println!(" CDF {}", name);
+        println!();
         return;
       }
     }
 
-    eprintln!("  CDF address not found {}", addr);
+    println!("  CDF address not found {}", addr);
   }
 }
 
 macro_rules! symbol_with_update {
   ($self:ident, $w:ident, $s:expr, $cdf:expr) => {
     $w.symbol_with_update($s, $cdf);
-    #[cfg(debug)] {
+    #[cfg(feature = "desync_finder")] {
       if let Some(map) = $self.fc_map.as_ref() {
         map.lookup($cdf.as_ptr() as usize);
       }
@@ -1798,27 +1842,27 @@ pub fn av1_get_coded_tx_size(tx_size: TxSize) -> TxSize {
 #[derive(Clone)]
 pub struct ContextWriterCheckpoint {
   pub fc: CDFContext,
-  pub bc: BlockContext
+  pub bc: BlockContextCheckpoint,
 }
 
-#[derive(Clone)]
-pub struct ContextWriter {
-  pub bc: BlockContext,
-  pub fc: CDFContext,
-  #[cfg(debug)]
+pub struct ContextWriter<'a> {
+  pub bc: BlockContext<'a>,
+  pub fc: &'a mut CDFContext,
+  #[cfg(feature = "desync_finder")]
   fc_map: Option<FieldMap> // For debugging purposes
 }
 
-impl ContextWriter {
-  pub fn new(fc: CDFContext, bc: BlockContext) -> Self {
+impl<'a> ContextWriter<'a> {
+  #[allow(clippy::let_and_return)]
+  pub fn new(fc: &'a mut CDFContext, bc: BlockContext<'a>) -> Self {
     #[allow(unused_mut)]
     let mut cw = ContextWriter {
       fc,
       bc,
-      #[cfg(debug)]
+      #[cfg(feature = "desync_finder")]
       fc_map: Default::default()
     };
-    #[cfg(debug)] {
+    #[cfg(feature = "desync_finder")] {
       if std::env::var_os("RAV1E_DEBUG").is_some() {
         cw.fc_map = Some(FieldMap {
           map: cw.fc.build_map()
@@ -1902,16 +1946,17 @@ impl ContextWriter {
   }
 
   pub fn write_partition(
-    &mut self, w: &mut dyn Writer, bo: &BlockOffset, p: PartitionType, bsize: BlockSize
+    &mut self, w: &mut impl Writer, bo: BlockOffset, p: PartitionType, bsize: BlockSize
   ) {
+    debug_assert!(bsize.is_sqr());
     assert!(bsize >= BlockSize::BLOCK_8X8 );
     let hbs = bsize.width_mi() / 2;
-    let has_cols = (bo.x + hbs) < self.bc.cols;
-    let has_rows = (bo.y + hbs) < self.bc.rows;
-    let ctx = self.bc.partition_plane_context(&bo, bsize);
+    let has_cols = (bo.x + hbs) < self.bc.blocks.cols();
+    let has_rows = (bo.y + hbs) < self.bc.blocks.rows();
+    let ctx = self.bc.partition_plane_context(bo, bsize);
     assert!(ctx < PARTITION_CONTEXTS);
     let partition_cdf = if bsize <= BlockSize::BLOCK_8X8 {
-      &mut self.fc.partition_cdf[ctx][..PARTITION_TYPES+1]
+      &mut self.fc.partition_cdf[ctx][..=PARTITION_TYPES]
     } else {
       &mut self.fc.partition_cdf[ctx]
     };
@@ -1944,17 +1989,104 @@ impl ContextWriter {
       w.symbol((p == PartitionType::PARTITION_SPLIT) as u32, &cdf);
     }
   }
+
+  pub fn get_tx_size_context(&self, bo: BlockOffset, bsize: BlockSize) -> usize {
+    let max_tx_size = max_txsize_rect_lookup[bsize as usize];
+    let max_tx_wide = max_tx_size.width();
+    let max_tx_high = max_tx_size.height();
+    let has_above = bo.y > 0;
+    let has_left = bo.x > 0;
+    let mut above = self.bc.above_tx_context[bo.x] >= max_tx_wide as u8;
+    let mut left = self.bc.left_tx_context[bo.y_in_sb()] >= max_tx_high as u8;
+
+    if has_above {
+      let above_blk = self.bc.blocks.above_of(bo);
+      if above_blk.is_inter() { above = (above_blk.n4_w << MI_SIZE_LOG2) >= max_tx_wide; };
+    }
+    if has_left {
+      let left_blk = self.bc.blocks.left_of(bo);
+      if left_blk.is_inter() { left = (left_blk.n4_h << MI_SIZE_LOG2) >= max_tx_high; };
+    }
+    if has_above && has_left { return above as usize + left as usize };
+    if has_above { return above as usize};
+    if has_left { return left as usize};
+    0
+  }
+
+  pub fn write_tx_size_intra(&mut self, w: &mut dyn Writer, bo: BlockOffset,
+                          bsize: BlockSize, tx_size: TxSize) {
+    fn tx_size_to_depth(tx_size: TxSize, bsize: BlockSize ) -> usize {
+      let mut ctx_size = max_txsize_rect_lookup[bsize as usize];
+      let mut depth: usize = 0;
+      while tx_size != ctx_size {
+        depth += 1;
+        ctx_size = sub_tx_size_map[ctx_size as usize];
+        debug_assert!(depth <= MAX_TX_DEPTH);
+      }
+      depth
+    }
+    fn bsize_to_max_depth(bsize: BlockSize) -> usize {
+      let mut tx_size: TxSize = max_txsize_rect_lookup[bsize as usize];
+      let mut depth = 0;
+      while depth < MAX_TX_DEPTH && tx_size != TX_4X4 {
+        depth += 1;
+        tx_size = sub_tx_size_map[tx_size as usize];
+        debug_assert!(depth <= MAX_TX_DEPTH);
+      }
+      depth
+    }
+    fn bsize_to_tx_size_cat(bsize: BlockSize) -> usize {
+      let mut tx_size: TxSize = max_txsize_rect_lookup[bsize as usize];
+      debug_assert!(tx_size != TX_4X4);
+      let mut depth = 0;
+      while tx_size != TX_4X4 {
+        depth += 1;
+        tx_size = sub_tx_size_map[tx_size as usize];
+      }
+      debug_assert!(depth <= MAX_TX_CATS);
+
+      depth - 1
+    }
+
+    debug_assert!(!self.bc.blocks[bo].is_inter());
+    debug_assert!(bsize.greater_than(BlockSize::BLOCK_4X4));
+
+    let tx_size_ctx = self.get_tx_size_context(bo, bsize);
+    let depth = tx_size_to_depth(tx_size, bsize);
+
+    let max_depths = bsize_to_max_depth(bsize);
+    let tx_size_cat = bsize_to_tx_size_cat(bsize);
+
+    debug_assert!(depth <= max_depths);
+    debug_assert!(!tx_size.is_rect() || bsize.is_rect_tx_allowed());
+
+    symbol_with_update!(self, w, depth as u32,
+        &mut self.fc.tx_size_cdf[tx_size_cat][tx_size_ctx][..=max_depths+1]);
+  }
+
+  pub fn get_cdf_intra_mode_kf(&self, bo: BlockOffset) -> &[u16; INTRA_MODES + 1] {
+    static intra_mode_context: [usize; INTRA_MODES] =
+      [0, 1, 2, 3, 4, 4, 4, 4, 3, 0, 1, 2, 0];
+    let above_mode = if bo.y > 0 { self.bc.blocks.above_of(bo).mode } else { PredictionMode::DC_PRED };
+    let left_mode = if bo.x > 0 { self.bc.blocks.left_of(bo).mode } else { PredictionMode::DC_PRED };
+    let above_ctx = intra_mode_context[above_mode as usize];
+    let left_ctx = intra_mode_context[left_mode as usize];
+    &self.fc.kf_y_cdf[above_ctx][left_ctx]
+  }
   pub fn write_intra_mode_kf(
-    &mut self, w: &mut dyn Writer, bo: &BlockOffset, mode: PredictionMode
+    &mut self, w: &mut dyn Writer, bo: BlockOffset, mode: PredictionMode
   ) {
     static intra_mode_context: [usize; INTRA_MODES] =
       [0, 1, 2, 3, 4, 4, 4, 4, 3, 0, 1, 2, 0];
-    let above_mode = self.bc.above_of(bo).mode as usize;
-    let left_mode = self.bc.left_of(bo).mode as usize;
-    let above_ctx = intra_mode_context[above_mode];
-    let left_ctx = intra_mode_context[left_mode];
+    let above_mode = if bo.y > 0 { self.bc.blocks.above_of(bo).mode } else { PredictionMode::DC_PRED };
+    let left_mode = if bo.x > 0 { self.bc.blocks.left_of(bo).mode } else { PredictionMode::DC_PRED };
+    let above_ctx = intra_mode_context[above_mode as usize];
+    let left_ctx = intra_mode_context[left_mode as usize];
     let cdf = &mut self.fc.kf_y_cdf[above_ctx][left_ctx];
     symbol_with_update!(self, w, mode as u32, cdf);
+  }
+  pub fn get_cdf_intra_mode(&self, bsize: BlockSize) -> &[u16; INTRA_MODES + 1] {
+    &self.fc.y_mode_cdf[size_group_lookup[bsize as usize] as usize]
   }
   pub fn write_intra_mode(&mut self, w: &mut dyn Writer, bsize: BlockSize, mode: PredictionMode) {
     let cdf =
@@ -1993,103 +2125,15 @@ impl ContextWriter {
     symbol_with_update!(self, w, enable as u32, &mut self.fc.filter_intra_cdfs[block_size as usize]);
   }
 
-  fn get_mvref_ref_frames(&mut self, ref_frame: usize) -> ([usize; 2], usize) {
-    let ref_frame_map: [[usize; 2]; TOTAL_COMP_REFS] = [
-      [ LAST_FRAME,  BWDREF_FRAME  ], [ LAST2_FRAME,  BWDREF_FRAME  ],
-      [ LAST3_FRAME, BWDREF_FRAME  ], [ GOLDEN_FRAME, BWDREF_FRAME  ],
-      [ LAST_FRAME,  ALTREF2_FRAME ], [ LAST2_FRAME,  ALTREF2_FRAME ],
-      [ LAST3_FRAME, ALTREF2_FRAME ], [ GOLDEN_FRAME, ALTREF2_FRAME ],
-      [ LAST_FRAME,  ALTREF_FRAME  ], [ LAST2_FRAME,  ALTREF_FRAME  ],
-      [ LAST3_FRAME, ALTREF_FRAME  ], [ GOLDEN_FRAME, ALTREF_FRAME  ],
-      [ LAST_FRAME,  LAST2_FRAME   ], [ LAST_FRAME,   LAST3_FRAME   ],
-      [ LAST_FRAME,  GOLDEN_FRAME  ], [ BWDREF_FRAME, ALTREF_FRAME  ],
-
-      // NOTE: Following reference frame pairs are not supported to be explicitly
-      //       signalled, but they are possibly chosen by the use of skip_mode,
-      //       which may use the most recent one-sided reference frame pair.
-      [ LAST2_FRAME, LAST3_FRAME   ], [  LAST2_FRAME, GOLDEN_FRAME  ],
-      [ LAST3_FRAME, GOLDEN_FRAME  ], [ BWDREF_FRAME, ALTREF2_FRAME ],
-      [ ALTREF2_FRAME, ALTREF_FRAME ]
-    ];
-
-    if ref_frame >= REF_FRAMES {
-      ([ ref_frame_map[ref_frame - REF_FRAMES][0], ref_frame_map[ref_frame - REF_FRAMES][1] ], 2)
-    } else {
-      ([ ref_frame, 0 ], 1)
-    }
-  }
-
   fn find_valid_row_offs(&mut self, row_offset: isize, mi_row: usize, mi_rows: usize) -> isize {
-    if /* !tile->tg_horz_boundary */ true {
-      cmp::min(cmp::max(row_offset, -(mi_row as isize)), (mi_rows - mi_row - 1) as isize)
-    } else {
-      0
-      /* TODO: for tiling */
-    }
+    cmp::min(cmp::max(row_offset, -(mi_row as isize)), (mi_rows - mi_row - 1) as isize)
   }
 
-  fn has_tr(&mut self, bo: &BlockOffset, bsize: BlockSize) -> bool {
-    let sb_mi_size = BLOCK_64X64.width_mi(); /* Assume 64x64 for now */
-    let mask_row = bo.y & LOCAL_BLOCK_MASK;
-    let mask_col = bo.x & LOCAL_BLOCK_MASK;
-    let target_n4_w = bsize.width_mi();
-    let target_n4_h = bsize.height_mi();
-
-    let mut bs = target_n4_w.max(target_n4_h);
-
-    if bs > BLOCK_64X64.width_mi() {
-      return false;
-    }
-
-    let mut has_tr = !((mask_row & bs) != 0 && (mask_col & bs) != 0);
-
-    /* TODO: assert its a power of two */
-
-    while bs < sb_mi_size {
-      if (mask_col & bs) != 0 {
-        if (mask_col & (2 * bs) != 0) && (mask_row & (2 * bs) != 0) {
-          has_tr = false;
-          break;
-        }
-      } else {
-        break;
-      }
-      bs <<= 1;
-    }
-
-    /* The left hand of two vertical rectangles always has a top right (as the
-     * block above will have been decoded) */
-    if (target_n4_w < target_n4_h) && (bo.x & target_n4_w) == 0 {
-      has_tr = true;
-    }
-
-    /* The bottom of two horizontal rectangles never has a top right (as the block
-     * to the right won't have been decoded) */
-    if (target_n4_w > target_n4_h) && (bo.y & target_n4_h) != 0 {
-      has_tr = false;
-    }
-
-    /* The bottom left square of a Vertical A (in the old format) does
-     * not have a top right as it is decoded before the right hand
-     * rectangle of the partition */
-/*
-    if blk.partition == PartitionType::PARTITION_VERT_A {
-      if blk.n4_w == blk.n4_h {
-        if (mask_row & bs) != 0 {
-          has_tr = false;
-        }
-      }
-    }
-*/
-
-    has_tr
+  fn find_valid_col_offs(&mut self, col_offset: isize, mi_col: usize, mi_cols: usize) -> isize {
+    cmp::min(cmp::max(col_offset, -(mi_col as isize)), (mi_cols - mi_col - 1) as isize)
   }
 
-  fn find_valid_col_offs(&mut self, col_offset: isize, mi_col: usize) -> isize {
-    cmp::max(col_offset, -(mi_col as isize))
-  }
-
-  fn find_matching_mv(&self, mv: MotionVector, mv_stack: &mut Vec<CandidateMV>) -> bool {
+  fn find_matching_mv(&self, mv: MotionVector, mv_stack: &mut ArrayVec<[CandidateMV; 9]>) -> bool {
     for mv_cand in mv_stack {
       if mv.row == mv_cand.this_mv.row && mv.col == mv_cand.this_mv.col {
         return true;
@@ -2098,7 +2142,7 @@ impl ContextWriter {
     false
   }
 
-  fn find_matching_mv_and_update_weight(&self, mv: MotionVector, mv_stack: &mut Vec<CandidateMV>, weight: u32) -> bool {
+  fn find_matching_mv_and_update_weight(&self, mv: MotionVector, mv_stack: &mut ArrayVec<[CandidateMV; 9]>, weight: u32) -> bool {
     for mut mv_cand in mv_stack {
       if mv.row == mv_cand.this_mv.row && mv.col == mv_cand.this_mv.col {
         mv_cand.weight += weight;
@@ -2108,8 +2152,8 @@ impl ContextWriter {
     false
   }
 
-  fn find_matching_comp_mv_and_update_weight(&self, mvs: [MotionVector; 2], mv_stack: &mut Vec<CandidateMV>, weight: u32) -> bool {
-    for mut mv_cand in mv_stack {
+  fn find_matching_comp_mv_and_update_weight(&self, mvs: [MotionVector; 2], mv_stack: &mut ArrayVec<[CandidateMV; 9]>, weight: u32) -> bool {
+    for mv_cand in mv_stack {
       if mvs[0].row == mv_cand.this_mv.row && mvs[0].col == mv_cand.this_mv.col &&
         mvs[1].row == mv_cand.comp_mv.row && mvs[1].col == mv_cand.comp_mv.col {
         mv_cand.weight += weight;
@@ -2119,7 +2163,7 @@ impl ContextWriter {
     false
   }
 
-  fn add_ref_mv_candidate(&self, ref_frames: [usize; 2], blk: &Block, mv_stack: &mut Vec<CandidateMV>,
+  fn add_ref_mv_candidate(&self, ref_frames: [RefType; 2], blk: &Block, mv_stack: &mut ArrayVec<[CandidateMV; 9]>,
                           weight: u32, newmv_count: &mut usize, is_compound: bool) -> bool {
     if !blk.is_inter() { /* For intrabc */
       false
@@ -2131,7 +2175,7 @@ impl ContextWriter {
           let mv_cand = CandidateMV {
             this_mv: blk.mv[0],
             comp_mv: blk.mv[1],
-            weight: weight
+            weight
           };
 
           mv_stack.push(mv_cand);
@@ -2158,8 +2202,8 @@ impl ContextWriter {
           if !found_match && mv_stack.len() < MAX_REF_MV_STACK_SIZE {
             let mv_cand = CandidateMV {
               this_mv: blk.mv[i],
-              comp_mv: MotionVector { row: 0, col: 0 },
-              weight: weight
+              comp_mv: MotionVector::default(),
+              weight
             };
 
             mv_stack.push(mv_cand);
@@ -2181,12 +2225,12 @@ impl ContextWriter {
     }
   }
 
-  fn add_extra_mv_candidate(
+  fn add_extra_mv_candidate<T: Pixel>(
     &self,
     blk: &Block,
-    ref_frames: [usize; 2],
-    mv_stack: &mut Vec<CandidateMV>,
-    fi: &FrameInvariants,
+    ref_frames: [RefType; 2],
+    mv_stack: &mut ArrayVec<[CandidateMV; 9]>,
+    fi: &FrameInvariants<T>,
     is_compound: bool,
     ref_id_count: &mut [usize; 2],
     ref_id_mvs: &mut [[MotionVector; 2]; 2],
@@ -2196,20 +2240,20 @@ impl ContextWriter {
     if is_compound {
       for cand_list in 0..2 {
         let cand_ref = blk.ref_frames[cand_list];
-        if cand_ref > INTRA_FRAME && cand_ref != NONE_FRAME {
+        if cand_ref != INTRA_FRAME && cand_ref != NONE_FRAME {
           for list in 0..2 {
             let mut cand_mv = blk.mv[cand_list];
             if cand_ref == ref_frames[list] && ref_id_count[list] < 2 {
               ref_id_mvs[list][ref_id_count[list]] = cand_mv;
-              ref_id_count[list] = ref_id_count[list] + 1;
+              ref_id_count[list] += 1;
             } else if ref_diff_count[list] < 2 {
-              if fi.ref_frame_sign_bias[cand_ref - LAST_FRAME] !=
-                fi.ref_frame_sign_bias[ref_frames[list] - LAST_FRAME] {
+              if fi.ref_frame_sign_bias[cand_ref.to_index()] !=
+                fi.ref_frame_sign_bias[ref_frames[list].to_index()] {
                 cand_mv.row = -cand_mv.row;
                 cand_mv.col = -cand_mv.col;
               }
               ref_diff_mvs[list][ref_diff_count[list]] = cand_mv;
-              ref_diff_count[list] = ref_diff_count[list] + 1;
+              ref_diff_count[list] += 1;
             }
           }
         }
@@ -2217,10 +2261,10 @@ impl ContextWriter {
     } else {
       for cand_list in 0..2 {
         let cand_ref = blk.ref_frames[cand_list];
-        if cand_ref > INTRA_FRAME && cand_ref != NONE_FRAME {
+        if cand_ref != INTRA_FRAME && cand_ref != NONE_FRAME {
           let mut mv = blk.mv[cand_list];
-          if fi.ref_frame_sign_bias[cand_ref - LAST_FRAME] !=
-            fi.ref_frame_sign_bias[ref_frames[0] - LAST_FRAME] {
+          if fi.ref_frame_sign_bias[cand_ref.to_index()] !=
+            fi.ref_frame_sign_bias[ref_frames[0].to_index()] {
             mv.row = -mv.row;
             mv.col = -mv.col;
           }
@@ -2228,7 +2272,7 @@ impl ContextWriter {
           if !self.find_matching_mv(mv, mv_stack) {
             let mv_cand = CandidateMV {
               this_mv: mv,
-              comp_mv: MotionVector { row: 0, col: 0 },
+              comp_mv: MotionVector::default(),
               weight: 2
             };
             mv_stack.push(mv_cand);
@@ -2238,14 +2282,14 @@ impl ContextWriter {
     }
   }
 
-  fn scan_row_mbmi(&mut self, bo: &BlockOffset, row_offset: isize, max_row_offs: isize,
-                   processed_rows: &mut isize, ref_frames: [usize; 2],
-                   mv_stack: &mut Vec<CandidateMV>, newmv_count: &mut usize, bsize: BlockSize,
+  fn scan_row_mbmi(&mut self, bo: BlockOffset, row_offset: isize, max_row_offs: isize,
+                   processed_rows: &mut isize, ref_frames: [RefType; 2],
+                   mv_stack: &mut ArrayVec<[CandidateMV; 9]>, newmv_count: &mut usize, bsize: BlockSize,
                    is_compound: bool) -> bool {
     let bc = &self.bc;
     let target_n4_w = bsize.width_mi();
 
-    let end_mi = cmp::min(cmp::min(target_n4_w, bc.cols - bo.x),
+    let end_mi = cmp::min(cmp::min(target_n4_w, bc.blocks.cols() - bo.x),
                           BLOCK_64X64.width_mi());
     let n4_w_8 = BLOCK_8X8.width_mi();
     let n4_w_16 = BLOCK_16X16.width_mi();
@@ -2264,7 +2308,7 @@ impl ContextWriter {
 
     let mut i = 0;
     while i < end_mi {
-      let cand = bc.at(&bo.with_offset(col_offset + i as isize, row_offset));
+      let cand = &bc.blocks[bo.with_offset(col_offset + i as isize, row_offset)];
 
       let n4_w = cand.n4_w;
       let mut len = cmp::min(target_n4_w, n4_w);
@@ -2292,15 +2336,15 @@ impl ContextWriter {
     found_match
   }
 
-  fn scan_col_mbmi(&mut self, bo: &BlockOffset, col_offset: isize, max_col_offs: isize,
-                   processed_cols: &mut isize, ref_frames: [usize; 2],
-                   mv_stack: &mut Vec<CandidateMV>, newmv_count: &mut usize, bsize: BlockSize,
+  fn scan_col_mbmi(&mut self, bo: BlockOffset, col_offset: isize, max_col_offs: isize,
+                   processed_cols: &mut isize, ref_frames: [RefType; 2],
+                   mv_stack: &mut ArrayVec<[CandidateMV; 9]>, newmv_count: &mut usize, bsize: BlockSize,
                    is_compound: bool) -> bool {
     let bc = &self.bc;
 
     let target_n4_h = bsize.height_mi();
 
-    let end_mi = cmp::min(cmp::min(target_n4_h, bc.rows - bo.y),
+    let end_mi = cmp::min(cmp::min(target_n4_h, bc.blocks.rows() - bo.y),
                           BLOCK_64X64.height_mi());
     let n4_h_8 = BLOCK_8X8.height_mi();
     let n4_h_16 = BLOCK_16X16.height_mi();
@@ -2319,7 +2363,7 @@ impl ContextWriter {
 
     let mut i = 0;
     while i < end_mi {
-      let cand = bc.at(&bo.with_offset(col_offset, row_offset + i as isize));
+      let cand = &bc.blocks[bo.with_offset(col_offset, row_offset + i as isize)];
       let n4_h = cand.n4_h;
       let mut len = cmp::min(target_n4_h, n4_h);
       if use_step_16 {
@@ -2346,27 +2390,29 @@ impl ContextWriter {
     found_match
   }
 
-  fn scan_blk_mbmi(&mut self, bo: &BlockOffset, ref_frames: [usize; 2],
-                   mv_stack: &mut Vec<CandidateMV>, newmv_count: &mut usize,
+  fn scan_blk_mbmi(&mut self, bo: BlockOffset, ref_frames: [RefType; 2],
+                   mv_stack: &mut ArrayVec<[CandidateMV; 9]>, newmv_count: &mut usize,
                    is_compound: bool) -> bool {
-    if bo.x >= self.bc.cols || bo.y >= self.bc.rows {
+    if bo.x >= self.bc.blocks.cols() || bo.y >= self.bc.blocks.rows() {
       return false;
     }
 
     let weight = 2 * BLOCK_8X8.width_mi() as u32;
     /* Always assume its within a tile, probably wrong */
-    self.add_ref_mv_candidate(ref_frames, self.bc.at(bo), mv_stack, weight, newmv_count, is_compound)
+    self.add_ref_mv_candidate(ref_frames, &self.bc.blocks[bo], mv_stack, weight, newmv_count, is_compound)
   }
 
-  fn add_offset(&mut self, mv_stack: &mut Vec<CandidateMV>) {
+  fn add_offset(&mut self, mv_stack: &mut ArrayVec<[CandidateMV; 9]>) {
     for mut cand_mv in mv_stack {
       cand_mv.weight += REF_CAT_LEVEL;
     }
   }
 
-  fn setup_mvref_list(&mut self, bo: &BlockOffset, ref_frames: [usize; 2], mv_stack: &mut Vec<CandidateMV>,
-                      bsize: BlockSize, fi: &FrameInvariants, is_compound: bool) -> usize {
-    let (_rf, _rf_num) = self.get_mvref_ref_frames(INTRA_FRAME);
+  fn setup_mvref_list<T: Pixel>(
+    &mut self, bo: BlockOffset, ref_frames: [RefType; 2], mv_stack: &mut ArrayVec<[CandidateMV; 9]>,
+    bsize: BlockSize, fi: &FrameInvariants<T>, is_compound: bool
+  ) -> usize {
+    let (_rf, _rf_num) = (INTRA_FRAME, 1);
 
     let target_n4_h = bsize.height_mi();
     let target_n4_w = bsize.width_mi();
@@ -2391,7 +2437,7 @@ impl ContextWriter {
         max_row_offs = -2 * 2 + row_adj as isize;
       }
 
-      let rows = self.bc.rows;
+      let rows = self.bc.blocks.rows();
       max_row_offs = self.find_valid_row_offs(max_row_offs, bo.y, rows);
     }
 
@@ -2403,7 +2449,8 @@ impl ContextWriter {
         max_col_offs = -2 * 2 + col_adj as isize;
       }
 
-      max_col_offs = self.find_valid_col_offs(max_col_offs, bo.x);
+      let cols = self.bc.blocks.cols();
+      max_col_offs = self.find_valid_col_offs(max_col_offs, bo.x, cols);
     }
 
     let mut row_match = false;
@@ -2420,8 +2467,8 @@ impl ContextWriter {
                                            &mut newmv_count, bsize, is_compound);
       col_match |= found_match;
     }
-    if self.has_tr(bo, bsize) {
-      let found_match = self.scan_blk_mbmi(&bo.with_offset(target_n4_w as isize, -1), ref_frames, mv_stack,
+    if has_tr(bo, bsize) && bo.y > 0 {
+      let found_match = self.scan_blk_mbmi(bo.with_offset(target_n4_w as isize, -1), ref_frames, mv_stack,
                                            &mut newmv_count, is_compound);
       row_match |= found_match;
     }
@@ -2433,12 +2480,12 @@ impl ContextWriter {
     /* Scan the second outer area. */
     let mut far_newmv_count: usize = 0; // won't be used
 
-    let found_match = self.scan_blk_mbmi(
-      &bo.with_offset(-1, -1), ref_frames, mv_stack, &mut far_newmv_count, is_compound
+    let found_match = bo.x > 0 && bo.y > 0 && self.scan_blk_mbmi(
+      bo.with_offset(-1, -1), ref_frames, mv_stack, &mut far_newmv_count, is_compound
     );
     row_match |= found_match;
 
-    for idx in 2..MVREF_ROW_COLS+1 {
+    for idx in 2..=MVREF_ROW_COLS {
       let row_offset = -2 * idx as isize + 1 + row_adj as isize;
       let col_offset = -2 * idx as isize + 1 + col_adj as isize;
 
@@ -2475,16 +2522,16 @@ impl ContextWriter {
     if mv_stack.len() < 2 {
       // 7.10.2.12 Extra search process
 
-      let w4 = bsize.width_mi().min(16).min(self.bc.cols - bo.x);
-      let h4 = bsize.height_mi().min(16).min(self.bc.rows - bo.y);
+      let w4 = bsize.width_mi().min(16).min(self.bc.blocks.cols() - bo.x);
+      let h4 = bsize.height_mi().min(16).min(self.bc.blocks.rows() - bo.y);
       let num4x4 = w4.min(h4);
 
       let passes = if up_avail { 0 } else { 1 } .. if left_avail { 2 } else { 1 };
 
       let mut ref_id_count = [0 as usize; 2];
       let mut ref_diff_count = [0 as usize; 2];
-      let mut ref_id_mvs = [[MotionVector { row: 0, col: 0 }; 2]; 2];
-      let mut ref_diff_mvs = [[MotionVector { row: 0, col: 0 }; 2]; 2];
+      let mut ref_id_mvs = [[MotionVector::default(); 2]; 2];
+      let mut ref_diff_mvs = [[MotionVector::default(); 2]; 2];
 
       for pass in passes {
         let mut idx = 0;
@@ -2495,7 +2542,7 @@ impl ContextWriter {
             bo.with_offset(-1, idx as isize)
           };
 
-          let blk = &self.bc.at(&rbo);
+          let blk = &self.bc.blocks[rbo];
           self.add_extra_mv_candidate(
             blk, ref_frames, mv_stack, fi, is_compound,
             &mut ref_id_count, &mut ref_id_mvs, &mut ref_diff_count, &mut ref_diff_mvs
@@ -2510,18 +2557,18 @@ impl ContextWriter {
       }
 
       if is_compound {
-        let mut combined_mvs = [[MotionVector { row: 0, col: 0}; 2]; 2];
+        let mut combined_mvs = [[MotionVector::default(); 2]; 2];
 
         for list in 0..2 {
           let mut comp_count = 0;
           for idx in 0..ref_id_count[list] {
             combined_mvs[comp_count][list] = ref_id_mvs[list][idx];
-            comp_count = comp_count + 1;
+            comp_count += 1;
           }
           for idx in 0..ref_diff_count[list] {
             if comp_count < 2 {
               combined_mvs[comp_count][list] = ref_diff_mvs[list][idx];
-              comp_count = comp_count + 1;
+              comp_count += 1;
             }
           }
         }
@@ -2561,16 +2608,20 @@ impl ContextWriter {
 
     /* TODO: Handle single reference frame extension */
 
+    let frame_bo = BlockOffset {
+      x: self.bc.blocks.x() + bo.x,
+      y: self.bc.blocks.y() + bo.y,
+    };
     // clamp mvs
     for mv in mv_stack {
       let blk_w = bsize.width();
       let blk_h = bsize.height();
       let border_w = 128 + blk_w as isize * 8;
       let border_h = 128 + blk_h as isize * 8;
-      let mvx_min = -(bo.x as isize) * (8 * MI_SIZE) as isize - border_w;
-      let mvx_max = (self.bc.cols - bo.x - blk_w / MI_SIZE) as isize * (8 * MI_SIZE) as isize + border_w;
-      let mvy_min = -(bo.y as isize) * (8 * MI_SIZE) as isize - border_h;
-      let mvy_max = (self.bc.rows - bo.y - blk_h / MI_SIZE) as isize * (8 * MI_SIZE) as isize + border_h;
+      let mvx_min = -(frame_bo.x as isize) * (8 * MI_SIZE) as isize - border_w;
+      let mvx_max = (self.bc.blocks.frame_cols - frame_bo.x - blk_w / MI_SIZE) as isize * (8 * MI_SIZE) as isize + border_w;
+      let mvy_min = -(frame_bo.y as isize) * (8 * MI_SIZE) as isize - border_h;
+      let mvy_max = (self.bc.blocks.frame_rows - frame_bo.y - blk_h / MI_SIZE) as isize * (8 * MI_SIZE) as isize + border_h;
       mv.this_mv.row = (mv.this_mv.row as isize).max(mvy_min).min(mvy_max) as i16;
       mv.this_mv.col = (mv.this_mv.col as isize).max(mvx_min).min(mvx_max) as i16;
       mv.comp_mv.row = (mv.comp_mv.row as isize).max(mvy_min).min(mvy_max) as i16;
@@ -2580,51 +2631,50 @@ impl ContextWriter {
     mode_context
   }
 
-  pub fn find_mvrefs(&mut self, bo: &BlockOffset, ref_frames: [usize; 2],
-                     mv_stack: &mut Vec<CandidateMV>, bsize: BlockSize,
-                     fi: &FrameInvariants, is_compound: bool) -> usize {
+  pub fn find_mvrefs<T: Pixel>(
+    &mut self, bo: BlockOffset, ref_frames: [RefType; 2],
+    mv_stack: &mut ArrayVec<[CandidateMV; 9]>, bsize: BlockSize,
+    fi: &FrameInvariants<T>, is_compound: bool
+  ) -> usize {
     assert!(ref_frames[0] != NONE_FRAME);
-    if ref_frames[0] < REF_FRAMES {
-      if ref_frames[0] != INTRA_FRAME {
-        /* TODO: convert global mv to an mv here */
-      } else {
-        /* TODO: set the global mv ref to invalid here */
-      }
+    if ref_frames[0] != NONE_FRAME {
+      // TODO: If ref_frames[0] != INTRA_FRAME, convert global mv to an mv;
+      // otherwise, set the global mv ref to invalid.
     }
 
     if ref_frames[0] != INTRA_FRAME {
       /* TODO: Set zeromv ref to the converted global motion vector */
     } else {
       /* TODO: Set the zeromv ref to 0 */
-    }
-
-    if ref_frames[0] <= INTRA_FRAME {
       return 0;
     }
 
     self.setup_mvref_list(bo, ref_frames, mv_stack, bsize, fi, is_compound)
   }
 
-  pub fn fill_neighbours_ref_counts(&mut self, bo: &BlockOffset) {
-      let mut ref_counts = [0; TOTAL_REFS_PER_FRAME];
+  pub fn fill_neighbours_ref_counts(&mut self, bo: BlockOffset) {
+      let mut ref_counts = [0; INTER_REFS_PER_FRAME];
 
-      let above_b = self.bc.above_of(bo);
-      let left_b = self.bc.left_of(bo);
-
-      if bo.y > 0 && above_b.is_inter() {
-        ref_counts[above_b.ref_frames[0] as usize] += 1;
-        if above_b.has_second_ref() {
-          ref_counts[above_b.ref_frames[1] as usize] += 1;
+      if bo.y > 0 {
+        let above_b = self.bc.blocks.above_of(bo);
+        if above_b.is_inter() {
+          ref_counts[above_b.ref_frames[0].to_index()] += 1;
+          if above_b.has_second_ref() {
+            ref_counts[above_b.ref_frames[1].to_index()] += 1;
+          }
         }
       }
 
-      if bo.x > 0 && left_b.is_inter() {
-        ref_counts[left_b.ref_frames[0] as usize] += 1;
-        if left_b.has_second_ref() {
-          ref_counts[left_b.ref_frames[1] as usize] += 1;
+      if bo.x > 0 {
+        let left_b = self.bc.blocks.left_of(bo);
+        if left_b.is_inter() {
+          ref_counts[left_b.ref_frames[0].to_index()] += 1;
+          if left_b.has_second_ref() {
+            ref_counts[left_b.ref_frames[1].to_index()] += 1;
+          }
         }
       }
-      self.bc.at_mut(bo).neighbors_ref_counts = ref_counts;
+      self.bc.blocks[bo].neighbors_ref_counts = ref_counts;
   }
 
   fn ref_count_ctx(counts0: usize, counts1: usize) -> usize {
@@ -2637,81 +2687,87 @@ impl ContextWriter {
     }
   }
 
-  fn get_ref_frame_ctx_b0(&mut self, bo: &BlockOffset) -> usize {
-    let ref_counts = self.bc.at(bo).neighbors_ref_counts;
+  fn get_ref_frame_ctx_b0(&mut self, bo: BlockOffset) -> usize {
+    let ref_counts = self.bc.blocks[bo].neighbors_ref_counts;
 
-    let fwd_cnt = ref_counts[LAST_FRAME] + ref_counts[LAST2_FRAME] +
-                  ref_counts[LAST3_FRAME] + ref_counts[GOLDEN_FRAME];
+    let fwd_cnt = ref_counts[LAST_FRAME.to_index()] + ref_counts[LAST2_FRAME.to_index()] +
+                  ref_counts[LAST3_FRAME.to_index()] + ref_counts[GOLDEN_FRAME.to_index()];
 
-    let bwd_cnt = ref_counts[BWDREF_FRAME] + ref_counts[ALTREF2_FRAME] +
-                  ref_counts[ALTREF_FRAME];
+    let bwd_cnt = ref_counts[BWDREF_FRAME.to_index()] + ref_counts[ALTREF2_FRAME.to_index()] +
+                  ref_counts[ALTREF_FRAME.to_index()];
 
     ContextWriter::ref_count_ctx(fwd_cnt, bwd_cnt)
   }
 
-  fn get_pred_ctx_brfarf2_or_arf(&mut self, bo: &BlockOffset) -> usize {
-    let ref_counts = self.bc.at(bo).neighbors_ref_counts;
+  fn get_pred_ctx_brfarf2_or_arf(&mut self, bo: BlockOffset) -> usize {
+    let ref_counts = self.bc.blocks[bo].neighbors_ref_counts;
 
-    let brfarf2_count = ref_counts[BWDREF_FRAME] + ref_counts[ALTREF2_FRAME];
-    let arf_count = ref_counts[ALTREF_FRAME];
+    let brfarf2_count = ref_counts[BWDREF_FRAME.to_index()] + ref_counts[ALTREF2_FRAME.to_index()];
+    let arf_count = ref_counts[ALTREF_FRAME.to_index()];
 
     ContextWriter::ref_count_ctx(brfarf2_count, arf_count)
   }
 
-  fn get_pred_ctx_ll2_or_l3gld(&mut self, bo: &BlockOffset) -> usize {
-    let ref_counts = self.bc.at(bo).neighbors_ref_counts;
+  fn get_pred_ctx_ll2_or_l3gld(&mut self, bo: BlockOffset) -> usize {
+    let ref_counts = self.bc.blocks[bo].neighbors_ref_counts;
 
-    let l_l2_count = ref_counts[LAST_FRAME] + ref_counts[LAST2_FRAME];
-    let l3_gold_count = ref_counts[LAST3_FRAME] + ref_counts[GOLDEN_FRAME];
+    let l_l2_count = ref_counts[LAST_FRAME.to_index()] + ref_counts[LAST2_FRAME.to_index()];
+    let l3_gold_count = ref_counts[LAST3_FRAME.to_index()] + ref_counts[GOLDEN_FRAME.to_index()];
 
     ContextWriter::ref_count_ctx(l_l2_count, l3_gold_count)
   }
 
-  fn get_pred_ctx_last_or_last2(&mut self, bo: &BlockOffset) -> usize {
-    let ref_counts = self.bc.at(bo).neighbors_ref_counts;
+  fn get_pred_ctx_last_or_last2(&mut self, bo: BlockOffset) -> usize {
+    let ref_counts = self.bc.blocks[bo].neighbors_ref_counts;
 
-    let l_count = ref_counts[LAST_FRAME];
-    let l2_count = ref_counts[LAST2_FRAME];
+    let l_count = ref_counts[LAST_FRAME.to_index()];
+    let l2_count = ref_counts[LAST2_FRAME.to_index()];
 
     ContextWriter::ref_count_ctx(l_count, l2_count)
   }
 
-  fn get_pred_ctx_last3_or_gold(&mut self, bo: &BlockOffset) -> usize {
-    let ref_counts = self.bc.at(bo).neighbors_ref_counts;
+  fn get_pred_ctx_last3_or_gold(&mut self, bo: BlockOffset) -> usize {
+    let ref_counts = self.bc.blocks[bo].neighbors_ref_counts;
 
-    let l3_count = ref_counts[LAST3_FRAME];
-    let gold_count = ref_counts[GOLDEN_FRAME];
+    let l3_count = ref_counts[LAST3_FRAME.to_index()];
+    let gold_count = ref_counts[GOLDEN_FRAME.to_index()];
 
     ContextWriter::ref_count_ctx(l3_count, gold_count)
   }
 
-  fn get_pred_ctx_brf_or_arf2(&mut self, bo: &BlockOffset) -> usize {
-    let ref_counts = self.bc.at(bo).neighbors_ref_counts;
+  fn get_pred_ctx_brf_or_arf2(&mut self, bo: BlockOffset) -> usize {
+    let ref_counts = self.bc.blocks[bo].neighbors_ref_counts;
 
-    let brf_count = ref_counts[BWDREF_FRAME];
-    let arf2_count = ref_counts[ALTREF2_FRAME];
+    let brf_count = ref_counts[BWDREF_FRAME.to_index()];
+    let arf2_count = ref_counts[ALTREF2_FRAME.to_index()];
 
     ContextWriter::ref_count_ctx(brf_count, arf2_count)
   }
 
-  fn get_comp_mode_ctx(&self, bo: &BlockOffset) -> usize {
-    fn check_backward(ref_frame: usize) -> bool {
-      ref_frame >= BWDREF_FRAME && ref_frame <= ALTREF_FRAME
-    }
+
+  fn get_comp_mode_ctx(&self, bo: BlockOffset) -> usize {
     let avail_left = bo.x > 0;
     let avail_up = bo.y > 0;
-    let bo_left = bo.with_offset(-1, 0);
-    let bo_up = bo.with_offset(0, -1);
-    let above0 = if avail_up { self.bc.at(&bo_up).ref_frames[0] } else { INTRA_FRAME };
-    let above1 = if avail_up { self.bc.at(&bo_up).ref_frames[1] } else { NONE_FRAME };
-    let left0 = if avail_left { self.bc.at(&bo_left).ref_frames[0] } else { INTRA_FRAME };
-    let left1 = if avail_left { self.bc.at(&bo_left).ref_frames[1] } else { NONE_FRAME };
+    let (left0, left1) = if avail_left {
+      let bo_left = bo.with_offset(-1, 0);
+      let ref_frames = &self.bc.blocks[bo_left].ref_frames;
+      (ref_frames[0], ref_frames[1])
+    } else {
+      (INTRA_FRAME, NONE_FRAME)
+    };
+    let (above0, above1) = if avail_up {
+      let bo_up = bo.with_offset(0, -1);
+      let ref_frames = &self.bc.blocks[bo_up].ref_frames;
+      (ref_frames[0], ref_frames[1])
+    } else {
+      (INTRA_FRAME, NONE_FRAME)
+    };
     let left_single = left1 == NONE_FRAME;
     let above_single = above1 == NONE_FRAME;
     let left_intra = left0 == INTRA_FRAME;
     let above_intra = above0 == INTRA_FRAME;
-    let left_backward = check_backward(left0);
-    let above_backward = check_backward(above0);
+    let left_backward = left0.is_bwd_ref();
+    let above_backward = above0.is_bwd_ref();
 
     if avail_left && avail_up {
       if above_single && left_single {
@@ -2740,19 +2796,27 @@ impl ContextWriter {
     }
   }
 
-  fn get_comp_ref_type_ctx(&self, bo: &BlockOffset) -> usize {
-    fn is_samedir_ref_pair(ref0: usize, ref1: usize) -> bool {
-      (ref0 >= BWDREF_FRAME && ref0 != NONE_FRAME) == (ref1 >= BWDREF_FRAME && ref1 != NONE_FRAME)
+  fn get_comp_ref_type_ctx(&self, bo: BlockOffset) -> usize {
+    fn is_samedir_ref_pair(ref0: RefType, ref1: RefType) -> bool {
+      (ref0.is_bwd_ref() && ref0 != NONE_FRAME) == (ref1.is_bwd_ref() && ref1 != NONE_FRAME)
     }
 
     let avail_left = bo.x > 0;
     let avail_up = bo.y > 0;
-    let bo_left = bo.with_offset(-1, 0);
-    let bo_up = bo.with_offset(0, -1);
-    let above0 = if avail_up { self.bc.at(&bo_up).ref_frames[0] } else { INTRA_FRAME };
-    let above1 = if avail_up { self.bc.at(&bo_up).ref_frames[1] } else { NONE_FRAME };
-    let left0 = if avail_left { self.bc.at(&bo_left).ref_frames[0] } else { INTRA_FRAME };
-    let left1 = if avail_left { self.bc.at(&bo_left).ref_frames[1] } else { NONE_FRAME };
+    let (left0, left1) = if avail_left {
+      let bo_left = bo.with_offset(-1, 0);
+      let ref_frames = &self.bc.blocks[bo_left].ref_frames;
+      (ref_frames[0], ref_frames[1])
+    } else {
+      (INTRA_FRAME, NONE_FRAME)
+    };
+    let (above0, above1) = if avail_up {
+      let bo_up = bo.with_offset(0, -1);
+      let ref_frames = &self.bc.blocks[bo_up].ref_frames;
+      (ref_frames[0], ref_frames[1])
+    } else {
+      (INTRA_FRAME, NONE_FRAME)
+    };
     let left_single = left1 == NONE_FRAME;
     let above_single = above1 == NONE_FRAME;
     let left_intra = left0 == INTRA_FRAME;
@@ -2763,22 +2827,20 @@ impl ContextWriter {
     let left_uni_comp = left_comp_inter && is_samedir_ref_pair(left0, left1);
 
     if avail_up && !above_intra && avail_left && !left_intra {
-      let samedir = is_samedir_ref_pair(above0, left0);
+      let samedir = is_samedir_ref_pair(above0, left0) as usize;
 
       if !above_comp_inter && !left_comp_inter {
-        1 + 2 * samedir as usize
+        1 + 2 * samedir
       } else if !above_comp_inter {
-        if !left_uni_comp { 1 } else { 3 + samedir as usize }
+        if !left_uni_comp { 1 } else { 3 + samedir }
       } else if !left_comp_inter {
-        if !above_uni_comp { 1 } else { 3 + samedir as usize }
+        if !above_uni_comp { 1 } else { 3 + samedir }
+      } else if !above_uni_comp && !left_uni_comp {
+        0
+      } else if !above_uni_comp || !left_uni_comp {
+        2
       } else {
-        if !above_uni_comp && !left_uni_comp {
-          0
-        } else if !above_uni_comp || !left_uni_comp {
-          2
-        } else {
-          3 + ((above0 == BWDREF_FRAME) == (left0 == BWDREF_FRAME)) as usize
-        }
+        3 + ((above0 == BWDREF_FRAME) == (left0 == BWDREF_FRAME)) as usize
       }
     } else if avail_up && avail_left {
       if above_comp_inter {
@@ -2797,12 +2859,12 @@ impl ContextWriter {
     }
   }
 
-  pub fn write_ref_frames(&mut self, w: &mut dyn Writer, fi: &FrameInvariants, bo: &BlockOffset) {
-    let rf = self.bc.at(bo).ref_frames;
-    let sz = self.bc.at(bo).n4_w.min(self.bc.at(bo).n4_h);
+  pub fn write_ref_frames<T: Pixel>(&mut self, w: &mut dyn Writer, fi: &FrameInvariants<T>, bo: BlockOffset) {
+    let rf = self.bc.blocks[bo].ref_frames;
+    let sz = self.bc.blocks[bo].n4_w.min(self.bc.blocks[bo].n4_h);
 
     /* TODO: Handle multiple references */
-    let comp_mode = self.bc.at(bo).has_second_ref();
+    let comp_mode = self.bc.blocks[bo].has_second_ref();
 
     if fi.reference_mode != ReferenceMode::SINGLE && sz >= 2 {
       let ctx = self.get_comp_mode_ctx(bo);
@@ -2842,7 +2904,7 @@ impl ContextWriter {
       }
     } else {
       let b0_ctx = self.get_ref_frame_ctx_b0(bo);
-      let b0 = rf[0] <= ALTREF_FRAME && rf[0] >= BWDREF_FRAME;
+      let b0 = rf[0] != NONE_FRAME && rf[0].is_bwd_ref();
 
       symbol_with_update!(self, w, b0 as u32, &mut self.fc.single_ref_cdfs[b0_ctx][0]);
       if b0 {
@@ -2949,7 +3011,7 @@ impl ContextWriter {
           av1_tx_ind[tx_set as usize][tx_type as usize] as u32,
           &mut self.fc.inter_tx_cdf[tx_set_index as usize]
             [square_tx_size as usize]
-            [..num_tx_set[tx_set as usize] + 1]
+            [..=num_tx_set[tx_set as usize]]
         );
       } else {
         let intra_dir = y_mode;
@@ -2963,28 +3025,28 @@ impl ContextWriter {
           av1_tx_ind[tx_set as usize][tx_type as usize] as u32,
           &mut self.fc.intra_tx_cdf[tx_set_index as usize]
             [square_tx_size as usize][intra_dir as usize]
-            [..num_tx_set[tx_set as usize] + 1]
+            [..=num_tx_set[tx_set as usize]]
         );
       }
     }
   }
-  pub fn write_skip(&mut self, w: &mut dyn Writer, bo: &BlockOffset, skip: bool) {
+  pub fn write_skip(&mut self, w: &mut dyn Writer, bo: BlockOffset, skip: bool) {
     let ctx = self.bc.skip_context(bo);
     symbol_with_update!(self, w, skip as u32, &mut self.fc.skip_cdfs[ctx]);
   }
 
-  fn get_segment_pred(&mut self, bo: &BlockOffset) -> ( u8, u8 ) {
+  fn get_segment_pred(&mut self, bo: BlockOffset) -> ( u8, u8 ) {
     let mut prev_ul = -1;
     let mut prev_u  = -1;
     let mut prev_l  = -1;
     if bo.x > 0 && bo.y > 0 {
-      prev_ul = self.bc.above_left_of(bo).segmentation_idx as i8;
+      prev_ul = self.bc.blocks.above_left_of(bo).segmentation_idx as i8;
     }
     if bo.y > 0 {
-      prev_u  = self.bc.above_of(bo).segmentation_idx as i8;
+      prev_u  = self.bc.blocks.above_of(bo).segmentation_idx as i8;
     }
     if bo.x > 0 {
-      prev_l  = self.bc.left_of(bo).segmentation_idx as i8;
+      prev_l  = self.bc.blocks.left_of(bo).segmentation_idx as i8;
     }
 
     /* Pick CDF index based on number of matching/out-of-bounds segment IDs. */
@@ -3040,33 +3102,58 @@ impl ContextWriter {
     }
   }
 
-  pub fn write_segmentation(&mut self, w: &mut dyn Writer, bo: &BlockOffset,
+  pub fn write_segmentation(&mut self, w: &mut dyn Writer, bo: BlockOffset,
                             bsize: BlockSize, skip: bool, last_active_segid: u8) {
     let ( pred, cdf_index ) = self.get_segment_pred(bo);
     if skip {
-      self.bc.set_segmentation_idx(bo, bsize, pred);
+      self.bc.blocks.set_segmentation_idx(bo, bsize, pred);
       return;
     }
-    let seg_idx = self.bc.at(bo).segmentation_idx;
+    let seg_idx = self.bc.blocks[bo].segmentation_idx;
     let coded_id = self.neg_interleave(seg_idx as i32, pred as i32, (last_active_segid + 1) as i32);
     symbol_with_update!(self, w, coded_id as u32, &mut self.fc.spatial_segmentation_cdfs[cdf_index as usize]);
   }
 
-  pub fn write_lrf(&mut self, w: &mut dyn Writer, fi: &FrameInvariants, rs: &mut RestorationState,
-                   sbo: &SuperBlockOffset) {
+  // rather than test writing and rolling back the cdf, we just count Q8 bits using the current cdf
+  pub fn count_lrf_switchable(&mut self, w: &dyn Writer, rs: &TileRestorationState,
+                              filter: RestorationFilter, pli: usize) -> u32 {
+    let nsym = &self.fc.lrf_switchable_cdf.len()-1;
+    match filter {
+      RestorationFilter::None => {
+        w.symbol_bits(0, &self.fc.lrf_switchable_cdf[..nsym])
+      }
+      RestorationFilter::Wiener{ .. } => {
+        unreachable!() // for now, not permanently
+      }
+      RestorationFilter::Sgrproj{set, xqd} => {
+        // Does *not* use 'RESTORE_SGRPROJ' but rather just '2'
+        let rp = &rs.planes[pli];
+        let mut bits = w.symbol_bits(2, &self.fc.lrf_switchable_cdf[..nsym]) +
+          ((SGRPROJ_PARAMS_BITS as u32) << OD_BITRES);
+        for i in 0..2 {
+          let s = SGRPROJ_PARAMS_S[set as usize][i];
+          let min = SGRPROJ_XQD_MIN[i] as i32;
+          let max = SGRPROJ_XQD_MAX[i] as i32;
+          if s > 0 {
+            bits += w.count_signed_subexp_with_ref(xqd[i] as i32, min, max+1, SGRPROJ_PRJ_SUBEXP_K,
+                                                   rp.sgrproj_ref[i] as i32);
+          }
+        }
+        bits
+      }
+    }
+  }
+
+  pub fn write_lrf<T: Pixel>(
+    &mut self, w: &mut dyn Writer, fi: &FrameInvariants<T>, rs: &mut TileRestorationStateMut, sbo: SuperBlockOffset
+  ) {
     if !fi.allow_intrabc { // TODO: also disallow if lossless
       for pli in 0..PLANES {
-        let code;
-        let rp = &mut rs.plane[pli];
-        {
-          let ru = &mut rp.restoration_unit_as_mut(sbo);
-          code = !ru.coded;
-          ru.coded = true;
-        }
-        if code {
-          match rp.restoration_unit_as_mut(sbo).filter {
+        let rp = &mut rs.planes[pli];
+        if let Some(filter) = rp.restoration_unit(sbo).map(|ru| ru.filter) {
+          match filter {
             RestorationFilter::None => {
-              match rp.lrf_type {
+              match rp.rp_cfg.lrf_type {
                 RESTORE_WIENER => {
                   symbol_with_update!(self, w, 0, &mut self.fc.lrf_wiener_cdf);
                 }
@@ -3074,54 +3161,62 @@ impl ContextWriter {
                   symbol_with_update!(self, w, 0, &mut self.fc.lrf_sgrproj_cdf);
                 }
                 RESTORE_SWITCHABLE => {
-                  symbol_with_update!(self, w, RESTORE_NONE as u32, &mut self.fc.lrf_switchable_cdf);
+                  symbol_with_update!(self, w, 0, &mut self.fc.lrf_switchable_cdf);
                 }
                 RESTORE_NONE => {}
                 _ => unreachable!()
               }
             }
             RestorationFilter::Sgrproj{set, xqd} => {
-              match rs.lrf_type[pli] {
+              match rp.rp_cfg.lrf_type {
                 RESTORE_SGRPROJ => {
                   symbol_with_update!(self, w, 1, &mut self.fc.lrf_sgrproj_cdf);
                 }
                 RESTORE_SWITCHABLE => {
-                  symbol_with_update!(self, w, RESTORE_SGRPROJ as u32, &mut self.fc.lrf_switchable_cdf);
+                  // Does *not* write 'RESTORE_SGRPROJ'
+                  symbol_with_update!(self, w, 2, &mut self.fc.lrf_switchable_cdf);
                 }
                 _ => unreachable!()
               }
               w.literal(SGRPROJ_PARAMS_BITS, set as u32);
               for i in 0..2 {
-                let r = SGRPROJ_PARAMS_RADIUS[set as usize][i];
+                let s = SGRPROJ_PARAMS_S[set as usize][i];
                 let min = SGRPROJ_XQD_MIN[i] as i32;
                 let max = SGRPROJ_XQD_MAX[i] as i32;
-                if r>0 {
+                if s > 0 {
                   w.write_signed_subexp_with_ref(xqd[i] as i32, min, max+1, SGRPROJ_PRJ_SUBEXP_K,
                                                  rp.sgrproj_ref[i] as i32);
                   rp.sgrproj_ref[i] = xqd[i];
                 } else {
                   // Nothing written, just update the reference
                   if i==0 {
+                    assert!(xqd[i] == 0);
                     rp.sgrproj_ref[0] = 0;
                   } else {
-                    rp.sgrproj_ref[1] =
-                      clamp((1 << SGRPROJ_PRJ_BITS) - rp.sgrproj_ref[0], min as i8, max as i8);
+                    rp.sgrproj_ref[1] = 95; // LOL at spec.  The result is always 95.
                   }
                 }
               }
             }
             RestorationFilter::Wiener{coeffs} => {
-              match rs.lrf_type[pli] {
+              match rp.rp_cfg.lrf_type {
                 RESTORE_WIENER => {
                   symbol_with_update!(self, w, 1, &mut self.fc.lrf_wiener_cdf);
                 }
                 RESTORE_SWITCHABLE => {
-                  symbol_with_update!(self, w, RESTORE_WIENER as u32, &mut self.fc.lrf_switchable_cdf);
+                  // Does *not* write 'RESTORE_WIENER'
+                  symbol_with_update!(self, w, 1, &mut self.fc.lrf_switchable_cdf);
                 }
                 _ => unreachable!()
               }
               for pass in 0..2 {
-                let first_coeff = if pli==0 {0} else {1};
+                let first_coeff =
+                  if pli==0 {
+                    0
+                  } else {
+                    assert!(coeffs[pass][0] == 0);
+                    1
+                  };
                 for i in first_coeff..3 {
                   let min = WIENER_TAPS_MIN[i] as i32;
                   let max = WIENER_TAPS_MAX[i] as i32;
@@ -3142,8 +3237,8 @@ impl ContextWriter {
   }
 
   pub fn write_block_deblock_deltas(&mut self, w: &mut dyn Writer,
-                                    bo: &BlockOffset, multi: bool) {
-      let block = self.bc.at(bo);
+                                    bo: BlockOffset, multi: bool) {
+      let block = &self.bc.blocks[bo];
       let deltas = if multi { FRAME_LF_COUNT + PLANES - 3 } else { 1 };
       for i in 0..deltas {
           let delta = block.deblock_deltas[i];
@@ -3167,7 +3262,7 @@ impl ContextWriter {
       }
   }
 
-  pub fn write_is_inter(&mut self, w: &mut dyn Writer, bo: &BlockOffset, is_inter: bool) {
+  pub fn write_is_inter(&mut self, w: &mut dyn Writer, bo: BlockOffset, is_inter: bool) {
     let ctx = self.bc.intra_inter_context(bo);
     symbol_with_update!(self, w, is_inter as u32, &mut self.fc.intra_inter_cdfs[ctx]);
   }
@@ -3399,7 +3494,7 @@ impl ContextWriter {
   }
 
   pub fn write_coeffs_lv_map(
-    &mut self, w: &mut dyn Writer, plane: usize, bo: &BlockOffset, coeffs_in: &[i32],
+    &mut self, w: &mut dyn Writer, plane: usize, bo: BlockOffset, coeffs_in: &[i32],
     pred_mode: PredictionMode,
     tx_size: TxSize, tx_type: TxType, plane_bsize: BlockSize, xdec: usize,
     ydec: usize, use_reduced_tx_set: bool
@@ -3412,8 +3507,9 @@ impl ContextWriter {
     let scan = scan_order.scan;
     let width = av1_get_coded_tx_size(tx_size).width();
     let height = av1_get_coded_tx_size(tx_size).height();
-    let mut coeffs_storage = [0 as i32; 32*32];
-    let coeffs = &mut coeffs_storage[..width*height];
+    let mut coeffs_storage: AlignedArray<[i32; 32 * 32]> =
+      UninitializedAlignedArray();
+    let coeffs = &mut coeffs_storage.array[..width*height];
     let mut cul_level = 0 as u32;
 
     for i in 0..width*height {
@@ -3439,7 +3535,7 @@ impl ContextWriter {
       return false;
     }
 
-    let mut levels_buf = [0 as u8; TX_PAD_2D];
+    let mut levels_buf = [0u8; TX_PAD_2D];
 
     self.txb_init_levels(
       coeffs_in,
@@ -3477,20 +3573,15 @@ impl ContextWriter {
       1
     };
 
-    symbol_with_update!(
-      self,
-      w,
-      eob_pt - 1,
-      match eob_multi_size {
-        0 => &mut self.fc.eob_flag_cdf16[plane_type][eob_multi_ctx],
-        1 => &mut self.fc.eob_flag_cdf32[plane_type][eob_multi_ctx],
-        2 => &mut self.fc.eob_flag_cdf64[plane_type][eob_multi_ctx],
-        3 => &mut self.fc.eob_flag_cdf128[plane_type][eob_multi_ctx],
-        4 => &mut self.fc.eob_flag_cdf256[plane_type][eob_multi_ctx],
-        5 => &mut self.fc.eob_flag_cdf512[plane_type][eob_multi_ctx],
-        _ => &mut self.fc.eob_flag_cdf1024[plane_type][eob_multi_ctx],
-      }
-    );
+    match eob_multi_size {
+      0 => { symbol_with_update!(self, w, eob_pt - 1, &mut self.fc.eob_flag_cdf16[plane_type][eob_multi_ctx]); },
+      1 => { symbol_with_update!(self, w, eob_pt - 1, &mut self.fc.eob_flag_cdf32[plane_type][eob_multi_ctx]); },
+      2 => { symbol_with_update!(self, w, eob_pt - 1, &mut self.fc.eob_flag_cdf64[plane_type][eob_multi_ctx]); },
+      3 => { symbol_with_update!(self, w, eob_pt - 1, &mut self.fc.eob_flag_cdf128[plane_type][eob_multi_ctx]); },
+      4 => { symbol_with_update!(self, w, eob_pt - 1, &mut self.fc.eob_flag_cdf256[plane_type][eob_multi_ctx]); },
+      5 => { symbol_with_update!(self, w, eob_pt - 1, &mut self.fc.eob_flag_cdf512[plane_type][eob_multi_ctx]); },
+      _ => { symbol_with_update!(self, w, eob_pt - 1, &mut self.fc.eob_flag_cdf1024[plane_type][eob_multi_ctx]); },
+    }
 
     let eob_offset_bits = k_eob_offset_bits[eob_pt as usize];
 
@@ -3518,7 +3609,8 @@ impl ContextWriter {
       }
     }
 
-    let mut coeff_contexts = [0 as i8; MAX_TX_SQUARE];
+    let mut coeff_contexts: AlignedArray<[i8; MAX_TX_SQUARE]> =
+      UninitializedAlignedArray();
     let levels =
       &mut levels_buf[TX_PAD_TOP * (width + TX_PAD_HOR)..];
 
@@ -3528,14 +3620,14 @@ impl ContextWriter {
       eob as u16,
       tx_size,
       tx_class,
-      &mut coeff_contexts
+      &mut coeff_contexts.array
     );
 
     let bwl = self.get_txb_bwl(tx_size);
 
     for c in (0..eob).rev() {
       let pos = scan[c];
-      let coeff_ctx = coeff_contexts[pos as usize];
+      let coeff_ctx = coeff_contexts.array[pos as usize];
       let v = coeffs_in[pos as usize];
       let level: u32 = v.abs() as u32;
 
@@ -3636,15 +3728,15 @@ impl ContextWriter {
 
   pub fn checkpoint(&mut self) -> ContextWriterCheckpoint {
     ContextWriterCheckpoint {
-      fc: self.fc,
+      fc: *self.fc,
       bc: self.bc.checkpoint()
     }
   }
 
   pub fn rollback(&mut self, checkpoint: &ContextWriterCheckpoint) {
-    self.fc = checkpoint.fc;
+    *self.fc = checkpoint.fc;
     self.bc.rollback(&checkpoint.bc);
-    #[cfg(debug)] {
+    #[cfg(feature = "desync_finder")] {
       if self.fc_map.is_some() {
         self.fc_map = Some(FieldMap {
           map: self.fc.build_map()
@@ -3688,10 +3780,10 @@ const MV_LOW: i32 = (-(1 << MV_IN_USE_BITS));
 #[inline(always)]
 pub fn av1_get_mv_joint(mv: MotionVector) -> MvJointType {
   if mv.row == 0 {
-    if mv.col == 0 { MvJointType::MV_JOINT_ZERO } else { MvJointType::MV_JOINT_HNZVZ }
-  } else {
-    if mv.col == 0 { MvJointType::MV_JOINT_HZVNZ } else { MvJointType::MV_JOINT_HNZVNZ }
+    return if mv.col == 0 { MvJointType::MV_JOINT_ZERO } else { MvJointType::MV_JOINT_HNZVZ };
   }
+
+  if mv.col == 0 { MvJointType::MV_JOINT_HZVNZ } else { MvJointType::MV_JOINT_HNZVNZ }
 }
 #[inline(always)]
 pub fn mv_joint_vertical(joint_type: MvJointType) -> bool {
@@ -3722,7 +3814,7 @@ pub fn get_mv_class(z: u32, offset: &mut u32) -> usize {
   c
 }
 
-pub fn encode_mv_component(w: &mut Writer, comp: i32,
+pub fn encode_mv_component(w: &mut dyn Writer, comp: i32,
   mvcomp: &mut NMVComponent, precision: MvSubpelPrecision) {
   assert!(comp != 0);
   let mut offset: u32 = 0;

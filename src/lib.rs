@@ -8,15 +8,21 @@
 // PATENTS file, you can obtain it at www.aomedia.org/license/patent.
 
 #![allow(safe_extern_statics)]
-#![cfg_attr(feature = "cargo-clippy", allow(collapsible_if))]
+#![deny(bare_trait_objects)]
 
-extern crate bitstream_io;
-extern crate backtrace;
-extern crate libc;
-extern crate rand;
+#[macro_use]
+extern crate serde_derive;
+extern crate bincode;
 
-extern crate num_traits;
-extern crate paste;
+#[cfg(all(test, feature="decode_test_dav1d"))]
+extern crate dav1d_sys;
+
+#[cfg(test)]
+extern crate interpolate_name;
+
+#[cfg(test)]
+#[macro_use]
+extern crate pretty_assertions;
 
 pub mod ec;
 pub mod partition;
@@ -25,6 +31,7 @@ pub mod transform;
 pub mod quantize;
 pub mod predict;
 pub mod rdo;
+pub mod rdo_tables;
 #[macro_use]
 pub mod util;
 pub mod context;
@@ -35,15 +42,31 @@ pub mod segmentation;
 pub mod cdef;
 pub mod lrf;
 pub mod encoder;
+pub mod mc;
 pub mod me;
 pub mod metrics;
 pub mod scan_order;
 pub mod scenechange;
+pub mod rate;
+pub mod tiling;
 
 mod api;
+mod header;
+mod frame;
 
-pub use api::*;
-pub use encoder::*;
+pub use crate::api::*;
+pub use crate::encoder::*;
+pub use crate::header::*;
+pub use crate::util::{CastFromPrimitive, Pixel};
+
+pub use crate::frame::Frame;
+
+#[cfg(all(test, any(feature="decode_test", feature="decode_test_dav1d")))]
+mod test_encode_decode;
 
 #[cfg(all(test, feature="decode_test"))]
-mod test_encode_decode;
+mod test_encode_decode_aom;
+
+#[cfg(all(test, feature="decode_test_dav1d"))]
+mod test_encode_decode_dav1d;
+

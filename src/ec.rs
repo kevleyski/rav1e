@@ -9,15 +9,12 @@
 // PATENTS file, you can obtain it at www.aomedia.org/license/patent.
 
 #![allow(non_camel_case_types)]
-#![cfg_attr(feature = "cargo-clippy", allow(cast_lossless))]
-#![cfg_attr(feature = "cargo-clippy", allow(identity_op))]
-#![cfg_attr(feature = "cargo-clippy", allow(needless_range_loop))]
 
 use bitstream_io::{BitWriter, BigEndian};
 use std;
 use std::io;
-use util::ILog;
-use util::msb;
+use crate::util::ILog;
+use crate::util::msb;
 
 pub const OD_BITRES: u8 = 3;
 const EC_PROB_SHIFT: u32 = 6;
@@ -34,6 +31,10 @@ type ec_window = u32;
 pub trait Writer {
   /// Write a symbol s, using the passed in cdf reference; leaves cdf unchanged
   fn symbol(&mut self, s: u32, cdf: &[u16]);
+  /// return approximate number of fractional bits in OD_BITRES
+  /// precision to write a symbol s using the passed in cdf reference;
+  /// leaves cdf unchanged
+  fn symbol_bits(&self, s: u32, cdf: &[u16]) -> u32;
   /// Write a symbol s, using the passed in cdf reference; updates the referenced cdf.
   fn symbol_with_update(&mut self, s: u32, cdf: &mut [u16]);
   /// Write a bool using passed in probability
@@ -46,14 +47,28 @@ pub trait Writer {
   fn write_golomb(&mut self, level: u16);
   /// Write a value v in [0, n-1] quasi-uniformly
   fn write_quniform(&mut self, n: u32, v: u32);
+  /// Return fractional bits needed to write Write a value v in [0,
+  /// n-1] quasi-uniformly
+  fn count_quniform(&self, n: u32, v: u32) -> u32;
   /// Write symbol v in [0, n-1] with parameter k as finite subexponential
   fn write_subexp(&mut self, n: u32, k: u8, v: u32);
+  /// Return fractional bits needed to write symbol v in [0, n-1] with
+  /// parameter k as finite subexponential
+  fn count_subexp(&self, n: u32, k: u8, v: u32) -> u32;
   /// Write symbol v in [0, n-1] with parameter k as finite
   /// subexponential based on a reference ref also in [0, n-1].
   fn write_unsigned_subexp_with_ref(&mut self, v: u32, mx: u32, k: u8, r: u32);
+  /// Return fractional bits beed to write symbol v in [0, n-1] with
+  /// parameter k as finite subexponential based on a reference ref
+  /// also in [0, n-1].
+  fn count_unsigned_subexp_with_ref(&self, v: u32, mx: u32, k: u8, r: u32) -> u32;
   /// Write symbol v in [-(n-1), n-1] with parameter k as finite
   /// subexponential based on a reference ref also in [-(n-1), n-1].
   fn write_signed_subexp_with_ref(&mut self, v: i32, low: i32, high: i32, k: u8, r: i32);
+  /// Return fractional bits needed to write symbol v in [-(n-1), n-1]
+  /// with parameter k as finite subexponential based on a reference
+  /// ref also in [-(n-1), n-1].
+  fn count_signed_subexp_with_ref(&self, v: i32, low: i32, high: i32, k: u8, r: i32) -> u32;
   /// Return current length of range-coded bitstream in integer bits
   fn tell(&mut self) -> u32;
   /// Return currrent length of range-coded bitstream in fractional
@@ -62,7 +77,9 @@ pub trait Writer {
   /// Save current point in coding/recording to a checkpoint
   fn checkpoint(&mut self) -> WriterCheckpoint;
   /// Restore saved position in coding/recording from a checkpoint
-  fn rollback(&mut self, &WriterCheckpoint);
+  fn rollback(&mut self, _: &WriterCheckpoint);
+  /// Add additional bits from rate estimators without coding a real symbol
+  fn add_bits_frac(&mut self, bits_frac: u32);
 }
 
 /// StorageBackend is an internal trait used to tie a specific Writer
@@ -77,7 +94,7 @@ pub trait StorageBackend {
   /// Backend implementation of checkpoint to pass through Writer interface
   fn checkpoint(&mut self) -> WriterCheckpoint;
   /// Backend implementation of rollback to pass through Writer interface
-  fn rollback(&mut self, &WriterCheckpoint);
+  fn rollback(&mut self, _: &WriterCheckpoint);
 }
 
 #[derive(Debug, Clone)]
@@ -86,8 +103,12 @@ pub struct WriterBase<S> {
   rng: u16,
   /// The number of bits of data in the current value.
   cnt: i16,
+  #[cfg(feature = "desync_finder")]
   /// Debug enable flag
   debug: bool,
+  /// Extra offset added to tell() and tell_frac() to approximate costs
+  /// of actually coding a symbol
+  fake_bits_frac: u32,
   /// Use-specific storage
   s: S
 }
@@ -283,7 +304,12 @@ impl<S> WriterBase<S> {
   /// Internal constructor called by the subtypes that implement the
   /// actual encoder and Recorder.
   fn new(storage: S) -> Self {
-    WriterBase { rng: 0x8000, cnt: -9, debug: false, s: storage }
+    #[cfg(feature = "desync_finder")] {
+      WriterBase { rng: 0x8000, cnt: -9, debug: std::env::var_os("RAV1E_DEBUG").is_some(), fake_bits_frac: 0, s: storage }
+    }
+    #[cfg(not(feature = "desync_finder"))] {
+      WriterBase { rng: 0x8000, cnt: -9, fake_bits_frac: 0, s: storage }
+    }
   }
 
   /// Compute low and range values from token cdf values and local state
@@ -329,9 +355,7 @@ impl<S> WriterBase<S> {
     //  encoder or decoder claims to have used 1 bit.
     let nbits = nbits_total << OD_BITRES;
     let mut l = 0;
-    let mut i = OD_BITRES;
-    while i > 0 {
-      i -= 1;
+    for _ in 0..OD_BITRES {
       rng = (rng * rng) >> 15;
       let b = rng >> 16;
       l = (l << 1) | b;
@@ -341,7 +365,7 @@ impl<S> WriterBase<S> {
   }
 
   // Function to update the CDF for Writer calls that do so.
-  fn update_cdf(cdf: &mut [u16], val: u32) {
+  pub fn update_cdf(cdf: &mut [u16], val: u32) {
     let nsymbs = cdf.len() - 1;
     let rate = 3 + (nsymbs >> 1).min(2) + (cdf[nsymbs] >> 4) as usize;
     cdf[nsymbs] += 1 - (cdf[nsymbs] >> 5);
@@ -355,11 +379,43 @@ impl<S> WriterBase<S> {
       }
     }
   }
-  fn recenter(r: u32, v: u32) -> u32 {
-    if v > (r << 1) {v} else if v >= r {v - r << 1} else {(r - v << 1) - 1}
+
+  #[cfg(target_arch = "x86_64")]
+  pub fn update_cdf_4_sse2(cdf: &mut [u16], val: u32) {
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+    let nsymbs = 4;
+    let rate = 3 + (nsymbs >> 1).min(2) + (cdf[nsymbs] >> 4) as usize;
+    cdf[nsymbs] += 1 - (cdf[nsymbs] >> 5);
+    #[target_feature(enable = "sse2")]
+    unsafe {
+      let val_idx = _mm_set_epi16(0, 0, 0, 0, 3, 2, 1, 0);
+      let val_splat = _mm_set1_epi16(val as i16);
+      let mask = _mm_cmpgt_epi16(val_splat, val_idx);
+      let v = _mm_loadl_epi64(cdf.as_ptr() as *const __m128i);
+      // *v -= *v >> rate;
+      let shrunk_v = _mm_sub_epi16(v, _mm_srl_epi16(v, _mm_cvtsi64_si128(rate as i64)));
+      // *v += (32768 - *v) >> rate;
+      let expanded_v = _mm_add_epi16(v, _mm_srl_epi16(
+        _mm_sub_epi16(_mm_set1_epi16(-32768), v),
+        _mm_cvtsi64_si128(rate as i64)
+      ));
+      let out_v = _mm_or_si128(_mm_andnot_si128(mask, shrunk_v), _mm_and_si128(mask, expanded_v));
+      _mm_storel_epi64(cdf.as_mut_ptr() as *mut __m128i, out_v);
+    }
   }
 
-  #[cfg(debug)]
+  fn recenter(r: u32, v: u32) -> u32 {
+    if v > (r << 1) {
+      v
+    } else if v >= r {
+      (v - r) << 1
+    } else {
+      ((r - v) << 1) - 1
+    }
+  }
+
+  #[cfg(feature = "desync_finder")]
   fn print_backtrace(&self, s: u32) {
     let mut depth = 3;
     backtrace::trace(|frame| {
@@ -370,7 +426,7 @@ impl<S> WriterBase<S> {
       if depth == 0 {
         backtrace::resolve(ip, |symbol| {
           if let Some(name) = symbol.name() {
-            eprintln!("Writing symbol {} from {}", s, name);
+            println!("Writing symbol {} from {}", s, name);
           }
         });
         false
@@ -463,6 +519,10 @@ where
   fn bit(&mut self, bit: u16) {
     self.bool(bit == 1, 16384);
   }
+  // fake add bits
+  fn add_bits_frac(&mut self, bits_frac: u32) {
+    self.fake_bits_frac += bits_frac
+  }
   /// Encode a literal bitstring, bit by bit in MSB order, with flat
   /// probability.
   /// 'bits': Length of bitstring
@@ -497,14 +557,60 @@ where
   ///       must be exactly 32768. There should be at most 16 values.
   fn symbol_with_update(&mut self, s: u32, cdf: &mut [u16]) {
     let nsymbs = cdf.len() - 1;
-    #[cfg(debug)]
+    #[cfg(feature = "desync_finder")]
     {
       if self.debug {
         self.print_backtrace(s);
       }
     }
     self.symbol(s, &cdf[..nsymbs]);
+
+    #[cfg(target_arch = "x86_64")]
+    {
+      if cdf.len() == 5 && cfg!(target_feature = "sse2") {
+        return Self::update_cdf_4_sse2(cdf, s);
+      }
+    }
+
     Self::update_cdf(cdf, s);
+  }
+  /// Returns approximate cost for a symbol given a cumulative
+  /// distribution function (CDF) table and current write state.
+  /// `s`: The index of the symbol to encode.
+  /// `cdf`: The CDF, such that symbol s falls in the range
+  ///        `[s > 0 ? cdf[s - 1] : 0, cdf[s])`.
+  ///       The values must be monotonically non-decreasing, and the last value
+  ///       must be exactly 32768. There should be at most 16 values.
+  fn symbol_bits(&self, s: u32, cdf: &[u16]) -> u32 {
+    let mut bits = 0;
+    debug_assert!(cdf[cdf.len() - 1] == 0);
+    debug_assert!(32768 <= self.rng);
+    let rng = (self.rng >> 8) as u32;
+    let fh = cdf[s as usize] as u32 >> EC_PROB_SHIFT;
+    let r = if s > 0 {
+      let fl = cdf[s as usize - 1] as u32 >> EC_PROB_SHIFT;
+      ((rng * fl) >> (7 - EC_PROB_SHIFT)) - ((rng * fh) >> (7 - EC_PROB_SHIFT)) + EC_MIN_PROB
+    } else {
+      let nms1 = cdf.len() as u32 - s - 1;
+      self.rng as u32 - ((rng * fh) >> (7 - EC_PROB_SHIFT)) - nms1 * EC_MIN_PROB
+    };
+
+    // The 9 here counteracts the offset of -9 baked into cnt.  Don't include a termination bit.
+    let pre = Self::frac_compute((self.cnt + 9) as u32, self.rng as u32);
+    let d = 16 - r.ilog();
+    let mut c = self.cnt;
+    let mut sh = c + (d as i16);
+    if sh >= 0 {
+      c += 16;
+      if sh >= 8 {
+        bits += 8;
+        c -= 8;
+      }
+      bits += 8;
+      sh = c + (d as i16) - 24;
+    }
+    // The 9 here counteracts the offset of -9 baked into cnt.  Don't include a termination bit.
+    Self::frac_compute((bits + sh + 9) as u32, r << d) - pre
   }
   /// Encode a golomb to the bitstream.
   /// 'level': passed in value to encode
@@ -535,12 +641,27 @@ where
       let l = msb(n as i32) as u8 + 1;
       let m = (1 << l) - n;
       if v < m {
-        self.literal(l-1, v);
+        self.literal(l - 1, v);
       } else {
-        self.literal(l-1, m + (v-m >> 1));
-        self.literal(1, (v-m) & 1);
+        self.literal(l - 1, m + ((v - m) >> 1));
+        self.literal(1, (v - m) & 1);
       }
     }
+  }
+  /// Returns QOD_BITRES bits for a value v in [0, n-1] quasi-uniformly
+  /// n: size of interval
+  /// v: value to encode
+  fn count_quniform(&self, n: u32, v: u32) -> u32 {
+    let mut bits = 0;
+    if n > 1 {
+      let l = (msb(n as i32) + 1) as u32;
+      let m = (1 << l) - n;
+      bits += (l - 1) << OD_BITRES;
+      if v >= m {
+        bits += 1 << OD_BITRES;
+      }
+    }
+    bits
   }
   /// Write symbol v in [0, n-1] with parameter k as finite subexponential
   /// n: size of interval
@@ -568,6 +689,34 @@ where
       }
     }
   }
+  /// Resturns QOD_BITRES bits for symbol v in [0, n-1] with parameter k as finite subexponential
+  /// n: size of interval
+  /// k: 'parameter'
+  /// v: value to encode
+  fn count_subexp(&self, n: u32, k: u8, v: u32) -> u32 {
+    let mut i = 0;
+    let mut mk = 0;
+    let mut bits = 0;
+    loop {
+      let b = if i != 0 {k + i - 1} else {k};
+      let a = 1 << b;
+      if n <= mk + 3 * a {
+        bits += self.count_quniform(n - mk, v - mk);
+        break;
+      } else {
+        let t = v >= mk + a;
+        bits += 1 << OD_BITRES;
+        if t {
+          i += 1;
+          mk += a;
+        } else {
+          bits += (b as u32) << OD_BITRES;
+          break;
+        }
+      }
+    }
+    bits
+  }
   /// Write symbol v in [0, n-1] with parameter k as finite
   /// subexponential based on a reference ref also in [0, n-1].
   /// v: value to encode
@@ -581,6 +730,19 @@ where
       self.write_subexp(n, k, Self::recenter(n-1-r, n-1-v));
     }
   }
+  /// Returns QOD_BITRES bits for symbol v in [0, n-1] with parameter k as finite
+  /// subexponential based on a reference ref also in [0, n-1].
+  /// v: value to encode
+  /// n: size of interval
+  /// k: 'parameter'
+  /// r: reference
+  fn count_unsigned_subexp_with_ref(&self, v: u32, n: u32, k: u8, r: u32) -> u32 {
+    if (r << 1) <= n {
+      self.count_subexp(n, k, Self::recenter(r, v))
+    } else {
+      self.count_subexp(n, k, Self::recenter(n-1-r, n-1-v))
+    }
+  }
   /// Write symbol v in [-(n-1), n-1] with parameter k as finite
   /// subexponential based on a reference ref also in [-(n-1), n-1].
   /// v: value to encode
@@ -590,7 +752,15 @@ where
   fn write_signed_subexp_with_ref(&mut self, v: i32, low: i32, high: i32, k: u8, r: i32) {
     self.write_unsigned_subexp_with_ref((v - low) as u32, (high - low) as u32, k, (r - low) as u32);
   }
-
+  /// Returns QOD_BITRES bits for symbol v in [-(n-1), n-1] with parameter k as finite
+  /// subexponential based on a reference ref also in [-(n-1), n-1].
+  /// v: value to encode
+  /// n: size of interval
+  /// k: 'parameter'
+  /// r: reference
+  fn count_signed_subexp_with_ref(&self, v: i32, low: i32, high: i32, k: u8, r: i32) -> u32 {
+    self.count_unsigned_subexp_with_ref((v - low) as u32, (high - low) as u32, k, (r - low) as u32)
+  }
   /// Returns the number of bits "used" by the encoded symbols so far.
   /// This same number can be computed in either the encoder or the
   /// decoder, and is suitable for making coding decisions.  The value
@@ -601,7 +771,7 @@ where
   fn tell(&mut self) -> u32 {
     // The 10 here counteracts the offset of -9 baked into cnt, and adds 1 extra
     // bit, which we reserve for terminating the stream.
-    (((self.stream_bytes() * 8) as i32) + (self.cnt as i32) + 10) as u32
+    (((self.stream_bytes() * 8) as i32) + (self.cnt as i32) + 10) as u32 + (self.fake_bits_frac >> 8)
   }
   /// Returns the number of bits "used" by the encoded symbols so far.
   /// This same number can be computed in either the encoder or the
@@ -611,7 +781,7 @@ where
   ///         This will always be slightly larger than the exact value (e.g., all
   ///          rounding error is in the positive direction).
   fn tell_frac(&mut self) -> u32 {
-    Self::frac_compute(self.tell(), self.rng as u32)
+    Self::frac_compute(self.tell(), self.rng as u32) + self.fake_bits_frac
   }
   /// Save current point in coding/recording to a checkpoint that can
   /// be restored later.  A WriterCheckpoint can be generated for an
@@ -871,6 +1041,17 @@ mod test {
     assert_eq!(r.symbol(&cdf), 2);
     assert_eq!(r.symbol(&cdf), 2);
     assert_eq!(r.symbol(&cdf), 2);
+  }
+
+  #[test]
+  fn update_cdf_4_sse2() {
+    let mut cdf = [7296, 3819, 1616, 0, 0];
+    let mut cdf2 = [7296, 3819, 1616, 0, 0];
+    for i in 0..4 {
+      WriterBase::<WriterRecorder>::update_cdf(&mut cdf, i);
+      WriterBase::<WriterRecorder>::update_cdf_4_sse2(&mut cdf2, i);
+      assert_eq!(cdf, cdf2);
+    }
   }
 
   #[test]

@@ -7,10 +7,6 @@
 // Media Patent License 1.0 was not distributed with this source code in the
 // PATENTS file, you can obtain it at www.aomedia.org/license/patent.
 
-extern crate criterion;
-extern crate rand;
-extern crate rav1e;
-
 mod predict;
 mod transform;
 mod me;
@@ -21,13 +17,12 @@ use rav1e::context::*;
 use rav1e::partition::*;
 use rav1e::predict::*;
 use rav1e::rdo::rdo_cfl_alpha;
-use transform::transform;
+use rav1e::rdo::RDOType;
+use rav1e::ec::*;
+use crate::transform::transform;
 
 use criterion::*;
 use std::time::Duration;
-
-#[cfg(feature = "comparative_bench")]
-mod comparative;
 
 fn write_b(c: &mut Criterion) {
   for &tx_size in &[TxSize::TX_4X4, TxSize::TX_8X8] {
@@ -39,20 +34,24 @@ fn write_b(c: &mut Criterion) {
 }
 
 fn write_b_bench(b: &mut Bencher, tx_size: TxSize, qindex: usize) {
-  #[cfg(feature = "aom")]
-  unsafe {
-    av1_rtcd();
-    aom_dsp_rtcd();
-  }
-  let config =
-    EncoderConfig { quantizer: qindex, speed_settings: SpeedSettings::from_preset(10), ..Default::default() };
-  let mut fi = FrameInvariants::new(1024, 1024, config);
+  let config = EncoderConfig {
+    width: 1024,
+    height: 1024,
+    quantizer: qindex,
+    speed_settings: SpeedSettings::from_preset(10),
+    ..Default::default()
+  };
+  let sequence = Sequence::new(&Default::default());
+  let mut fi = FrameInvariants::<u16>::new(config, sequence);
   let mut w = ec::WriterEncoder::new();
-  let fc = CDFContext::new(fi.base_q_idx);
-  let bc = BlockContext::new(fi.sb_width * 16, fi.sb_height * 16);
-  let mut fs = FrameState::new(&fi, Default::default());
+  let mut fc = CDFContext::new(fi.base_q_idx);
+  let mut fb = FrameBlocks::new(fi.sb_width * 16, fi.sb_height * 16);
+  let mut tb = fb.as_tile_blocks_mut();
+  let bc = BlockContext::new(&mut tb);
+  let mut fs = FrameState::new(&fi);
+  let mut ts = fs.as_tile_state_mut();
   // For now, restoration unit size is locked to superblock size.
-  let mut cw = ContextWriter::new(fc, bc);
+  let mut cw = ContextWriter::new(&mut fc, bc);
 
   let tx_type = TxType::DCT_DCT;
 
@@ -64,7 +63,7 @@ fn write_b_bench(b: &mut Bencher, tx_size: TxSize, qindex: usize) {
     for &mode in RAV1E_INTRA_MODES {
       let sbo = SuperBlockOffset { x: sbx, y: sby };
       for p in 1..3 {
-        fs.qc.update(fi.base_q_idx, tx_size, mode.is_intra(), 8, fi.dc_delta_q[p], fi.ac_delta_q[p]);
+        ts.qc.update(fi.base_q_idx, tx_size, mode.is_intra(), 8, fi.dc_delta_q[p], fi.ac_delta_q[p]);
         for by in 0..8 {
           for bx in 0..8 {
             // For ex, 8x8 tx should be applied to even numbered (bx,by)
@@ -75,24 +74,24 @@ fn write_b_bench(b: &mut Bencher, tx_size: TxSize, qindex: usize) {
             };
             let bo = sbo.block_offset(bx, by);
             let tx_bo = BlockOffset { x: bo.x + bx, y: bo.y + by };
-            let po = tx_bo.plane_offset(&fs.input.planes[p].cfg);
+            let po = tx_bo.plane_offset(&ts.input.planes[p].cfg);
             encode_tx_block(
               &mut fi,
-              &mut fs,
+              &mut ts,
               &mut cw,
               &mut w,
               p,
-              &bo,
+              bo,
               mode,
               tx_size,
               tx_type,
               tx_size.block_size(),
-              &po,
+              po,
               false,
-              8,
               ac,
               0,
-              false
+              RDOType::PixelDistRealRate,
+              true
             );
           }
         }
@@ -108,14 +107,20 @@ fn cdef_frame(c: &mut Criterion) {
   c.bench_function(&n, move |b| cdef_frame_bench(b, w, h));
 }
 
-fn cdef_frame_bench(b: &mut Bencher, w: usize, h: usize) {
-  let config =
-    EncoderConfig { quantizer: 100, speed_settings: SpeedSettings::from_preset(10), ..Default::default() };
-  let fi = FrameInvariants::new(w, h, config);
-  let mut bc = BlockContext::new(fi.sb_width * 16, fi.sb_height * 16);
-  let mut fs = FrameState::new(&fi, Default::default());
+fn cdef_frame_bench(b: &mut Bencher, width: usize, height: usize) {
+  let config = EncoderConfig {
+    width,
+    height,
+    quantizer: 100,
+    speed_settings: SpeedSettings::from_preset(10),
+    ..Default::default()
+  };
+  let sequence = Sequence::new(&Default::default());
+  let fi = FrameInvariants::<u16>::new(config, sequence);
+  let fb = FrameBlocks::new(fi.sb_width * 16, fi.sb_height * 16);
+  let mut fs = FrameState::new(&fi);
 
-  b.iter(|| cdef_filter_frame(&fi, &mut fs.rec, &mut bc, 8));
+  b.iter(|| cdef_filter_frame(&fi, &mut fs.rec, &fb));
 }
 
 fn cfl_rdo(c: &mut Criterion) {
@@ -131,12 +136,44 @@ fn cfl_rdo(c: &mut Criterion) {
 }
 
 fn cfl_rdo_bench(b: &mut Bencher, bsize: BlockSize) {
-  let config =
-    EncoderConfig { quantizer: 100, speed_settings: SpeedSettings::from_preset(10), ..Default::default() };
-  let fi = FrameInvariants::new(1024, 1024, config);
-  let mut fs = FrameState::new(&fi, Default::default());
+  let config = EncoderConfig {
+    width: 1024,
+    height: 1024,
+    quantizer: 100,
+    speed_settings: SpeedSettings::from_preset(10),
+    ..Default::default()
+  };
+  let sequence = Sequence::new(&Default::default());
+  let fi = FrameInvariants::<u16>::new(config, sequence);
+  let mut fs = FrameState::new(&fi);
+  let mut ts = fs.as_tile_state_mut();
   let offset = BlockOffset { x: 1, y: 1 };
-  b.iter(|| rdo_cfl_alpha(&mut fs, &offset, bsize, 8, Default::default()))
+  b.iter(|| rdo_cfl_alpha(&mut ts, offset, bsize, fi.sequence.bit_depth))
+}
+
+fn ec_bench(c: &mut Criterion) {
+    c.bench_function("update_cdf_4_native", update_cdf_4_native);
+    c.bench_function("update_cdf_4_sse2", update_cdf_4_sse2);
+}
+
+fn update_cdf_4_native(b: &mut Bencher) {
+    let mut cdf = [7296, 3819, 1616, 0, 0];
+    b.iter(|| {
+        for i in 0..1000 {
+            WriterBase::<WriterRecorder>::update_cdf(&mut cdf, i & 3);
+            black_box(cdf);
+        }
+    });
+}
+
+fn update_cdf_4_sse2(b: &mut Bencher) {
+    let mut cdf = [7296, 3819, 1616, 0, 0];
+    b.iter(|| {
+        for i in 0..1000 {
+            WriterBase::<WriterRecorder>::update_cdf_4_sse2(&mut cdf, i & 3);
+            black_box(cdf);
+        }
+    });
 }
 
 criterion_group!(intra_prediction, predict::pred_bench,);
@@ -149,8 +186,7 @@ criterion_group!{ name = me;
                   targets = me::get_sad
 }
 
-#[cfg(feature = "comparative_bench")]
-criterion_main!(comparative::intra_prediction);
+criterion_group!(ec, ec_bench);
 
-#[cfg(not(feature = "comparative_bench"))]
-criterion_main!(write_block, intra_prediction, cdef, cfl, me, transform);
+criterion_main!(write_block, intra_prediction, cdef, cfl, me, transform, ec);
+
