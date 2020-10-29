@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2018, The rav1e contributors. All rights reserved
+// Copyright (c) 2017-2020, The rav1e contributors. All rights reserved
 //
 // This source code is subject to the terms of the BSD 2 Clause License and
 // the Alliance for Open Media Patent License 1.0. If the BSD 2 Clause License
@@ -7,36 +7,85 @@
 // Media Patent License 1.0 was not distributed with this source code in the
 // PATENTS file, you can obtain it at www.aomedia.org/license/patent.
 
+use crate::error::*;
 use crate::muxer::{create_muxer, Muxer};
+use crate::stats::MetricsEnabled;
 use crate::{ColorPrimaries, MatrixCoefficients, TransferCharacteristics};
-use clap::{App, AppSettings, Arg, ArgMatches, SubCommand, Shell};
-use rav1e::partition::BlockSize;
-use rav1e::*;
+use clap::{App, AppSettings, Arg, ArgMatches, Shell, SubCommand};
+use rav1e::prelude::*;
+use rav1e::version;
+use scan_fmt::scan_fmt;
 
 use std::fs::File;
+use std::io;
 use std::io::prelude::*;
-use std::path::PathBuf;
-use std::time::Instant;
-use std::{fmt, io};
 
 pub struct EncoderIO {
-  pub input: Box<dyn Read>,
-  pub output: Box<dyn Muxer>,
-  pub rec: Option<Box<dyn Write>>
+  pub input: Box<dyn Read + Send>,
+  pub output: Box<dyn Muxer + Send>,
+  pub rec: Option<Box<dyn Write + Send>>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Verbose {
+  Quiet,
+  Normal,
+  Verbose,
 }
 
 pub struct CliOptions {
   pub io: EncoderIO,
   pub enc: EncoderConfig,
   pub limit: usize,
+  pub color_range_specified: bool,
+  pub override_time_base: bool,
   pub skip: usize,
-  pub verbose: bool,
+  pub verbose: Verbose,
+  pub benchmark: bool,
   pub threads: usize,
+  pub metrics_enabled: MetricsEnabled,
+  pub pass1file_name: Option<String>,
+  pub pass2file_name: Option<String>,
+  pub save_config: Option<String>,
 }
 
-pub fn parse_cli() -> CliOptions {
+#[cfg(feature = "serialize")]
+fn build_speed_long_help() -> String {
+  let levels = (0..=10)
+    .map(|speed| {
+      let s = SpeedSettings::from_preset(speed);
+      let o = crate::kv::to_string(&s).unwrap().replace(", ", "\n    ");
+      format!("{:2} :\n    {}", speed, o)
+    })
+    .collect::<Vec<String>>()
+    .join("\n");
+
+  format!(
+    "Speed level (0 is best quality, 10 is fastest)\n\
+     Speeds 10 and 0 are extremes and are generally not recommended\n\
+     {}",
+    levels
+  )
+}
+
+#[cfg(not(feature = "serialize"))]
+fn build_speed_long_help() -> String {
+  "Speed level (0 is best quality, 10 is fastest)\n\
+   Speeds 10 and 0 are extremes and are generally not recommended"
+    .into()
+}
+
+#[allow(unused_mut)]
+/// Only call this once at the start of the app,
+/// otherwise bad things will happen.
+pub fn parse_cli() -> Result<CliOptions, CliError> {
+  let profile = env!("PROFILE");
+  let ver_short = format!("{} ({})", version::short(), profile);
+  let ver_long = format!("{} ({})", version::full(), profile);
+  let speed_long_help = build_speed_long_help();
   let mut app = App::new("rav1e")
-    .version(env!("CARGO_PKG_VERSION"))
+    .version(ver_short.as_str())
+    .long_version(ver_long.as_str())
     .about("AV1 video encoder")
     .setting(AppSettings::DeriveDisplayOrder)
     .setting(AppSettings::SubcommandsNegateReqs)
@@ -66,21 +115,18 @@ pub fn parse_cli() -> CliOptions {
         .required_unless("FULLHELP")
         .takes_value(true)
     )
-    .arg(
-      Arg::with_name("STATS_FILE")
-        .help("Custom location for first-pass stats file")
-        .long("stats")
-        .takes_value(true)
-        .default_value("rav1e_stats.json")
-    )
     // ENCODING SETTINGS
     .arg(
-      Arg::with_name("PASS")
-        .help("Specify first-pass or second-pass to run as a two-pass encode; If not provided, will run a one-pass encode")
-        .short("p")
-        .long("pass")
+      Arg::with_name("FIRST_PASS")
+        .help("Perform the first pass of a two-pass encode, saving the pass data to the specified file for future passes")
+        .long("first-pass")
         .takes_value(true)
-        .possible_values(&["1", "2"])
+    )
+    .arg(
+      Arg::with_name("SECOND_PASS")
+        .help("Perform the second pass of a two-pass encode, reading the pass data saved from a previous pass from the specified file")
+        .long("second-pass")
+        .takes_value(true)
     )
     .arg(
       Arg::with_name("LIMIT")
@@ -104,6 +150,13 @@ pub fn parse_cli() -> CliOptions {
         .takes_value(true)
     )
     .arg(
+      Arg::with_name("MINQP")
+        .help("Minimum quantizer (0-255) to use in bitrate mode [default: 0]")
+        .long("min-quantizer")
+        .alias("min_quantizer")
+        .takes_value(true)
+    )
+    .arg(
       Arg::with_name("BITRATE")
         .help("Bitrate (kbps)")
         .short("b")
@@ -114,34 +167,11 @@ pub fn parse_cli() -> CliOptions {
       Arg::with_name("SPEED")
         .help("Speed level (0 is best quality, 10 is fastest)\n\
         Speeds 10 and 0 are extremes and are generally not recommended")
-        .long_help("Speed level (0 is best quality, 10 is fastest)\n\
-        Speeds 10 and 0 are extremes and are generally not recommended\n\
-        - 10 (fastest):\n\
-        Min block size 64x64, TX domain distortion, fast deblock, no scenechange detection\n\
-        - 9:\n\
-        Min block size 64x64, TX domain distortion, fast deblock\n\
-        - 8:\n\
-        Min block size 8x8, reduced TX set, TX domain distortion, fast deblock\n\
-        - 7:\n\
-        Min block size 8x8, reduced TX set, TX domain distortion\n\
-        - 6:\n\
-        Min block size 8x8, reduced TX set, TX domain distortion\n\
-        - 5 (default):\n\
-        Min block size 8x8, reduced TX set, TX domain distortion, complex pred modes for keyframes\n\
-        - 4:\n\
-        Min block size 8x8, TX domain distortion, complex pred modes for keyframes\n\
-        - 3:\n\
-        Min block size 8x8, TX domain distortion, complex pred modes for keyframes, RDO TX decision\n\
-        - 2:\n\
-        Min block size 8x8, TX domain distortion, complex pred modes for keyframes, RDO TX decision, include near MVs\n\
-        - 1:\n\
-        Min block size 8x8, TX domain distortion, complex pred modes, RDO TX decision, include near MVs\n\
-        - 0 (slowest):\n\
-        Min block size 4x4, TX domain distortion, complex pred modes, RDO TX decision, include near MVs, bottom-up encoding\n")
+        .long_help(&speed_long_help)
         .short("s")
         .long("speed")
         .takes_value(true)
-        .default_value("5")
+        .default_value("6")
     )
     .arg(
       Arg::with_name("MIN_KEYFRAME_INTERVAL")
@@ -153,24 +183,40 @@ pub fn parse_cli() -> CliOptions {
     )
     .arg(
       Arg::with_name("KEYFRAME_INTERVAL")
-        .help("Maximum interval between keyframes")
+        .help("Maximum interval between keyframes. When set to 0, disables fixed-interval keyframes.")
         .short("I")
         .long("keyint")
         .takes_value(true)
         .default_value("240")
     )
     .arg(
+      Arg::with_name("SWITCH_FRAME_INTERVAL")
+        .help("Maximum interval between switch frames. When set to 0, disables switch frames.")
+        .short("S")
+        .long("switch-frame-interval")
+        .takes_value(true)
+        .default_value("0")
+    )
+    .arg(
       Arg::with_name("RESERVOIR_FRAME_DELAY")
-        .help("Number of frames over which rate control should distribute the reservoir [default: max(240, 1.5x keyint)]\n\
+        .help("Number of frames over which rate control should distribute the reservoir [default: min(240, 1.5x keyint)]\n\
          A minimum value of 12 is enforced.")
-        .long("reservoir_frame_delay")
+        .long("reservoir-frame-delay")
+        .alias("reservoir_frame_delay")
         .takes_value(true)
     )
     .arg(
       Arg::with_name("LOW_LATENCY")
         .help("Low latency mode; disables frame reordering\n\
             Has a significant speed-to-quality trade-off")
-        .long("low_latency")
+        .long("low-latency")
+        .alias("low_latency")
+    )
+    .arg(
+      Arg::with_name("RDO_LOOKAHEAD_FRAMES")
+        .help("Number of frames encoder should lookahead for RDO purposes [default: 40]\n")
+        .long("rdo-lookahead-frames")
+        .takes_value(true)
     )
     .arg(
       Arg::with_name("TUNE")
@@ -181,16 +227,24 @@ pub fn parse_cli() -> CliOptions {
         .case_insensitive(true)
     )
     .arg(
-      Arg::with_name("TILE_ROWS_LOG2")
-        .help("Log2 of number of tile rows")
-        .long("tile-rows-log2")
+      Arg::with_name("TILE_ROWS")
+        .help("Number of tile rows. Must be a power of 2. rav1e may override this based on video resolution.")
+        .long("tile-rows")
         .takes_value(true)
         .default_value("0")
     )
     .arg(
-      Arg::with_name("TILE_COLS_LOG2")
-        .help("Log2 of number of tile columns")
-        .long("tile-cols-log2")
+      Arg::with_name("TILE_COLS")
+        .help("Number of tile columns. Must be a power of 2. rav1e may override this based on video resolution.")
+        .long("tile-cols")
+        .takes_value(true)
+        .default_value("0")
+    )
+    .arg(
+      Arg::with_name("TILES")
+        .help("Number of tiles. Tile-cols and tile-rows are overridden\n\
+               so that the video has at least this many tiles.")
+        .long("tiles")
         .takes_value(true)
         .default_value("0")
     )
@@ -200,7 +254,7 @@ pub fn parse_cli() -> CliOptions {
         .help("Pixel range")
         .long("range")
         .possible_values(&PixelRange::variants())
-        .default_value("unspecified")
+        .default_value("limited")
         .case_insensitive(true)
     )
     .arg(
@@ -230,18 +284,48 @@ pub fn parse_cli() -> CliOptions {
     .arg(
       Arg::with_name("MASTERING_DISPLAY")
         .help("Mastering display primaries in the form of G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)")
-        .long("mastering_display")
+        .long("mastering-display")
+        .alias("mastering_display")
         .default_value("unspecified")
         .case_insensitive(true)
     )
     .arg(
       Arg::with_name("CONTENT_LIGHT")
         .help("Content light level used to describe content luminosity (cll,fall)")
-        .long("content_light")
+        .long("content-light")
+        .alias("content_light")
         .default_value("0,0")
         .case_insensitive(true)
     )
+    // TIMING INFO
+    .arg(
+      Arg::with_name("FRAME_RATE")
+        .help("Constant frame rate to set at the output (inferred from input when omitted)")
+        .long("frame-rate")
+        .alias("frame_rate")
+        .takes_value(true)
+    )
+    .arg(
+      Arg::with_name("TIME_SCALE")
+        .help("The time scale associated with the frame rate if provided (ignored otherwise)")
+        .long("time-scale")
+        .alias("time_scale")
+        .default_value("1")
+        .takes_value(true)
+    )
+    // STILL PICTURE
+    .arg(
+      Arg::with_name("STILL_PICTURE")
+        .help("Still picture mode")
+        .long("still-picture")
+        .alias("still_picture")
+    )
     // DEBUGGING
+    .arg(
+      Arg::with_name("BENCHMARK")
+        .help("Provide a benchmark report at the end of the encoding")
+        .long("benchmark")
+    )
     .arg(
       Arg::with_name("VERBOSE")
         .help("Verbose logging; outputs info for every frame")
@@ -249,9 +333,20 @@ pub fn parse_cli() -> CliOptions {
         .short("v")
     )
     .arg(
+      Arg::with_name("QUIET")
+        .help("Do not output any status message")
+        .long("quiet")
+        .short("q")
+    )
+    .arg(
       Arg::with_name("PSNR")
         .help("Calculate and display PSNR metrics")
         .long("psnr")
+    )
+    .arg(
+      Arg::with_name("METRICS")
+        .help("Calulate and display several metrics including PSNR, SSIM, CIEDE2000 etc")
+        .long("metrics")
     )
     .arg(
       Arg::with_name("RECONSTRUCTION")
@@ -261,15 +356,9 @@ pub fn parse_cli() -> CliOptions {
         .takes_value(true)
     )
     .arg(
-      Arg::with_name("SPEED_TEST")
-        .help("Run an encode using default encoding settings, manually adjusting only the settings specified; allows benchmarking settings in isolation")
-        .hidden(true)
-        .long("speed-test")
-        .takes_value(true)
-    )
-    .arg(
-      Arg::with_name("train-rdo")
-        .long("train-rdo")
+      Arg::with_name("OVERWRITE")
+        .help("Overwrite output file.")
+        .short("y")
     )
     .subcommand(SubCommand::with_name("advanced")
                 .setting(AppSettings::Hidden)
@@ -281,6 +370,18 @@ pub fn parse_cli() -> CliOptions {
                      .takes_value(true)
                      .possible_values(&Shell::variants())
                 )
+                .arg(Arg::with_name("SAVE_CONFIG")
+                     .help("Save the current configuration in a toml file")
+                     .short("s")
+                     .long("save_config")
+                     .takes_value(true)
+                )
+                .arg(Arg::with_name("LOAD_CONFIG")
+                     .help("Load the encoder configuration from a toml file")
+                     .short("l")
+                     .long("load_config")
+                     .takes_value(true)
+                )
     );
 
   let matches = app.clone().get_matches();
@@ -290,427 +391,289 @@ pub fn parse_cli() -> CliOptions {
     std::process::exit(0);
   }
 
-  let threads = matches.value_of("THREADS").map(|v| v.parse().expect("Threads must be an integer")).unwrap();
+  let threads = matches
+    .value_of("THREADS")
+    .map(|v| v.parse().expect("Threads must be an integer"))
+    .unwrap();
+
+  let mut save_config = None;
+  let mut enc = None;
 
   if let Some(matches) = matches.subcommand_matches("advanced") {
-    if let Some(shell) = matches.value_of("SHELL").map(|v| v.parse().unwrap()) {
+    if let Some(shell) = matches.value_of("SHELL").map(|v| v.parse().unwrap())
+    {
       app.gen_completions_to("rav1e", shell, &mut std::io::stdout());
       std::process::exit(0);
     }
+
+    #[cfg(feature = "serialize")]
+    {
+      save_config = matches.value_of("SAVE_CONFIG").map(|v| v.to_owned());
+      if let Some(load_config) = matches.value_of("LOAD_CONFIG") {
+        let mut config = String::new();
+        File::open(load_config)
+          .and_then(|mut f| f.read_to_string(&mut config))
+          .map_err(|e| e.context("Cannot open the configuration file"))?;
+
+        enc = Some(toml::from_str(&config).unwrap());
+      }
+    }
+    #[cfg(not(feature = "serialize"))]
+    {
+      if matches.value_of("SAVE_CONFIG").is_some()
+        || matches.value_of("LOAD_CONFIG").is_some()
+      {
+        let e: io::Error = io::ErrorKind::InvalidInput.into();
+        return Err(e.context(
+          "The load/save config advanced option requires the
+            `serialize` feature, rebuild adding it.",
+        ));
+      }
+    }
   }
+
+  let rec = match matches.value_of("RECONSTRUCTION") {
+    Some(f) => Some(Box::new(
+      File::create(&f)
+        .map_err(|e| e.context("Cannot create reconstruction file"))?,
+    ) as Box<dyn Write + Send>),
+    None => None,
+  };
 
   let io = EncoderIO {
     input: match matches.value_of("INPUT").unwrap() {
-      "-" => Box::new(io::stdin()) as Box<dyn Read>,
-      f => Box::new(File::open(&f).unwrap()) as Box<dyn Read>
+      "-" => Box::new(io::stdin()) as Box<dyn Read + Send>,
+      f => Box::new(
+        File::open(&f).map_err(|e| e.context("Cannot open input file"))?,
+      ) as Box<dyn Read + Send>,
     },
-    output: create_muxer(matches.value_of("OUTPUT").unwrap()),
-    rec: matches
-      .value_of("RECONSTRUCTION")
-      .map(|f| Box::new(File::create(&f).unwrap()) as Box<dyn Write>)
+    output: create_muxer(
+      matches.value_of("OUTPUT").unwrap(),
+      matches.is_present("OVERWRITE"),
+    )?,
+    rec,
   };
 
-  CliOptions {
+  let enc = enc.map_or_else(|| parse_config(&matches), Ok)?;
+
+  let verbose = if matches.is_present("QUIET") {
+    Verbose::Quiet
+  } else if matches.is_present("VERBOSE") {
+    Verbose::Verbose
+  } else {
+    Verbose::Normal
+  };
+
+  let metrics_enabled = if matches.is_present("METRICS") {
+    MetricsEnabled::All
+  } else if matches.is_present("PSNR") {
+    MetricsEnabled::Psnr
+  } else {
+    MetricsEnabled::None
+  };
+
+  let limit = matches.value_of("LIMIT").unwrap().parse().unwrap();
+  if enc.still_picture && limit > 1 {
+    panic!("A limit cannot be set above 1 in still picture mode");
+  }
+
+  Ok(CliOptions {
     io,
-    enc: parse_config(&matches),
-    limit: matches.value_of("LIMIT").unwrap().parse().unwrap(),
+    enc,
+    limit,
+    // Use `occurrences_of()` because `is_present()` is always true
+    // if a parameter has a default value.
+    color_range_specified: matches.occurrences_of("PIXEL_RANGE") > 0,
+    override_time_base: matches.is_present("FRAME_RATE"),
+    metrics_enabled,
     skip: matches.value_of("SKIP").unwrap().parse().unwrap(),
-    verbose: matches.is_present("VERBOSE"),
+    benchmark: matches.is_present("BENCHMARK"),
+    verbose,
     threads,
+    pass1file_name: matches.value_of("FIRST_PASS").map(|s| s.to_owned()),
+    pass2file_name: matches.value_of("SECOND_PASS").map(|s| s.to_owned()),
+    save_config,
+  })
+}
+
+pub trait MatchGet {
+  fn value_of_int(&self, name: &str) -> Option<Result<i32, CliError>>;
+}
+
+impl MatchGet for ArgMatches<'_> {
+  fn value_of_int(&self, name: &str) -> Option<Result<i32, CliError>> {
+    self
+      .value_of(name)
+      .map(|v| v.parse().map_err(|e: std::num::ParseIntError| e.context(name)))
   }
 }
 
-fn parse_config(matches: &ArgMatches<'_>) -> EncoderConfig {
-  let maybe_quantizer = matches.value_of("QP").map(|qp| qp.parse().unwrap());
-  let maybe_bitrate =
-    matches.value_of("BITRATE").map(|bitrate| bitrate.parse().unwrap());
+fn parse_config(matches: &ArgMatches<'_>) -> Result<EncoderConfig, CliError> {
+  let maybe_quantizer = matches.value_of_int("QP");
+  let maybe_bitrate = matches.value_of_int("BITRATE");
   let quantizer = maybe_quantizer.unwrap_or_else(|| {
     if maybe_bitrate.is_some() {
       // If a bitrate is specified, the quantizer is the maximum allowed (e.g.,
       //  the minimum quality allowed), which by default should be
       //  unconstrained.
-      255
+      Ok(255)
     } else {
-      100
+      Ok(100)
     }
-  });
-  let bitrate: i32 = maybe_bitrate.unwrap_or(0);
-  let train_rdo = matches.is_present("train-rdo");
+  })? as usize;
+  let bitrate: i32 = maybe_bitrate.unwrap_or(Ok(0))?;
+  if bitrate <= 0
+    && (matches.is_present("FIRST_PASS") || matches.is_present("SECOND_PASS"))
+  {
+    panic!("A target bitrate must be specified when using passes");
+  }
+
   if quantizer == 0 {
     unimplemented!("Lossless encoding not yet implemented");
   } else if quantizer > 255 {
     panic!("Quantizer must be between 0-255");
   }
 
-  let mut cfg = if let Some(settings) = matches.value_of("SPEED_TEST") {
-    eprintln!("Running in speed test mode--ignoring other settings");
-    let mut cfg = EncoderConfig::default();
-    settings
-      .split_whitespace()
-      .for_each(|setting| apply_speed_test_cfg(&mut cfg, setting));
-    cfg
+  let speed = matches.value_of("SPEED").unwrap().parse().unwrap();
+  let max_interval: u64 =
+    matches.value_of("KEYFRAME_INTERVAL").unwrap().parse().unwrap();
+  let mut min_interval: u64 =
+    matches.value_of("MIN_KEYFRAME_INTERVAL").unwrap().parse().unwrap();
+
+  if matches.occurrences_of("MIN_KEYFRAME_INTERVAL") == 0 {
+    min_interval = min_interval.min(max_interval);
+  }
+
+  if speed > 10 {
+    panic!("Speed must be between 0-10");
+  } else if min_interval > max_interval {
+    panic!("Maximum keyframe interval must be greater than or equal to minimum keyframe interval");
+  }
+
+  let color_primaries =
+    matches.value_of("COLOR_PRIMARIES").unwrap().parse().unwrap_or_default();
+  let transfer_characteristics = matches
+    .value_of("TRANSFER_CHARACTERISTICS")
+    .unwrap()
+    .parse()
+    .unwrap_or_default();
+  let matrix_coefficients = matches
+    .value_of("MATRIX_COEFFICIENTS")
+    .unwrap()
+    .parse()
+    .unwrap_or_default();
+
+  let mut cfg = EncoderConfig::with_speed_preset(speed);
+  cfg.set_key_frame_interval(min_interval, max_interval);
+  cfg.switch_frame_interval =
+    matches.value_of("SWITCH_FRAME_INTERVAL").unwrap().parse().unwrap();
+
+  cfg.pixel_range =
+    matches.value_of("PIXEL_RANGE").unwrap().parse().unwrap_or_default();
+  cfg.color_description = if color_primaries == ColorPrimaries::Unspecified
+    && transfer_characteristics == TransferCharacteristics::Unspecified
+    && matrix_coefficients == MatrixCoefficients::Unspecified
+  {
+    // No need to set a color description with all parameters unspecified.
+    None
   } else {
-    let speed = matches.value_of("SPEED").unwrap().parse().unwrap();
-    let max_interval: u64 = matches.value_of("KEYFRAME_INTERVAL").unwrap().parse().unwrap();
-    let mut min_interval: u64 = matches.value_of("MIN_KEYFRAME_INTERVAL").unwrap().parse().unwrap();
-
-    if matches.occurrences_of("MIN_KEYFRAME_INTERVAL") == 0 {
-      min_interval = min_interval.min(max_interval);
-    }
-
-    // Validate arguments
-    if max_interval < 1 {
-      panic!("Keyframe interval must be greater than 0");
-    }
-
-    if speed > 10 {
-      panic!("Speed must be between 0-10");
-    } else if min_interval > max_interval {
-      panic!("Maximum keyframe interval must be greater than or equal to minimum keyframe interval");
-    }
-
-    let color_primaries =
-      matches.value_of("COLOR_PRIMARIES").unwrap().parse().unwrap_or_default();
-    let transfer_characteristics = matches
-      .value_of("TRANSFER_CHARACTERISTICS")
-      .unwrap()
-      .parse()
-      .unwrap_or_default();
-    let matrix_coefficients = matches
-      .value_of("MATRIX_COEFFICIENTS")
-      .unwrap()
-      .parse()
-      .unwrap_or_default();
-
-    let mut cfg = EncoderConfig::with_speed_preset(speed);
-    cfg.max_key_frame_interval = min_interval;
-    cfg.max_key_frame_interval = max_interval;
-
-    cfg.pixel_range = matches.value_of("PIXEL_RANGE").unwrap().parse().unwrap_or_default();
-    cfg.color_description = if color_primaries == ColorPrimaries::Unspecified &&
-      transfer_characteristics == TransferCharacteristics::Unspecified &&
-      matrix_coefficients == MatrixCoefficients::Unspecified {
-      // No need to set a color description with all parameters unspecified.
-      None
-    } else {
-      Some(ColorDescription {
-        color_primaries,
-        transfer_characteristics,
-        matrix_coefficients
-      })
-    };
-
-    let mastering_display_opt = matches.value_of("MASTERING_DISPLAY").unwrap();
-    cfg.mastering_display = if mastering_display_opt == "unspecified" { None } else {
-      let (g_x, g_y, b_x, b_y, r_x, r_y, wp_x, wp_y, max_lum, min_lum) = scan_fmt!(mastering_display_opt, "G({},{})B({},{})R({},{})WP({},{})L({},{})", f64, f64, f64, f64, f64, f64, f64, f64, f64, f64).expect("Cannot parse the mastering display option");
-      Some(MasteringDisplay {
-        primaries: [
-          Point {
-            x: (r_x * ((1 << 16) as f64)).round() as u16,
-            y: (r_y * ((1 << 16) as f64)).round() as u16,
-          },
-          Point {
-            x: (g_x * ((1 << 16) as f64)).round() as u16,
-            y: (g_y * ((1 << 16) as f64)).round() as u16,
-          },
-          Point {
-            x: (b_x * ((1 << 16) as f64)).round() as u16,
-            y: (b_y * ((1 << 16) as f64)).round() as u16,
-          }
-        ],
-        white_point: Point {
-          x: (wp_x * ((1 << 16) as f64)).round() as u16,
-          y: (wp_y * ((1 << 16) as f64)).round() as u16,
-        },
-        max_luminance: (max_lum * ((1 << 8) as f64)).round() as u32,
-        min_luminance: (min_lum * ((1 << 14) as f64)).round() as u32,
-      })
-    };
-
-    let content_light_opt = matches.value_of("CONTENT_LIGHT").unwrap();
-    let (cll, fall) = scan_fmt!(content_light_opt, "{},{}", u16, u16).expect("Cannot parse the content light option");
-    cfg.content_light = if cll == 0 && fall == 0 { None } else {
-      Some(ContentLight {
-        max_content_light_level: cll,
-        max_frame_average_light_level: fall
-      })
-    };
-    cfg
+    Some(ColorDescription {
+      color_primaries,
+      transfer_characteristics,
+      matrix_coefficients,
+    })
   };
+
+  let mastering_display_opt = matches.value_of("MASTERING_DISPLAY").unwrap();
+  cfg.mastering_display = if mastering_display_opt == "unspecified" {
+    None
+  } else {
+    let (g_x, g_y, b_x, b_y, r_x, r_y, wp_x, wp_y, max_lum, min_lum) =
+      scan_fmt!(
+        mastering_display_opt,
+        "G({},{})B({},{})R({},{})WP({},{})L({},{})",
+        f64,
+        f64,
+        f64,
+        f64,
+        f64,
+        f64,
+        f64,
+        f64,
+        f64,
+        f64
+      )
+      .expect("Cannot parse the mastering display option");
+    Some(MasteringDisplay {
+      primaries: [
+        ChromaticityPoint {
+          x: (r_x * ((1 << 16) as f64)).round() as u16,
+          y: (r_y * ((1 << 16) as f64)).round() as u16,
+        },
+        ChromaticityPoint {
+          x: (g_x * ((1 << 16) as f64)).round() as u16,
+          y: (g_y * ((1 << 16) as f64)).round() as u16,
+        },
+        ChromaticityPoint {
+          x: (b_x * ((1 << 16) as f64)).round() as u16,
+          y: (b_y * ((1 << 16) as f64)).round() as u16,
+        },
+      ],
+      white_point: ChromaticityPoint {
+        x: (wp_x * ((1 << 16) as f64)).round() as u16,
+        y: (wp_y * ((1 << 16) as f64)).round() as u16,
+      },
+      max_luminance: (max_lum * ((1 << 8) as f64)).round() as u32,
+      min_luminance: (min_lum * ((1 << 14) as f64)).round() as u32,
+    })
+  };
+
+  let content_light_opt = matches.value_of("CONTENT_LIGHT").unwrap();
+  let (cll, fall) = scan_fmt!(content_light_opt, "{},{}", u16, u16)
+    .expect("Cannot parse the content light option");
+  cfg.content_light = if cll == 0 && fall == 0 {
+    None
+  } else {
+    Some(ContentLight {
+      max_content_light_level: cll,
+      max_frame_average_light_level: fall,
+    })
+  };
+
+  cfg.still_picture = matches.is_present("STILL_PICTURE");
 
   cfg.quantizer = quantizer;
+  cfg.min_quantizer =
+    matches.value_of("MINQP").unwrap_or("0").parse().unwrap();
   cfg.bitrate = bitrate.checked_mul(1000).expect("Bitrate too high");
-  cfg.reservoir_frame_delay = matches.value_of("RESERVOIR_FRAME_DELAY").map(|reservior_frame_delay| reservior_frame_delay.parse().unwrap());
-  cfg.show_psnr = matches.is_present("PSNR");
-  cfg.pass = matches.value_of("PASS").map(|pass| pass.parse().unwrap());
-  cfg.stats_file = if cfg.pass.is_some() {
-    Some(PathBuf::from(matches.value_of("STATS_FILE").unwrap()))
-  } else {
-    None
-  };
+  cfg.reservoir_frame_delay = matches
+    .value_of("RESERVOIR_FRAME_DELAY")
+    .map(|reservior_frame_delay| reservior_frame_delay.parse().unwrap());
+  cfg.rdo_lookahead_frames =
+    matches.value_of("RDO_LOOKAHEAD_FRAMES").unwrap_or("40").parse().unwrap();
   cfg.tune = matches.value_of("TUNE").unwrap().parse().unwrap();
 
-  cfg.tile_cols_log2 = matches.value_of("TILE_COLS_LOG2").unwrap().parse().unwrap();
-  cfg.tile_rows_log2 = matches.value_of("TILE_ROWS_LOG2").unwrap().parse().unwrap();
+  if cfg.tune == Tune::Psychovisual {
+    cfg.speed_settings.tx_domain_distortion = false;
+  }
 
-  if cfg.tile_cols_log2 > 6 || cfg.tile_rows_log2 > 6 {
-    panic!("Log2 of tile columns and rows may not be greater than 6");
+  cfg.tile_cols = matches.value_of("TILE_COLS").unwrap().parse().unwrap();
+  cfg.tile_rows = matches.value_of("TILE_ROWS").unwrap().parse().unwrap();
+
+  cfg.tiles = matches.value_of("TILES").unwrap().parse().unwrap();
+
+  if cfg.tile_cols > 64 || cfg.tile_rows > 64 {
+    panic!("Tile columns and rows may not be greater than 64");
+  }
+
+  if let Some(frame_rate) = matches.value_of("FRAME_RATE") {
+    cfg.time_base = Rational::new(
+      matches.value_of("TIME_SCALE").unwrap().parse().unwrap(),
+      frame_rate.parse().unwrap(),
+    );
   }
 
   cfg.low_latency = matches.is_present("LOW_LATENCY");
-  cfg.train_rdo = train_rdo;
-  cfg
-}
 
-fn apply_speed_test_cfg(cfg: &mut EncoderConfig, setting: &str) {
-  match setting {
-    "baseline" => {
-      cfg.speed_settings = SpeedSettings::default();
-    },
-    "min_block_size_4x4" => {
-      cfg.speed_settings.min_block_size = BlockSize::BLOCK_4X4;
-    },
-    "min_block_size_8x8" => {
-      cfg.speed_settings.min_block_size = BlockSize::BLOCK_8X8;
-    },
-    "min_block_size_32x32" => {
-      cfg.speed_settings.min_block_size = BlockSize::BLOCK_32X32;
-    },
-    "min_block_size_64x64" => {
-      cfg.speed_settings.min_block_size = BlockSize::BLOCK_64X64;
-    },
-    "multiref" => {
-      cfg.speed_settings.multiref = true;
-    },
-    "fast_deblock" => {
-      cfg.speed_settings.fast_deblock = true;
-    },
-    "reduced_tx_set" => {
-      cfg.speed_settings.reduced_tx_set = true;
-    },
-    "tx_domain_distortion" => {
-      cfg.speed_settings.tx_domain_distortion = true;
-    },
-    "tx_domain_rate" => {
-      cfg.speed_settings.tx_domain_rate = true;
-    },
-    "encode_bottomup" => {
-      cfg.speed_settings.encode_bottomup = true;
-    },
-    "rdo_tx_decision" => {
-      cfg.speed_settings.rdo_tx_decision = true;
-    },
-    "prediction_modes_keyframes" => {
-      cfg.speed_settings.prediction_modes = PredictionModesSetting::ComplexKeyframes;
-    },
-    "prediction_modes_all" => {
-      cfg.speed_settings.prediction_modes = PredictionModesSetting::ComplexAll;
-    },
-    "include_near_mvs" => {
-      cfg.speed_settings.include_near_mvs = true;
-    },
-    "no_scene_detection" => {
-      cfg.speed_settings.no_scene_detection = true;
-    },
-    "diamond_me" => {
-      cfg.speed_settings.diamond_me = true;
-    }
-    "cdef" => {
-      cfg.speed_settings.cdef = true;
-    }
-    setting => {
-      panic!("Unrecognized speed test setting {}", setting);
-    }
-  };
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct FrameSummary {
-  // Frame size in bytes
-  pub size: usize,
-  pub number: u64,
-  pub frame_type: FrameType,
-  // PSNR for Y, U, and V planes
-  pub psnr: Option<(f64, f64, f64)>,
-}
-
-impl<T: Pixel> From<Packet<T>> for FrameSummary {
-  fn from(packet: Packet<T>) -> Self {
-    Self {
-      size: packet.data.len(),
-      number: packet.number,
-      frame_type: packet.frame_type,
-      psnr: packet.psnr,
-    }
-  }
-}
-
-impl fmt::Display for FrameSummary {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    write!(
-      f,
-      "Frame {} - {} - {} bytes{}",
-      self.number,
-      self.frame_type,
-      self.size,
-      if let Some(psnr) = self.psnr {
-        format!(" - PSNR: Y: {:.4}  Cb: {:.4}  Cr: {:.4}", psnr.0, psnr.1, psnr.2)
-      } else { String::new() }
-    )
-  }
-}
-
-#[derive(Debug, Clone)]
-pub struct ProgressInfo {
-  // Frame rate of the video
-  frame_rate: Rational,
-  // The length of the whole video, in frames, if known
-  total_frames: Option<usize>,
-  // The time the encode was started
-  time_started: Instant,
-  // List of frames encoded so far
-  frame_info: Vec<FrameSummary>,
-  // Video size so far in bytes.
-  //
-  // This value will be updated in the CLI very frequently, so we cache the previous value
-  // to reduce the overall complexity.
-  encoded_size: usize,
-  // Whether to display PSNR statistics during and at end of encode
-  show_psnr: bool,
-}
-
-impl ProgressInfo {
-  pub fn new(frame_rate: Rational, total_frames: Option<usize>, show_psnr: bool) -> Self {
-    Self {
-      frame_rate,
-      total_frames,
-      time_started: Instant::now(),
-      frame_info: Vec::with_capacity(total_frames.unwrap_or_default()),
-      encoded_size: 0,
-      show_psnr,
-    }
-  }
-
-  pub fn add_frame(&mut self, frame: FrameSummary) {
-    self.encoded_size += frame.size;
-    self.frame_info.push(frame);
-  }
-
-  pub fn frames_encoded(&self) -> usize {
-    self.frame_info.len()
-  }
-
-  pub fn encoding_fps(&self) -> f64 {
-    let duration = Instant::now().duration_since(self.time_started);
-    self.frame_info.len() as f64 / (duration.as_secs() as f64 + duration.subsec_millis() as f64 / 1000f64)
-  }
-
-  pub fn video_fps(&self) -> f64 {
-    self.frame_rate.num as f64 / self.frame_rate.den as f64
-  }
-
-  // Returns the bitrate of the frames so far, in bits/second
-  pub fn bitrate(&self) -> usize {
-    let bits = self.encoded_size * 8;
-    let seconds = self.frame_info.len() as f64 / self.video_fps();
-    (bits as f64 / seconds) as usize
-  }
-
-  // Estimates the final filesize in bytes, if the number of frames is known
-  pub fn estimated_size(&self) -> usize {
-    self.total_frames
-      .map(|frames| self.encoded_size * frames / self.frames_encoded())
-      .unwrap_or_default()
-  }
-
-  // Estimates the remaining encoding time in seconds, if the number of frames is known
-  pub fn estimated_time(&self) -> f64 {
-    self.total_frames
-      .map(|frames| (frames - self.frames_encoded()) as f64 / self.encoding_fps())
-      .unwrap_or_default()
-  }
-
-  // Number of frames of given type which appear in the video
-  pub fn get_frame_type_count(&self, frame_type: FrameType) -> usize {
-    self.frame_info.iter()
-      .filter(|frame| frame.frame_type == frame_type)
-      .count()
-  }
-
-  // Size in bytes of all frames of given frame type
-  pub fn get_frame_type_size(&self, frame_type: FrameType) -> usize {
-    self.frame_info.iter()
-      .filter(|frame| frame.frame_type == frame_type)
-      .map(|frame| frame.size)
-      .sum()
-  }
-
-  pub fn print_summary(&self) -> String {
-    let (key, key_size) = (
-      self.get_frame_type_count(FrameType::KEY),
-      self.get_frame_type_size(FrameType::KEY)
-    );
-    let (inter, inter_size) = (
-      self.get_frame_type_count(FrameType::INTER),
-      self.get_frame_type_size(FrameType::INTER)
-    );
-    let (ionly, ionly_size) = (
-      self.get_frame_type_count(FrameType::INTRA_ONLY),
-      self.get_frame_type_size(FrameType::INTRA_ONLY)
-    );
-    let (switch, switch_size) = (
-      self.get_frame_type_count(FrameType::SWITCH),
-      self.get_frame_type_size(FrameType::SWITCH)
-    );
-    format!("\
-    Key Frames: {:>6}    avg size: {:>7} B\n\
-    Inter:      {:>6}    avg size: {:>7} B\n\
-    Intra Only: {:>6}    avg size: {:>7} B\n\
-    Switch:     {:>6}    avg size: {:>7} B\
-    {}",
-      key, key_size / key,
-      inter, inter_size.checked_div(inter).unwrap_or(0),
-      ionly, ionly_size / key,
-      switch, switch_size / key,
-      if self.show_psnr {
-        let psnr_y =
-          self.frame_info.iter().map(|fi| fi.psnr.unwrap().0).sum::<f64>()
-            / self.frame_info.len() as f64;
-        let psnr_u =
-          self.frame_info.iter().map(|fi| fi.psnr.unwrap().1).sum::<f64>()
-            / self.frame_info.len() as f64;
-        let psnr_v =
-          self.frame_info.iter().map(|fi| fi.psnr.unwrap().2).sum::<f64>()
-            / self.frame_info.len() as f64;
-        format!("\nMean PSNR: Y: {:.4}  Cb: {:.4}  Cr: {:.4}  Avg: {:.4}",
-                psnr_y, psnr_u, psnr_v,
-                (psnr_y + psnr_u + psnr_v) / 3.0)
-      } else { String::new() }
-    )
-  }
-}
-
-impl fmt::Display for ProgressInfo {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    if let Some(total_frames) = self.total_frames {
-      write!(
-        f,
-        "encoded {}/{} frames, {:.3} fps, {:.2} Kb/s, est. size: {:.2} MB, est. time: {:.0} s",
-        self.frames_encoded(),
-        total_frames,
-        self.encoding_fps(),
-        self.bitrate() as f64 / 1024f64,
-        self.estimated_size() as f64 / (1024 * 1024) as f64,
-        self.estimated_time()
-      )
-    } else {
-      write!(
-        f,
-        "encoded {} frames, {:.3} fps, {:.2} Kb/s",
-        self.frames_encoded(),
-        self.encoding_fps(),
-        self.bitrate() as f64 / 1024f64
-      )
-    }
-  }
+  Ok(cfg)
 }

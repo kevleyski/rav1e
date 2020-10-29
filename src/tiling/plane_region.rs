@@ -1,4 +1,4 @@
-// Copyright (c) 2019, The rav1e contributors. All rights reserved
+// Copyright (c) 2019-2020, The rav1e contributors. All rights reserved
 //
 // This source code is subject to the terms of the BSD 2 Clause License and
 // the Alliance for Open Media Patent License 1.0. If the BSD 2 Clause License
@@ -7,16 +7,19 @@
 // Media Patent License 1.0 was not distributed with this source code in the
 // PATENTS file, you can obtain it at www.aomedia.org/license/patent.
 
+#![allow(clippy::iter_nth_zero)]
+
 use crate::context::*;
-use crate::plane::*;
+use crate::frame::*;
 use crate::util::*;
 
+use std::iter::FusedIterator;
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
 use std::slice;
 
 /// Rectangle of a plane region, in pixels
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Rect {
   // coordinates relative to the plane origin (xorigin, yorigin)
   pub x: isize,
@@ -27,7 +30,7 @@ pub struct Rect {
 
 impl Rect {
   #[inline(always)]
-  pub fn decimated(&self, xdec: usize, ydec: usize) -> Self {
+  pub const fn decimated(&self, xdec: usize, ydec: usize) -> Self {
     Self {
       x: self.x >> xdec,
       y: self.y >> ydec,
@@ -35,21 +38,24 @@ impl Rect {
       height: self.height >> ydec,
     }
   }
+  pub const fn to_area(&self) -> Area {
+    Area::Rect { x: self.x, y: self.y, width: self.width, height: self.height }
+  }
 }
 
-/// Structure to describe a rectangle area in several ways
-///
-/// To retrieve a subregion from a region, we need to provide the subregion
-/// bounds, relative to its parent region. The subregion must always be included
-/// in its parent region.
-///
-/// For that purpose, we could just use a rectangle (x, y, width, height), but
-/// this would be too cumbersome to use in practice. For example, we often need
-/// to pass a subregion from an offset, using the same bottom-right corner as
-/// its parent, or to pass a subregion expressed in block offset instead of
-/// pixel offset.
-///
-/// Area provides a flexible way to describe a subregion.
+// Structure to describe a rectangle area in several ways
+//
+// To retrieve a subregion from a region, we need to provide the subregion
+// bounds, relative to its parent region. The subregion must always be included
+// in its parent region.
+//
+// For that purpose, we could just use a rectangle (x, y, width, height), but
+// this would be too cumbersome to use in practice. For example, we often need
+// to pass a subregion from an offset, using the same bottom-right corner as
+// its parent, or to pass a subregion expressed in block offset instead of
+// pixel offset.
+//
+// Area provides a flexible way to describe a subregion.
 #[derive(Debug, Clone, Copy)]
 pub enum Area {
   /// A well-defined rectangle
@@ -66,12 +72,13 @@ pub enum Area {
 
 impl Area {
   #[inline(always)]
+  /// Convert to a rectangle of pixels.
+  /// For a BlockRect and BlockStartingAt, for subsampled chroma planes,
+  /// the returned rect will be aligned to a 4x4 chroma block.
+  /// This is necessary for compute_distortion and rdo_cfl_alpha as
+  /// the subsampled chroma block covers multiple luma blocks.
   pub fn to_rect(
-    &self,
-    xdec: usize,
-    ydec: usize,
-    parent_width: usize,
-    parent_height: usize,
+    &self, xdec: usize, ydec: usize, parent_width: usize, parent_height: usize,
   ) -> Rect {
     match *self {
       Area::Rect { x, y, width, height } => Rect { x, y, width, height },
@@ -96,7 +103,7 @@ impl Area {
           width: (parent_width as isize - x) as usize,
           height: (parent_height as isize - y) as usize,
         }
-      },
+      }
     }
   }
 }
@@ -133,21 +140,37 @@ macro_rules! plane_region_common {
   // $opt_mut: nothing or mut
   ($name:ident, $as_ptr:ident $(,$opt_mut:tt)?) => {
     impl<'a, T: Pixel> $name<'a, T> {
-
       #[inline(always)]
-      pub fn new(plane: &'a $($opt_mut)? Plane<T>, rect: Rect) -> Self {
-        assert!(rect.x >= -(plane.cfg.xorigin as isize));
-        assert!(rect.y >= -(plane.cfg.yorigin as isize));
-        assert!(plane.cfg.xorigin as isize + rect.x + rect.width as isize <= plane.cfg.stride as isize);
-        assert!(plane.cfg.yorigin as isize + rect.y + rect.height as isize <= plane.cfg.alloc_height as isize);
-        let origin = (plane.cfg.yorigin as isize + rect.y) * plane.cfg.stride as isize
-                    + plane.cfg.xorigin as isize + rect.x;
+      pub fn is_null(&self) -> bool {
+        self.data.is_null()
+      }
+      #[inline(always)]
+      pub fn from_slice(data: &'a $($opt_mut)? [T], cfg: &'a PlaneConfig, rect:
+        Rect) -> Self {
+        if cfg.width == 0 || cfg.height == 0 {
+          return Self {
+            data: unsafe { std::ptr::null_mut::<T>() },
+            plane_cfg: cfg,
+            rect: Rect::default(),
+            phantom: PhantomData,
+          }
+        }
+        assert!(rect.x >= -(cfg.xorigin as isize));
+        assert!(rect.y >= -(cfg.yorigin as isize));
+        assert!(cfg.xorigin as isize + rect.x + rect.width as isize <= cfg.stride as isize);
+        assert!(cfg.yorigin as isize + rect.y + rect.height as isize <= cfg.alloc_height as isize);
+        let origin = (cfg.yorigin as isize + rect.y) * cfg.stride as isize
+                    + cfg.xorigin as isize + rect.x;
         Self {
-          data: unsafe { plane.data.$as_ptr().offset(origin) },
-          plane_cfg: &plane.cfg,
+          data: unsafe { data.$as_ptr().offset(origin) },
+          plane_cfg: cfg,
           rect,
           phantom: PhantomData,
         }
+      }
+      #[inline(always)]
+      pub fn new(plane: &'a $($opt_mut)? Plane<T>, rect: Rect) -> Self {
+        Self::from_slice(& $($opt_mut)? plane.data, &plane.cfg, rect)
       }
 
       #[inline(always)]
@@ -171,54 +194,111 @@ macro_rules! plane_region_common {
         }
       }
 
-      /// Return a view to a subregion of the plane
-      ///
-      /// The subregion must be included in (i.e. must not exceed) this region.
-      ///
-      /// It is described by an `Area`, relative to this region.
-      ///
-      /// # Example
-      ///
-      /// ```
-      /// # use rav1e::tiling::*;
-      /// # fn f(region: &PlaneRegion<'_, u16>) {
-      /// // a subregion from (10, 8) to the end of the region
-      /// let subregion = region.subregion(Area::StartingAt { x: 10, y: 8 });
-      /// # }
-      /// ```
-      ///
-      /// ```
-      /// # use rav1e::context::*;
-      /// # use rav1e::tiling::*;
-      /// # fn f(region: &PlaneRegion<'_, u16>) {
-      /// // a subregion from the top-left of block (2, 3) having size (64, 64)
-      /// let bo = BlockOffset { x: 2, y: 3 };
-      /// let subregion = region.subregion(Area::BlockRect { bo, width: 64, height: 64 });
-      /// # }
-      /// ```
+      pub fn vert_windows(&self, h: usize) -> VertWindows<'_, T> {
+        VertWindows {
+          data: self.data,
+          plane_cfg: self.plane_cfg,
+          remaining: (self.rect.height as isize - h as isize + 1).max(0) as usize,
+          output_rect: Rect {
+            x: self.rect.x,
+            y: self.rect.y,
+            width: self.rect.width,
+            height: h
+          }
+        }
+      }
+
+      pub fn horz_windows(&self, w: usize) -> HorzWindows<'_, T> {
+        HorzWindows {
+          data: self.data,
+          plane_cfg: self.plane_cfg,
+          remaining: (self.rect.width as isize - w as isize + 1).max(0) as usize,
+          output_rect: Rect {
+            x: self.rect.x,
+            y: self.rect.y,
+            width: w,
+            height: self.rect.height
+          }
+        }
+      }
+
+      // Return a view to a subregion of the plane
+      //
+      // The subregion must be included in (i.e. must not exceed) this region.
+      //
+      // It is described by an `Area`, relative to this region.
+      //
+      // # Example
+      //
+      // ``` ignore
+      // # use rav1e::tiling::*;
+      // # fn f(region: &PlaneRegion<'_, u16>) {
+      // // a subregion from (10, 8) to the end of the region
+      // let subregion = region.subregion(Area::StartingAt { x: 10, y: 8 });
+      // # }
+      // ```
+      //
+      // ``` ignore
+      // # use rav1e::context::*;
+      // # use rav1e::tiling::*;
+      // # fn f(region: &PlaneRegion<'_, u16>) {
+      // // a subregion from the top-left of block (2, 3) having size (64, 64)
+      // let bo = BlockOffset { x: 2, y: 3 };
+      // let subregion = region.subregion(Area::BlockRect { bo, width: 64, height: 64 });
+      // # }
+      // ```
       #[inline(always)]
       pub fn subregion(&self, area: Area) -> PlaneRegion<'_, T> {
-        let rect = area.to_rect(
-          self.plane_cfg.xdec,
-          self.plane_cfg.ydec,
-          self.rect.width,
-          self.rect.height,
-        );
-        assert!(rect.x >= 0 && rect.x as usize <= self.rect.width);
-        assert!(rect.y >= 0 && rect.y as usize <= self.rect.height);
-        let data = unsafe {
-          self.data.add(rect.y as usize * self.plane_cfg.stride + rect.x as usize)
+        if self.data.is_null() {
+          PlaneRegion {
+            data: self.data,
+            plane_cfg: &self.plane_cfg,
+            rect: Rect::default(),
+            phantom: PhantomData,
+          }
+        } else {
+          let rect = area.to_rect(
+            self.plane_cfg.xdec,
+            self.plane_cfg.ydec,
+            self.rect.width,
+            self.rect.height,
+          );
+          assert!(rect.x >= 0 && rect.x as usize <= self.rect.width);
+          assert!(rect.y >= 0 && rect.y as usize <= self.rect.height);
+          let data = unsafe {
+            self.data.add(rect.y as usize * self.plane_cfg.stride + rect.x as usize)
+          };
+          let absolute_rect = Rect {
+            x: self.rect.x + rect.x,
+            y: self.rect.y + rect.y,
+            width: rect.width,
+            height: rect.height,
+          };
+          PlaneRegion {
+            data,
+            plane_cfg: &self.plane_cfg,
+            rect: absolute_rect,
+            phantom: PhantomData,
+          }
+        }
+      }
+
+      // Return an equivalent PlaneRegion with origin homed to 0,0.  Data
+      // pointer is not moved (0,0 points to the same pixel previously
+      // pointed to by old x,y).
+      #[inline(always)]
+      pub fn home(&self) -> Self {
+        let home_rect = Rect {
+          x: 0,
+          y: 0,
+          width: self.rect.width,
+          height: self.rect.height,
         };
-        let absolute_rect = Rect {
-          x: self.rect.x + rect.x,
-          y: self.rect.y + rect.y,
-          width: rect.width,
-          height: rect.height,
-        };
-        PlaneRegion {
-          data,
+
+        Self {
+          data: self.data,
           plane_cfg: &self.plane_cfg,
-          rect: absolute_rect,
+          rect: home_rect,
           phantom: PhantomData,
         }
       }
@@ -232,7 +312,7 @@ macro_rules! plane_region_common {
       }
 
       #[inline(always)]
-      pub fn to_frame_block_offset(&self, tile_bo: BlockOffset) -> BlockOffset {
+      pub fn to_frame_block_offset(&self, tile_bo: TileBlockOffset) -> PlaneBlockOffset {
         debug_assert!(self.rect.x >= 0);
         debug_assert!(self.rect.y >= 0);
         let PlaneConfig { xdec, ydec, .. } = self.plane_cfg;
@@ -240,18 +320,18 @@ macro_rules! plane_region_common {
         debug_assert!(self.rect.y as usize % (MI_SIZE >> ydec) == 0);
         let bx = self.rect.x as usize >> MI_SIZE_LOG2 - xdec;
         let by = self.rect.y as usize >> MI_SIZE_LOG2 - ydec;
-        BlockOffset {
-          x: bx + tile_bo.x,
-          y: by + tile_bo.y,
-        }
+        PlaneBlockOffset(BlockOffset {
+          x: bx + tile_bo.0.x,
+          y: by + tile_bo.0.y,
+        })
       }
 
       #[inline(always)]
       pub fn to_frame_super_block_offset(
         &self,
-        tile_sbo: SuperBlockOffset,
+        tile_sbo: TileSuperBlockOffset,
         sb_size_log2: usize
-      ) -> SuperBlockOffset {
+      ) -> PlaneSuperBlockOffset {
         debug_assert!(sb_size_log2 == 6 || sb_size_log2 == 7);
         debug_assert!(self.rect.x >= 0);
         debug_assert!(self.rect.y >= 0);
@@ -260,10 +340,29 @@ macro_rules! plane_region_common {
         debug_assert!(self.rect.y as usize % (1 << sb_size_log2 - ydec) == 0);
         let sbx = self.rect.x as usize >> sb_size_log2 - xdec;
         let sby = self.rect.y as usize >> sb_size_log2 - ydec;
-        SuperBlockOffset {
-          x: sbx + tile_sbo.x,
-          y: sby + tile_sbo.y,
+        PlaneSuperBlockOffset(SuperBlockOffset {
+          x: sbx + tile_sbo.0.x,
+          y: sby + tile_sbo.0.y,
+        })
+      }
+
+      /// Returns the frame block offset of the subregion.
+      #[inline(always)]
+      pub fn frame_block_offset(&self) -> PlaneBlockOffset {
+        self.to_frame_block_offset(TileBlockOffset(BlockOffset { x: 0, y: 0 }))
+      }
+
+      pub(crate) fn scratch_copy(&self) -> Plane<T> {
+        let &Rect { width, height, .. } = self.rect();
+        let &PlaneConfig { xdec, ydec, .. } = self.plane_cfg;
+        let mut ret: Plane<T> = Plane::new(width, height, xdec, ydec, 0, 0);
+        let mut dst: PlaneRegionMut<T> = ret.as_region_mut();
+        for (dst_row, src_row) in dst.rows_iter_mut().zip(self.rows_iter()) {
+          for (out, input) in dst_row.iter_mut().zip(src_row) {
+            *out = *input;
+          }
         }
+        ret
       }
     }
 
@@ -305,31 +404,31 @@ impl<'a, T: Pixel> PlaneRegionMut<'a, T> {
     }
   }
 
-  /// Return a mutable view to a subregion of the plane
-  ///
-  /// The subregion must be included in (i.e. must not exceed) this region.
-  ///
-  /// It is described by an `Area`, relative to this region.
-  ///
-  /// # Example
-  ///
-  /// ```
-  /// # use rav1e::tiling::*;
-  /// # fn f(region: &mut PlaneRegionMut<'_, u16>) {
-  /// // a mutable subregion from (10, 8) having size (32, 32)
-  /// let subregion = region.subregion_mut(Area::Rect { x: 10, y: 8, width: 32, height: 32 });
-  /// # }
-  /// ```
-  ///
-  /// ```
-  /// # use rav1e::context::*;
-  /// # use rav1e::tiling::*;
-  /// # fn f(region: &mut PlaneRegionMut<'_, u16>) {
-  /// // a mutable subregion from the top-left of block (2, 3) to the end of the region
-  /// let bo = BlockOffset { x: 2, y: 3 };
-  /// let subregion = region.subregion_mut(Area::BlockStartingAt { bo });
-  /// # }
-  /// ```
+  // Return a mutable view to a subregion of the plane
+  //
+  // The subregion must be included in (i.e. must not exceed) this region.
+  //
+  // It is described by an `Area`, relative to this region.
+  //
+  // # Example
+  //
+  // ``` ignore
+  // # use rav1e::tiling::*;
+  // # fn f(region: &mut PlaneRegionMut<'_, u16>) {
+  // // a mutable subregion from (10, 8) having size (32, 32)
+  // let subregion = region.subregion_mut(Area::Rect { x: 10, y: 8, width: 32, height: 32 });
+  // # }
+  // ```
+  //
+  // ``` ignore
+  // # use rav1e::context::*;
+  // # use rav1e::tiling::*;
+  // # fn f(region: &mut PlaneRegionMut<'_, u16>) {
+  // // a mutable subregion from the top-left of block (2, 3) to the end of the region
+  // let bo = BlockOffset { x: 2, y: 3 };
+  // let subregion = region.subregion_mut(Area::BlockStartingAt { bo });
+  // # }
+  // ```
   #[inline(always)]
   pub fn subregion_mut(&mut self, area: Area) -> PlaneRegionMut<'_, T> {
     let rect = area.to_rect(
@@ -351,7 +450,7 @@ impl<'a, T: Pixel> PlaneRegionMut<'a, T> {
     };
     PlaneRegionMut {
       data,
-      plane_cfg: &self.plane_cfg,
+      plane_cfg: self.plane_cfg,
       rect: absolute_rect,
       phantom: PhantomData,
     }
@@ -446,4 +545,193 @@ impl<'a, T: Pixel> Iterator for RowsIterMut<'a, T> {
 }
 
 impl<T: Pixel> ExactSizeIterator for RowsIter<'_, T> {}
+impl<T: Pixel> FusedIterator for RowsIter<'_, T> {}
 impl<T: Pixel> ExactSizeIterator for RowsIterMut<'_, T> {}
+impl<T: Pixel> FusedIterator for RowsIterMut<'_, T> {}
+
+pub struct VertWindows<'a, T: Pixel> {
+  data: *const T,
+  plane_cfg: &'a PlaneConfig,
+  remaining: usize,
+  output_rect: Rect,
+}
+
+pub struct HorzWindows<'a, T: Pixel> {
+  data: *const T,
+  plane_cfg: &'a PlaneConfig,
+  remaining: usize,
+  output_rect: Rect,
+}
+
+impl<'a, T: Pixel> Iterator for VertWindows<'a, T> {
+  type Item = PlaneRegion<'a, T>;
+
+  #[inline(always)]
+  fn next(&mut self) -> Option<Self::Item> {
+    self.nth(0)
+  }
+
+  #[inline(always)]
+  fn size_hint(&self) -> (usize, Option<usize>) {
+    (self.remaining, Some(self.remaining))
+  }
+
+  #[inline(always)]
+  fn nth(&mut self, n: usize) -> Option<Self::Item> {
+    if self.remaining > n {
+      self.data = unsafe { self.data.add(self.plane_cfg.stride * n) };
+      self.output_rect.y += n as isize;
+      let output = PlaneRegion {
+        data: self.data,
+        plane_cfg: self.plane_cfg,
+        rect: self.output_rect,
+        phantom: PhantomData,
+      };
+      self.data = unsafe { self.data.add(self.plane_cfg.stride) };
+      self.output_rect.y += 1;
+      self.remaining -= (n + 1);
+      Some(output)
+    } else {
+      None
+    }
+  }
+}
+
+impl<'a, T: Pixel> Iterator for HorzWindows<'a, T> {
+  type Item = PlaneRegion<'a, T>;
+
+  #[inline(always)]
+  fn next(&mut self) -> Option<Self::Item> {
+    self.nth(0)
+  }
+
+  #[inline(always)]
+  fn size_hint(&self) -> (usize, Option<usize>) {
+    (self.remaining, Some(self.remaining))
+  }
+
+  #[inline(always)]
+  fn nth(&mut self, n: usize) -> Option<Self::Item> {
+    if self.remaining > n {
+      self.data = unsafe { self.data.add(n) };
+      self.output_rect.x += n as isize;
+      let output = PlaneRegion {
+        data: self.data,
+        plane_cfg: self.plane_cfg,
+        rect: self.output_rect,
+        phantom: PhantomData,
+      };
+      self.data = unsafe { self.data.add(1) };
+      self.output_rect.x += 1;
+      self.remaining -= (n + 1);
+      Some(output)
+    } else {
+      None
+    }
+  }
+}
+
+impl<T: Pixel> ExactSizeIterator for VertWindows<'_, T> {}
+impl<T: Pixel> FusedIterator for VertWindows<'_, T> {}
+impl<T: Pixel> ExactSizeIterator for HorzWindows<'_, T> {}
+impl<T: Pixel> FusedIterator for HorzWindows<'_, T> {}
+
+#[test]
+fn area_test() {
+  assert_eq!(
+    (Area::BlockStartingAt { bo: BlockOffset { x: 0, y: 0 } })
+      .to_rect(0, 0, 100, 100),
+    Rect { x: 0, y: 0, width: 100, height: 100 }
+  );
+  assert_eq!(
+    (Area::BlockStartingAt { bo: BlockOffset { x: 1, y: 1 } })
+      .to_rect(0, 0, 100, 100),
+    Rect { x: 4, y: 4, width: 96, height: 96 }
+  );
+  assert_eq!(
+    (Area::BlockStartingAt { bo: BlockOffset { x: 1, y: 1 } })
+      .to_rect(1, 1, 50, 50),
+    Rect { x: 0, y: 0, width: 50, height: 50 }
+  );
+  assert_eq!(
+    (Area::BlockStartingAt { bo: BlockOffset { x: 2, y: 2 } })
+      .to_rect(1, 1, 50, 50),
+    Rect { x: 4, y: 4, width: 46, height: 46 }
+  );
+  assert_eq!(
+    (Area::BlockRect { bo: BlockOffset { x: 0, y: 0 }, width: 1, height: 1 })
+      .to_rect(0, 0, 100, 100),
+    Rect { x: 0, y: 0, width: 1, height: 1 }
+  );
+  assert_eq!(
+    (Area::BlockRect { bo: BlockOffset { x: 1, y: 1 }, width: 1, height: 1 })
+      .to_rect(0, 0, 100, 100),
+    Rect { x: 4, y: 4, width: 1, height: 1 }
+  );
+  assert_eq!(
+    (Area::BlockRect { bo: BlockOffset { x: 1, y: 1 }, width: 1, height: 1 })
+      .to_rect(1, 1, 50, 50),
+    Rect { x: 0, y: 0, width: 1, height: 1 }
+  );
+  assert_eq!(
+    (Area::BlockRect { bo: BlockOffset { x: 2, y: 2 }, width: 1, height: 1 })
+      .to_rect(1, 1, 50, 50),
+    Rect { x: 4, y: 4, width: 1, height: 1 }
+  );
+}
+
+#[test]
+fn frame_block_offset() {
+  {
+    let p = Plane::<u8>::new(100, 100, 0, 0, 0, 0);
+    let pr =
+      PlaneRegion::new(&p, Rect { x: 0, y: 0, width: 100, height: 100 });
+    let bo = BlockOffset { x: 0, y: 0 };
+    assert_eq!(
+      pr.to_frame_block_offset(TileBlockOffset(bo)),
+      PlaneBlockOffset { 0: bo }
+    );
+    assert_eq!(
+      pr.to_frame_block_offset(TileBlockOffset(bo)),
+      pr.subregion(Area::BlockStartingAt { bo }).frame_block_offset()
+    );
+  }
+  {
+    let p = Plane::<u8>::new(100, 100, 0, 0, 0, 0);
+    let pr =
+      PlaneRegion::new(&p, Rect { x: 0, y: 0, width: 100, height: 100 });
+    let bo = BlockOffset { x: 1, y: 1 };
+    assert_eq!(
+      pr.to_frame_block_offset(TileBlockOffset(bo)),
+      PlaneBlockOffset { 0: bo }
+    );
+    assert_eq!(
+      pr.to_frame_block_offset(TileBlockOffset(bo)),
+      pr.subregion(Area::BlockStartingAt { bo }).frame_block_offset()
+    );
+  }
+  {
+    let p = Plane::<u8>::new(100, 100, 1, 1, 0, 0);
+    let pr =
+      PlaneRegion::new(&p, Rect { x: 0, y: 0, width: 100, height: 100 });
+    let bo = BlockOffset { x: 1, y: 1 };
+    assert_eq!(
+      pr.to_frame_block_offset(TileBlockOffset(bo)),
+      PlaneBlockOffset { 0: bo }
+    );
+  }
+  {
+    let p = Plane::<u8>::new(100, 100, 1, 1, 0, 0);
+    let pr =
+      PlaneRegion::new(&p, Rect { x: 0, y: 0, width: 100, height: 100 });
+    let bo = BlockOffset { x: 2, y: 2 };
+    assert_eq!(
+      pr.to_frame_block_offset(TileBlockOffset(bo)),
+      PlaneBlockOffset { 0: bo }
+    );
+    assert_eq!(
+      pr.to_frame_block_offset(TileBlockOffset(bo)),
+      pr.subregion(Area::BlockStartingAt { bo }).frame_block_offset()
+    );
+  }
+}

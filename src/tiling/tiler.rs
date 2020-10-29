@@ -1,4 +1,4 @@
-// Copyright (c) 2019, The rav1e contributors. All rights reserved
+// Copyright (c) 2019-2020, The rav1e contributors. All rights reserved
 //
 // This source code is subject to the terms of the BSD 2 Clause License and
 // the Alliance for Open Media Patent License 1.0. If the BSD 2 Clause License
@@ -13,12 +13,14 @@ use crate::context::*;
 use crate::encoder::*;
 use crate::util::*;
 
+use std::iter::FusedIterator;
 use std::marker::PhantomData;
 
 pub const MAX_TILE_WIDTH: usize = 4096;
 pub const MAX_TILE_AREA: usize = 4096 * 2304;
 pub const MAX_TILE_COLS: usize = 64;
 pub const MAX_TILE_ROWS: usize = 64;
+pub const MAX_TILE_RATE: f64 = 4096f64 * 2176f64 * 60f64 * 1.1;
 
 /// Tiling information
 ///
@@ -42,15 +44,14 @@ pub struct TilingInfo {
   pub min_tile_rows_log2: usize,
   pub max_tile_rows_log2: usize,
   pub sb_size_log2: usize,
+  pub min_tiles_log2: usize,
 }
 
 impl TilingInfo {
-  pub fn new(
-    sb_size_log2: usize,
-    frame_width: usize,
-    frame_height: usize,
-    tile_cols_log2: usize,
-    tile_rows_log2: usize,
+  pub fn from_target_tiles(
+    sb_size_log2: usize, frame_width: usize, frame_height: usize,
+    frame_rate: f64, tile_cols_log2: usize, tile_rows_log2: usize,
+    is_422_p: bool,
   ) -> Self {
     // <https://aomediacodec.github.io/av1-spec/#tile-info-syntax>
 
@@ -64,29 +65,74 @@ impl TilingInfo {
     let sb_cols = frame_width.align_power_of_two_and_shift(sb_size_log2);
     let sb_rows = frame_height.align_power_of_two_and_shift(sb_size_log2);
 
+    // these are bitstream-defined values and must not be changed
     let max_tile_width_sb = MAX_TILE_WIDTH >> sb_size_log2;
     let max_tile_area_sb = MAX_TILE_AREA >> (2 * sb_size_log2);
-    let min_tile_cols_log2 = Self::tile_log2(max_tile_width_sb, sb_cols);
-    let max_tile_cols_log2 = Self::tile_log2(1, sb_cols.min(MAX_TILE_COLS));
-    let max_tile_rows_log2 = Self::tile_log2(1, sb_rows.min(MAX_TILE_ROWS));
-
+    let min_tile_cols_log2 =
+      Self::tile_log2(max_tile_width_sb, sb_cols).unwrap();
+    let max_tile_cols_log2 =
+      Self::tile_log2(1, sb_cols.min(MAX_TILE_COLS)).unwrap();
+    let max_tile_rows_log2 =
+      Self::tile_log2(1, sb_rows.min(MAX_TILE_ROWS)).unwrap();
     let min_tiles_log2 = min_tile_cols_log2
-      .max(Self::tile_log2(max_tile_area_sb, sb_cols * sb_rows));
+      .max(Self::tile_log2(max_tile_area_sb, sb_cols * sb_rows).unwrap());
+
+    // Implements restriction in Annex A of the spec.
+    // Unlike the other restrictions, this one does not change
+    // the header coding of the tile rows/cols.
+    let min_tiles_ratelimit_log2 = min_tiles_log2.max(
+      ((frame_width * frame_height) as f64 * frame_rate / MAX_TILE_RATE)
+        .ceil()
+        .log2()
+        .ceil() as usize,
+    );
 
     let tile_cols_log2 =
       tile_cols_log2.max(min_tile_cols_log2).min(max_tile_cols_log2);
-    let tile_width_sb = sb_cols.align_power_of_two_and_shift(tile_cols_log2);
+    let tile_width_sb_pre =
+      sb_cols.align_power_of_two_and_shift(tile_cols_log2);
+
+    // If this is 4:2:2, our UV horizontal is subsampled but not our
+    // vertical.  Loop Restoration Units must be square, so they
+    // will always have an even number of horizontal superblocks. For
+    // tiles and LRUs to align, tile_width_sb must be even in 4:2:2
+    // video.
+
+    // This is only relevant when doing loop restoration RDO inline
+    // with block/superblock encoding, that is, where tiles are
+    // relevant.  If (when) we introduce optionally delaying loop-filter
+    // encode to after the partitioning loop, we won't need to make
+    // any 4:2:2 adjustment.
+
+    let tile_width_sb = if is_422_p {
+      (tile_width_sb_pre + 1) >> 1 << 1
+    } else {
+      tile_width_sb_pre
+    };
+
+    let cols = (frame_width_sb + tile_width_sb - 1) / tile_width_sb;
+
+    // Adjust tile_cols_log2 in case of rounding tile_width_sb to even.
+    let tile_cols_log2 = Self::tile_log2(1, cols).unwrap();
+    assert!(tile_cols_log2 >= min_tile_cols_log2);
 
     let min_tile_rows_log2 = if min_tiles_log2 > tile_cols_log2 {
       min_tiles_log2 - tile_cols_log2
     } else {
       0
     };
-    let tile_rows_log2 =
-      tile_rows_log2.max(min_tile_rows_log2).min(max_tile_rows_log2);
+    let min_tile_rows_ratelimit_log2 =
+      if min_tiles_ratelimit_log2 > tile_cols_log2 {
+        min_tiles_ratelimit_log2 - tile_cols_log2
+      } else {
+        0
+      };
+    let tile_rows_log2 = tile_rows_log2
+      .max(min_tile_rows_log2)
+      .max(min_tile_rows_ratelimit_log2)
+      .min(max_tile_rows_log2);
     let tile_height_sb = sb_rows.align_power_of_two_and_shift(tile_rows_log2);
 
-    let cols = (frame_width_sb + tile_width_sb - 1) / tile_width_sb;
     let rows = (frame_height_sb + tile_height_sb - 1) / tile_height_sb;
 
     Self {
@@ -103,6 +149,7 @@ impl TilingInfo {
       min_tile_rows_log2,
       max_tile_rows_log2,
       sb_size_log2,
+      min_tiles_log2,
     }
   }
 
@@ -110,16 +157,16 @@ impl TilingInfo {
   /// or equal to `target`.
   ///
   /// <https://aomediacodec.github.io/av1-spec/#tile-size-calculation-function>
-  fn tile_log2(blk_size: usize, target: usize) -> usize {
+  pub fn tile_log2(blk_size: usize, target: usize) -> Option<usize> {
     let mut k = 0;
-    while (blk_size << k) < target {
+    while (blk_size.checked_shl(k)?) < target {
       k += 1;
     }
-    k
+    Some(k as usize)
   }
 
   #[inline(always)]
-  pub fn tile_count(&self) -> usize {
+  pub const fn tile_count(&self) -> usize {
     self.cols * self.rows
   }
 
@@ -127,9 +174,7 @@ impl TilingInfo {
   ///
   /// Provide mutable tiled views of frame-level structures.
   pub fn tile_iter_mut<'a, 'b, T: Pixel>(
-    &self,
-    fs: &'a mut FrameState<T>,
-    fb: &'b mut FrameBlocks,
+    &self, fs: &'a mut FrameState<T>, fb: &'b mut FrameBlocks,
   ) -> TileContextIterMut<'a, 'b, T> {
     TileContextIterMut { ti: *self, fs, fb, next: 0, phantom: PhantomData }
   }
@@ -160,12 +205,12 @@ impl<'a, 'b, T: Pixel> Iterator for TileContextIterMut<'a, 'b, T> {
       let ctx = TileContextMut {
         ts: {
           let fs = unsafe { &mut *self.fs };
-          let sbo = SuperBlockOffset {
+          let sbo = PlaneSuperBlockOffset(SuperBlockOffset {
             x: tile_col * self.ti.tile_width_sb,
             y: tile_row * self.ti.tile_height_sb,
-          };
-          let x = sbo.x << self.ti.sb_size_log2;
-          let y = sbo.y << self.ti.sb_size_log2;
+          });
+          let x = sbo.0.x << self.ti.sb_size_log2;
+          let y = sbo.0.y << self.ti.sb_size_log2;
           let tile_width = self.ti.tile_width_sb << self.ti.sb_size_log2;
           let tile_height = self.ti.tile_height_sb << self.ti.sb_size_log2;
           let width = tile_width.min(self.ti.frame_width - x);
@@ -199,45 +244,88 @@ impl<'a, 'b, T: Pixel> Iterator for TileContextIterMut<'a, 'b, T> {
 }
 
 impl<T: Pixel> ExactSizeIterator for TileContextIterMut<'_, '_, T> {}
+impl<T: Pixel> FusedIterator for TileContextIterMut<'_, '_, T> {}
 
 #[cfg(test)]
 pub mod test {
   use super::*;
   use crate::api::*;
   use crate::lrf::*;
-  use crate::partition::*;
+  use crate::mc::MotionVector;
+  use crate::predict::PredictionMode;
 
   #[test]
   fn test_tiling_info_from_tile_count() {
     let sb_size_log2 = 6;
     let (width, height) = (160, 144);
+    let frame_rate = 25f64;
 
-    let ti = TilingInfo::new(sb_size_log2, width, height, 0, 0);
+    let ti = TilingInfo::from_target_tiles(
+      sb_size_log2,
+      width,
+      height,
+      frame_rate,
+      0,
+      0,
+      false,
+    );
     assert_eq!(1, ti.cols);
     assert_eq!(1, ti.rows);
     assert_eq!(3, ti.tile_width_sb);
     assert_eq!(3, ti.tile_height_sb);
 
-    let ti = TilingInfo::new(sb_size_log2, width, height, 1, 1);
+    let ti = TilingInfo::from_target_tiles(
+      sb_size_log2,
+      width,
+      height,
+      frame_rate,
+      1,
+      1,
+      false,
+    );
     assert_eq!(2, ti.cols);
     assert_eq!(2, ti.rows);
     assert_eq!(2, ti.tile_width_sb);
     assert_eq!(2, ti.tile_height_sb);
 
-    let ti = TilingInfo::new(sb_size_log2, width, height, 2, 2);
+    let ti = TilingInfo::from_target_tiles(
+      sb_size_log2,
+      width,
+      height,
+      frame_rate,
+      2,
+      2,
+      false,
+    );
     assert_eq!(3, ti.cols);
     assert_eq!(3, ti.rows);
     assert_eq!(1, ti.tile_width_sb);
     assert_eq!(1, ti.tile_height_sb);
 
     // cannot split more than superblocks
-    let ti = TilingInfo::new(sb_size_log2, width, height, 10, 8);
+    let ti = TilingInfo::from_target_tiles(
+      sb_size_log2,
+      width,
+      height,
+      frame_rate,
+      10,
+      8,
+      false,
+    );
     assert_eq!(3, ti.cols);
     assert_eq!(3, ti.rows);
     assert_eq!(1, ti.tile_width_sb);
     assert_eq!(1, ti.tile_height_sb);
 
-    let ti = TilingInfo::new(sb_size_log2, 1024, 1024, 0, 0);
+    let ti = TilingInfo::from_target_tiles(
+      sb_size_log2,
+      1024,
+      1024,
+      frame_rate,
+      0,
+      0,
+      false,
+    );
     assert_eq!(1, ti.cols);
     assert_eq!(1, ti.rows);
     assert_eq!(16, ti.tile_width_sb);
@@ -245,9 +333,7 @@ pub mod test {
   }
 
   fn create_frame_invariants(
-    width: usize,
-    height: usize,
-    chroma_sampling: ChromaSampling,
+    width: usize, height: usize, chroma_sampling: ChromaSampling,
   ) -> FrameInvariants<u16> {
     // FrameInvariants aligns to the next multiple of 8, so using other values could make tests confusing
     assert!(width & 7 == 0);
@@ -259,7 +345,9 @@ pub mod test {
       chroma_sampling,
       ..Default::default()
     };
-    let sequence = Sequence::new(&config);
+    let mut sequence = Sequence::new(&config);
+    // These tests are all assuming SB-sized LRUs, so set that.
+    sequence.enable_large_lru = false;
     FrameInvariants::new(config, sequence)
   }
 
@@ -269,10 +357,19 @@ pub mod test {
     let mut fs = FrameState::new(&fi);
     // frame size 160x144, 40x36 in 4x4-blocks
     let mut fb = FrameBlocks::new(fi.w_in_b, fi.h_in_b);
+    let frame_rate = fi.config.frame_rate();
 
     {
       // 2x2 tiles
-      let ti = TilingInfo::new(fi.sb_size_log2(), fi.width, fi.height, 1, 1);
+      let ti = TilingInfo::from_target_tiles(
+        fi.sb_size_log2(),
+        fi.width,
+        fi.height,
+        frame_rate,
+        1,
+        1,
+        false,
+      );
       let mut iter = ti.tile_iter_mut(&mut fs, &mut fb);
       assert_eq!(4, iter.len());
       assert!(iter.next().is_some());
@@ -288,7 +385,15 @@ pub mod test {
 
     {
       // 4x4 tiles requested, will actually get 3x3 tiles
-      let ti = TilingInfo::new(fi.sb_size_log2(), fi.width, fi.height, 2, 2);
+      let ti = TilingInfo::from_target_tiles(
+        fi.sb_size_log2(),
+        fi.width,
+        fi.height,
+        frame_rate,
+        2,
+        2,
+        false,
+      );
       let mut iter = ti.tile_iter_mut(&mut fs, &mut fb);
       assert_eq!(9, iter.len());
       assert!(iter.next().is_some());
@@ -328,7 +433,15 @@ pub mod test {
     let mut fb = FrameBlocks::new(fi.w_in_b, fi.h_in_b);
 
     // 4x4 tiles requested, will actually get 3x3 tiles
-    let ti = TilingInfo::new(fi.sb_size_log2(), fi.width, fi.height, 2, 2);
+    let ti = TilingInfo::from_target_tiles(
+      fi.sb_size_log2(),
+      fi.width,
+      fi.height,
+      fi.config.frame_rate(),
+      2,
+      2,
+      false,
+    );
     let iter = ti.tile_iter_mut(&mut fs, &mut fb);
     let tile_states = iter.map(|ctx| ctx.ts).collect::<Vec<_>>();
 
@@ -352,9 +465,9 @@ pub mod test {
     assert_eq!((32, 0, 32, 32), rect(&tile.planes[2]));
 
     let tile = &tile_states[2].rec; // the top-right tile
-    assert_eq!((128, 0, 32, 64), rect(&tile.planes[0]));
-    assert_eq!((64, 0, 16, 32), rect(&tile.planes[1]));
-    assert_eq!((64, 0, 16, 32), rect(&tile.planes[2]));
+    assert_eq!((128, 0, 64, 64), rect(&tile.planes[0]));
+    assert_eq!((64, 0, 32, 32), rect(&tile.planes[1]));
+    assert_eq!((64, 0, 32, 32), rect(&tile.planes[2]));
 
     let tile = &tile_states[3].rec; // the middle-left tile
     assert_eq!((0, 64, 64, 64), rect(&tile.planes[0]));
@@ -367,24 +480,24 @@ pub mod test {
     assert_eq!((32, 32, 32, 32), rect(&tile.planes[2]));
 
     let tile = &tile_states[5].rec; // the middle-right tile
-    assert_eq!((128, 64, 32, 64), rect(&tile.planes[0]));
-    assert_eq!((64, 32, 16, 32), rect(&tile.planes[1]));
-    assert_eq!((64, 32, 16, 32), rect(&tile.planes[2]));
+    assert_eq!((128, 64, 64, 64), rect(&tile.planes[0]));
+    assert_eq!((64, 32, 32, 32), rect(&tile.planes[1]));
+    assert_eq!((64, 32, 32, 32), rect(&tile.planes[2]));
 
     let tile = &tile_states[6].rec; // the bottom-left tile
-    assert_eq!((0, 128, 64, 16), rect(&tile.planes[0]));
-    assert_eq!((0, 64, 32, 8), rect(&tile.planes[1]));
-    assert_eq!((0, 64, 32, 8), rect(&tile.planes[2]));
+    assert_eq!((0, 128, 64, 64), rect(&tile.planes[0]));
+    assert_eq!((0, 64, 32, 32), rect(&tile.planes[1]));
+    assert_eq!((0, 64, 32, 32), rect(&tile.planes[2]));
 
     let tile = &tile_states[7].rec; // the bottom-middle tile
-    assert_eq!((64, 128, 64, 16), rect(&tile.planes[0]));
-    assert_eq!((32, 64, 32, 8), rect(&tile.planes[1]));
-    assert_eq!((32, 64, 32, 8), rect(&tile.planes[2]));
+    assert_eq!((64, 128, 64, 64), rect(&tile.planes[0]));
+    assert_eq!((32, 64, 32, 32), rect(&tile.planes[1]));
+    assert_eq!((32, 64, 32, 32), rect(&tile.planes[2]));
 
     let tile = &tile_states[8].rec; // the bottom-right tile
-    assert_eq!((128, 128, 32, 16), rect(&tile.planes[0]));
-    assert_eq!((64, 64, 16, 8), rect(&tile.planes[1]));
-    assert_eq!((64, 64, 16, 8), rect(&tile.planes[2]));
+    assert_eq!((128, 128, 64, 64), rect(&tile.planes[0]));
+    assert_eq!((64, 64, 32, 32), rect(&tile.planes[1]));
+    assert_eq!((64, 64, 32, 32), rect(&tile.planes[2]));
   }
 
   #[inline]
@@ -399,7 +512,15 @@ pub mod test {
     let mut fb = FrameBlocks::new(fi.w_in_b, fi.h_in_b);
 
     // 4x4 tiles requested, will actually get 3x3 tiles
-    let ti = TilingInfo::new(fi.sb_size_log2(), fi.width, fi.height, 2, 2);
+    let ti = TilingInfo::from_target_tiles(
+      fi.sb_size_log2(),
+      fi.width,
+      fi.height,
+      fi.config.frame_rate(),
+      2,
+      2,
+      false,
+    );
     let iter = ti.tile_iter_mut(&mut fs, &mut fb);
     let tbs = iter.map(|ctx| ctx.tb).collect::<Vec<_>>();
 
@@ -432,7 +553,15 @@ pub mod test {
 
     {
       // 4x4 tiles requested, will actually get 3x3 tiles
-      let ti = TilingInfo::new(fi.sb_size_log2(), fi.width, fi.height, 2, 2);
+      let ti = TilingInfo::from_target_tiles(
+        fi.sb_size_log2(),
+        fi.width,
+        fi.height,
+        fi.config.frame_rate(),
+        2,
+        2,
+        false,
+      );
       let iter = ti.tile_iter_mut(&mut fs, &mut fb);
       let mut tile_states = iter.map(|ctx| ctx.ts).collect::<Vec<_>>();
 
@@ -441,15 +570,15 @@ pub mod test {
         let tile_plane = &mut tile_states[0].rec.planes[0];
         let row = &mut tile_plane[12];
         assert_eq!(64, row.len());
-        &mut row[35..41].copy_from_slice(&[4, 42, 12, 18, 15, 31]);
+        row[35..41].copy_from_slice(&[4, 42, 12, 18, 15, 31]);
       }
 
       {
         // row 8 of U-plane of the middle-right tile
         let tile_plane = &mut tile_states[5].rec.planes[1];
         let row = &mut tile_plane[8];
-        assert_eq!(16, row.len());
-        &mut row[..4].copy_from_slice(&[14, 121, 1, 3]);
+        assert_eq!(32, row.len());
+        row[..4].copy_from_slice(&[14, 121, 1, 3]);
       }
 
       {
@@ -457,7 +586,7 @@ pub mod test {
         let tile_plane = &mut tile_states[7].rec.planes[2];
         let row = &mut tile_plane[1];
         assert_eq!(32, row.len());
-        &mut row[11..16].copy_from_slice(&[6, 5, 2, 11, 8]);
+        row[11..16].copy_from_slice(&[6, 5, 2, 11, 8]);
       }
     }
 
@@ -489,7 +618,15 @@ pub mod test {
     let fi = create_frame_invariants(64, 80, ChromaSampling::Cs420);
     let mut fs = FrameState::new(&fi);
     let mut fb = FrameBlocks::new(fi.w_in_b, fi.h_in_b);
-    let ti = TilingInfo::new(fi.sb_size_log2(), fi.width, fi.height, 2, 2);
+    let ti = TilingInfo::from_target_tiles(
+      fi.sb_size_log2(),
+      fi.width,
+      fi.height,
+      fi.config.frame_rate(),
+      2,
+      2,
+      false,
+    );
     let iter = ti.tile_iter_mut(&mut fs, &mut fb);
     let mut tile_states = iter.map(|ctx| ctx.ts).collect::<Vec<_>>();
 
@@ -522,7 +659,15 @@ pub mod test {
 
     {
       // 2x2 tiles, each one containing 2×2 restoration units (1 super-block per restoration unit)
-      let ti = TilingInfo::new(fi.sb_size_log2(), fi.width, fi.height, 1, 1);
+      let ti = TilingInfo::from_target_tiles(
+        fi.sb_size_log2(),
+        fi.width,
+        fi.height,
+        fi.config.frame_rate(),
+        1,
+        1,
+        false,
+      );
       let iter = ti.tile_iter_mut(&mut fs, &mut fb);
       let mut tile_states = iter.map(|ctx| ctx.ts).collect::<Vec<_>>();
 
@@ -577,33 +722,41 @@ pub mod test {
 
     {
       // 4x4 tiles requested, will actually get 3x3 tiles
-      let ti = TilingInfo::new(fi.sb_size_log2(), fi.width, fi.height, 2, 2);
+      let ti = TilingInfo::from_target_tiles(
+        fi.sb_size_log2(),
+        fi.width,
+        fi.height,
+        fi.config.frame_rate(),
+        2,
+        2,
+        false,
+      );
       let iter = ti.tile_iter_mut(&mut fs, &mut fb);
       let mut tile_states = iter.map(|ctx| ctx.ts).collect::<Vec<_>>();
 
       {
         // block (8, 5) of the top-left tile (of the first ref frame)
-        let mvs = &mut tile_states[0].mvs[0];
-        mvs[5][8] = MotionVector { col: 42, row: 38 };
-        println!("{:?}", mvs[5][8]);
+        let me_stats = &mut tile_states[0].me_stats[0];
+        me_stats[5][8].mv = MotionVector { col: 42, row: 38 };
+        println!("{:?}", me_stats[5][8].mv);
       }
 
       {
         // block (4, 2) of the middle-right tile (of ref frame 2)
-        let mvs = &mut tile_states[5].mvs[2];
-        mvs[2][3] = MotionVector { col: 2, row: 14 };
+        let me_stats = &mut tile_states[5].me_stats[2];
+        me_stats[2][3].mv = MotionVector { col: 2, row: 14 };
       }
     }
 
     // check that writes on tiled views affected the underlying motion vectors
 
-    let mvs = &fs.frame_mvs[0];
-    assert_eq!(MotionVector { col: 42, row: 38 }, mvs[5][8]);
+    let me_stats = &fs.frame_me_stats[0];
+    assert_eq!(MotionVector { col: 42, row: 38 }, me_stats[5][8].mv);
 
-    let mvs = &fs.frame_mvs[2];
+    let me_stats = &fs.frame_me_stats[2];
     let mix = (128 >> MI_SIZE_LOG2) + 3;
     let miy = (64 >> MI_SIZE_LOG2) + 2;
-    assert_eq!(MotionVector { col: 2, row: 14 }, mvs[miy][mix]);
+    assert_eq!(MotionVector { col: 2, row: 14 }, me_stats[miy][mix].mv);
   }
 
   #[test]
@@ -614,7 +767,15 @@ pub mod test {
 
     {
       // 4x4 tiles requested, will actually get 3x3 tiles
-      let ti = TilingInfo::new(fi.sb_size_log2(), fi.width, fi.height, 2, 2);
+      let ti = TilingInfo::from_target_tiles(
+        fi.sb_size_log2(),
+        fi.width,
+        fi.height,
+        fi.config.frame_rate(),
+        2,
+        2,
+        false,
+      );
       let iter = ti.tile_iter_mut(&mut fs, &mut fb);
       let mut tbs = iter.map(|ctx| ctx.tb).collect::<Vec<_>>();
 
@@ -656,5 +817,48 @@ pub mod test {
 
     assert_eq!(PredictionMode::PAETH_PRED, fb[34][19].mode);
     assert_eq!(8, fb[33][17].n4_w);
+  }
+
+  #[test]
+  fn tile_log2_overflow() {
+    assert_eq!(TilingInfo::tile_log2(1, usize::max_value()), None);
+  }
+
+  #[test]
+  fn from_target_tiles_422() {
+    let sb_size_log2 = 6;
+    let is_422_p = true;
+    let frame_rate = 60.;
+    let sb_size = 1 << sb_size_log2;
+
+    for frame_height in (sb_size..4352).step_by(sb_size) {
+      for tile_rows_log2 in
+        0..=TilingInfo::tile_log2(1, frame_height >> sb_size_log2).unwrap()
+      {
+        for frame_width in (sb_size..7680).step_by(sb_size) {
+          for tile_cols_log2 in
+            0..=TilingInfo::tile_log2(1, frame_width >> sb_size_log2).unwrap()
+          {
+            let ti = TilingInfo::from_target_tiles(
+              sb_size_log2,
+              frame_width,
+              frame_height,
+              frame_rate,
+              tile_cols_log2,
+              tile_rows_log2,
+              is_422_p,
+            );
+            assert_eq!(
+              ti.tile_cols_log2,
+              TilingInfo::tile_log2(1, ti.cols).unwrap()
+            );
+            assert_eq!(
+              ti.tile_rows_log2,
+              TilingInfo::tile_log2(1, ti.rows).unwrap()
+            );
+          }
+        }
+      }
+    }
   }
 }

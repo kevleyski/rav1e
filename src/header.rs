@@ -1,4 +1,4 @@
-// Copyright (c) 2018, The rav1e contributors. All rights reserved
+// Copyright (c) 2018-2020, The rav1e contributors. All rights reserved
 //
 // This source code is subject to the terms of the BSD 2 Clause License and
 // the Alliance for Open Media Patent License 1.0. If the BSD 2 Clause License
@@ -12,17 +12,18 @@ use crate::context::*;
 use crate::ec::*;
 use crate::lrf::*;
 use crate::partition::*;
+use crate::tiling::MAX_TILE_WIDTH;
+use crate::util::Fixed;
 use crate::util::Pixel;
 
-use crate::SegmentationState;
 use crate::DeblockState;
-use crate::FrameState;
 use crate::FrameInvariants;
+use crate::FrameState;
+use crate::SegmentationState;
 use crate::Sequence;
 
-use bitstream_io::{BitWriter, BigEndian, LittleEndian};
+use bitstream_io::{BigEndian, BitWriter, LittleEndian};
 
-use std;
 use std::io;
 
 pub const PRIMARY_REF_NONE: u32 = 7;
@@ -40,11 +41,8 @@ const LEVEL_MAJOR_BITS: usize = 3;
 const LEVEL_MINOR_BITS: usize = 2;
 #[allow(unused)]
 const LEVEL_BITS: usize = LEVEL_MAJOR_BITS + LEVEL_MINOR_BITS;
-const FRAME_ID_LENGTH: usize = 15;
-const DELTA_FRAME_ID_LENGTH: usize = 14;
 
-
-#[allow(dead_code,non_camel_case_types)]
+#[allow(dead_code, non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ReferenceMode {
   SINGLE = 0,
@@ -53,6 +51,7 @@ pub enum ReferenceMode {
 }
 
 #[allow(non_camel_case_types)]
+#[allow(unused)]
 pub enum ObuType {
   OBU_SEQUENCE_HEADER = 1,
   OBU_TEMPORAL_DELIMITER = 2,
@@ -65,8 +64,9 @@ pub enum ObuType {
   OBU_PADDING = 15,
 }
 
-#[derive(Clone,Copy)]
+#[derive(Clone, Copy)]
 #[allow(non_camel_case_types)]
+#[allow(unused)]
 pub enum ObuMetaType {
   OBU_META_HDR_CLL = 1,
   OBU_META_HDR_MDCV = 2,
@@ -101,7 +101,9 @@ impl<W: io::Write> ULEB128Writer for BitWriter<W, BigEndian> {
       loop {
         size += 1;
         value >>= 7;
-        if value == 0 { break; }
+        if value == 0 {
+          break;
+        }
       }
       size
     }
@@ -112,7 +114,9 @@ impl<W: io::Write> ULEB128Writer for BitWriter<W, BigEndian> {
       for i in 0..leb_size {
         let mut byte = (value & 0x7f) as u8;
         value >>= 7;
-        if value != 0 { byte |= 0x80 };  // Signal that more bytes follow.
+        if value != 0 {
+          byte |= 0x80
+        }; // Signal that more bytes follow.
         coded_value[i] = byte;
       }
 
@@ -135,64 +139,69 @@ pub trait LEWriter {
 // to write little endian values in a globally big-endian BitWriter
 impl<W: io::Write> LEWriter for BitWriter<W, BigEndian> {
   fn write_le(&mut self, bytes: u32, value: u64) -> io::Result<()> {
-      let mut data = Vec::new();
-      let mut bwle = BitWriter::endian(&mut data, LittleEndian);
-      bwle.write(bytes * 8, value)?;
-      self.write_bytes(&data)
+    let mut data = Vec::new();
+    let mut bwle = BitWriter::endian(&mut data, LittleEndian);
+    bwle.write(bytes * 8, value)?;
+    self.write_bytes(&data)
   }
 }
 
 pub trait UncompressedHeader {
   // Start of OBU Headers
   fn write_obu_header(
-    &mut self, obu_type: ObuType, obu_extension: u32
+    &mut self, obu_type: ObuType, obu_extension: u32,
   ) -> io::Result<()>;
   fn write_metadata_obu(
-    &mut self, obu_meta_type: ObuMetaType, seq: Sequence
+    &mut self, obu_meta_type: ObuMetaType, seq: Sequence,
   ) -> io::Result<()>;
   fn write_sequence_header_obu<T: Pixel>(
-    &mut self, fi: &mut FrameInvariants<T>
+    &mut self, fi: &FrameInvariants<T>,
   ) -> io::Result<()>;
   fn write_frame_header_obu<T: Pixel>(
-    &mut self, fi: &FrameInvariants<T>, fs: &FrameState<T>
+    &mut self, fi: &FrameInvariants<T>, fs: &FrameState<T>,
+    inter_cfg: &InterConfig,
   ) -> io::Result<()>;
   fn write_sequence_header<T: Pixel>(
-    &mut self, fi: &mut FrameInvariants<T>
+    &mut self, fi: &FrameInvariants<T>,
   ) -> io::Result<()>;
-  fn write_color_config(
-    &mut self, seq: &mut Sequence
-  ) -> io::Result<()>;
+  fn write_color_config(&mut self, seq: &Sequence) -> io::Result<()>;
   // End of OBU Headers
 
+  fn write_max_frame_size<T: Pixel>(
+    &mut self, fi: &FrameInvariants<T>,
+  ) -> io::Result<()>;
   fn write_frame_size<T: Pixel>(
-    &mut self, fi: &FrameInvariants<T>
+    &mut self, fi: &FrameInvariants<T>,
+  ) -> io::Result<()>;
+  fn write_render_size<T: Pixel>(
+    &mut self, fi: &FrameInvariants<T>,
+  ) -> io::Result<()>;
+  fn write_frame_size_with_refs<T: Pixel>(
+    &mut self, fi: &FrameInvariants<T>,
   ) -> io::Result<()>;
   fn write_deblock_filter_a<T: Pixel>(
-    &mut self, fi: &FrameInvariants<T>, deblock: &DeblockState
+    &mut self, fi: &FrameInvariants<T>, deblock: &DeblockState,
   ) -> io::Result<()>;
   fn write_deblock_filter_b<T: Pixel>(
-    &mut self, fi: &FrameInvariants<T>, deblock: &DeblockState
+    &mut self, fi: &FrameInvariants<T>, deblock: &DeblockState,
   ) -> io::Result<()>;
   fn write_frame_cdef<T: Pixel>(
-    &mut self, fi: &FrameInvariants<T>
+    &mut self, fi: &FrameInvariants<T>,
   ) -> io::Result<()>;
   fn write_frame_lrf<T: Pixel>(
-    &mut self, fi: &FrameInvariants<T>, rs: &RestorationState
+    &mut self, fi: &FrameInvariants<T>, rs: &RestorationState,
   ) -> io::Result<()>;
   fn write_segment_data<T: Pixel>(
-    &mut self, fi: &FrameInvariants<T>, segmentation: &SegmentationState
+    &mut self, fi: &FrameInvariants<T>, segmentation: &SegmentationState,
   ) -> io::Result<()>;
-  fn write_delta_q(
-    &mut self, delta_q: i8
-  ) -> io::Result<()>;
+  fn write_delta_q(&mut self, delta_q: i8) -> io::Result<()>;
 }
-
 
 impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
   // Start of OBU Headers
   // Write OBU Header syntax
   fn write_obu_header(
-    &mut self, obu_type: ObuType, obu_extension: u32
+    &mut self, obu_type: ObuType, obu_extension: u32,
   ) -> io::Result<()> {
     self.write_bit(false)?; // forbidden bit.
     self.write(4, obu_type as u32)?;
@@ -209,7 +218,7 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
   }
 
   fn write_metadata_obu(
-    &mut self, obu_meta_type: ObuMetaType, seq: Sequence
+    &mut self, obu_meta_type: ObuMetaType, seq: Sequence,
   ) -> io::Result<()> {
     // header
     self.write_obu_header(ObuType::OBU_METADATA, 0)?;
@@ -228,7 +237,7 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
         let cll = seq.content_light.unwrap();
         self.write(16, cll.max_content_light_level)?;
         self.write(16, cll.max_frame_average_light_level)?;
-      },
+      }
       ObuMetaType::OBU_META_HDR_MDCV => {
         let mdcv = seq.mastering_display.unwrap();
         for i in 0..3 {
@@ -241,7 +250,7 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
 
         self.write(32, mdcv.max_luminance)?;
         self.write(32, mdcv.min_luminance)?;
-      },
+      }
       _ => {}
     }
 
@@ -253,24 +262,45 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
   }
 
   fn write_sequence_header_obu<T: Pixel>(
-    &mut self, fi: &mut FrameInvariants<T>
+    &mut self, fi: &FrameInvariants<T>,
   ) -> io::Result<()> {
+    assert!(
+      !fi.sequence.reduced_still_picture_hdr || fi.sequence.still_picture
+    );
+
     self.write(3, fi.sequence.profile)?; // profile
-    self.write_bit(false)?; // still_picture
-    self.write_bit(false)?; // reduced_still_picture_header
-    self.write_bit(false)?; // timing info present
-    self.write_bit(false)?; // initial display delay present flag
-    self.write(5, 0)?; // one operating point
-    self.write(12, 0)?; // idc
-    self.write(5, 31)?; // level
-    self.write(1, 0)?; // tier
+    self.write_bit(fi.sequence.still_picture)?; // still_picture
+    self.write_bit(fi.sequence.reduced_still_picture_hdr)?; // reduced_still_picture_header
+
     if fi.sequence.reduced_still_picture_hdr {
-      unimplemented!();
+      assert_eq!(fi.sequence.timing_info_present, false);
+      assert_eq!(fi.sequence.decoder_model_info_present_flag, false);
+      assert_eq!(fi.sequence.operating_points_cnt_minus_1, 0);
+      assert_eq!(fi.sequence.operating_point_idc[0], 0);
+      self.write(5, 31)?; // level
+      assert_eq!(fi.sequence.tier[0], 0);
+    } else {
+      self.write_bit(fi.sequence.timing_info_present)?; // timing info present
+
+      if fi.sequence.timing_info_present {
+        self.write(32, fi.config.time_base.num)?;
+        self.write(32, fi.config.time_base.den)?;
+
+        self.write_bit(true)?; // equal picture interval
+        self.write_bit(true)?; // zero interval
+        self.write_bit(false)?; // decoder model info present flag
+      }
+
+      self.write_bit(false)?; // initial display delay present flag
+      self.write(5, 0)?; // one operating point
+      self.write(12, 0)?; // idc
+      self.write(5, 31)?; // level
+      self.write(1, 0)?; // tier
     }
 
     self.write_sequence_header(fi)?;
 
-    self.write_color_config(&mut fi.sequence)?;
+    self.write_color_config(&fi.sequence)?;
 
     self.write_bit(fi.sequence.film_grain_params_present)?;
 
@@ -278,20 +308,17 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
   }
 
   fn write_sequence_header<T: Pixel>(
-    &mut self, fi: &mut FrameInvariants<T>
+    &mut self, fi: &FrameInvariants<T>,
   ) -> io::Result<()> {
-    self.write_frame_size(fi)?;
+    self.write_max_frame_size(fi)?;
 
-    let seq = &mut fi.sequence;
+    let seq = &fi.sequence;
 
-    seq.frame_id_numbers_present_flag = false;
-
-    if !seq.reduced_still_picture_hdr {
+    if seq.reduced_still_picture_hdr {
+      assert!(!seq.frame_id_numbers_present_flag);
+    } else {
       self.write_bit(seq.frame_id_numbers_present_flag)?;
     }
-
-    seq.frame_id_length = FRAME_ID_LENGTH as u32;
-    seq.delta_frame_id_length = DELTA_FRAME_ID_LENGTH as u32;
 
     if seq.frame_id_numbers_present_flag {
       // We must always have delta_frame_id_length < frame_id_length,
@@ -302,10 +329,20 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
     }
 
     self.write_bit(seq.use_128x128_superblock)?;
-    self.write_bit(seq.enable_filter_intra)?; // enable filter intra
+    self.write_bit(seq.enable_filter_intra)?;
     self.write_bit(seq.enable_intra_edge_filter)?;
 
-    if !seq.reduced_still_picture_hdr {
+    if seq.reduced_still_picture_hdr {
+      assert!(!seq.enable_interintra_compound);
+      assert!(!seq.enable_masked_compound);
+      assert!(!seq.enable_warped_motion);
+      assert!(!seq.enable_dual_filter);
+      assert!(!seq.enable_order_hint);
+      assert!(!seq.enable_jnt_comp);
+      assert!(!seq.enable_ref_frame_mvs);
+      assert!(seq.force_screen_content_tools == 2);
+      assert!(seq.force_integer_mv == 2);
+    } else {
       self.write_bit(seq.enable_interintra_compound)?;
       self.write_bit(seq.enable_masked_compound)?;
       self.write_bit(seq.enable_warped_motion)?;
@@ -345,7 +382,7 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
     Ok(())
   }
 
-  fn write_color_config(&mut self, seq: &mut Sequence) -> io::Result<()> {
+  fn write_color_config(&mut self, seq: &Sequence) -> io::Result<()> {
     let high_bd = seq.bit_depth > 8;
 
     self.write_bit(high_bd)?;
@@ -361,10 +398,6 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
       self.write_bit(monochrome)?;
     }
 
-    if monochrome {
-      unimplemented!();
-    }
-
     // color description present
     self.write_bit(seq.color_description.is_some())?;
 
@@ -375,9 +408,12 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
       self.write(8, color_description.transfer_characteristics as u8)?;
       self.write(8, color_description.matrix_coefficients as u8)?;
 
-      if color_description.color_primaries == ColorPrimaries::BT709 &&
-        color_description.transfer_characteristics == TransferCharacteristics::SRGB &&
-        color_description.matrix_coefficients == MatrixCoefficients::Identity {
+      if color_description.color_primaries == ColorPrimaries::BT709
+        && color_description.transfer_characteristics
+          == TransferCharacteristics::SRGB
+        && color_description.matrix_coefficients
+          == MatrixCoefficients::Identity
+      {
         write_color_range = false;
         assert!(seq.chroma_sampling == ChromaSampling::Cs444);
       }
@@ -412,19 +448,21 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
       }
     }
 
-    self.write_bit(seq.separate_uv_delta_q)?;
+    self.write_bit(true)?; // separate_uv_delta_q
 
     Ok(())
   }
 
   #[allow(unused)]
   fn write_frame_header_obu<T: Pixel>(
-    &mut self, fi: &FrameInvariants<T>, fs: &FrameState<T>
+    &mut self, fi: &FrameInvariants<T>, fs: &FrameState<T>,
+    inter_cfg: &InterConfig,
   ) -> io::Result<()> {
     if fi.sequence.reduced_still_picture_hdr {
-      assert!(fi.show_existing_frame);
+      assert!(!fi.show_existing_frame);
       assert!(fi.frame_type == FrameType::KEY);
       assert!(fi.show_frame);
+      assert!(!fi.showable_frame);
     } else {
       self.write_bit(fi.show_existing_frame)?;
 
@@ -460,6 +498,9 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
         self.write_bit(fi.showable_frame)?;
       }
 
+      if fi.error_resilient {
+        assert!(fi.primary_ref_frame == PRIMARY_REF_NONE);
+      }
       if fi.frame_type == FrameType::SWITCH {
         assert!(fi.error_resilient);
       } else if !(fi.frame_type == FrameType::KEY && fi.show_frame) {
@@ -478,18 +519,22 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
       );
     }
 
-    if fi.allow_screen_content_tools == 2 {
+    if fi.allow_screen_content_tools > 0 {
       if fi.sequence.force_integer_mv == 2 {
         self.write_bit(fi.force_integer_mv != 0)?;
       } else {
         assert!(fi.force_integer_mv == fi.sequence.force_integer_mv);
       }
-    } else {
-      assert!(
-        fi.allow_screen_content_tools
-          == fi.sequence.force_screen_content_tools
-      );
     }
+
+    assert!(
+      fi.force_integer_mv
+        == if fi.frame_type == FrameType::KEY || fi.intra_only {
+          1
+        } else {
+          0
+        }
+    );
 
     if fi.sequence.frame_id_numbers_present_flag {
       unimplemented!();
@@ -499,13 +544,10 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
       //self.write(frame_id_len, fi.current_frame_id);
     }
 
-    let mut frame_size_override_flag = false;
-    if fi.frame_type == FrameType::SWITCH {
-      frame_size_override_flag = true;
-    } else if fi.sequence.reduced_still_picture_hdr {
-      frame_size_override_flag = false;
-    } else {
-      self.write_bit(frame_size_override_flag)?; // frame size overhead flag
+    if fi.frame_type != FrameType::SWITCH
+      && !fi.sequence.reduced_still_picture_hdr
+    {
+      self.write_bit(fi.frame_size_override_flag)?; // frame size overhead flag
     }
 
     if fi.sequence.enable_order_hint {
@@ -514,8 +556,7 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
       self.write(n, fi.order_hint & mask)?;
     }
 
-    if fi.error_resilient || fi.intra_only {
-    } else {
+    if !fi.error_resilient && !fi.intra_only {
       self.write(PRIMARY_REF_BITS, fi.primary_ref_frame)?;
     }
 
@@ -531,6 +572,8 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
       } else {
         assert!(fi.refresh_frame_flags == ALL_REF_FRAMES_MASK);
       }
+    } else if fi.frame_type == FrameType::SWITCH {
+      assert!(fi.refresh_frame_flags == ALL_REF_FRAMES_MASK);
     } else {
       // Inter frame info goes here
       if fi.intra_only {
@@ -545,25 +588,25 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
     if (!fi.intra_only || fi.refresh_frame_flags != ALL_REF_FRAMES_MASK) {
       // Write all ref frame order hints if error_resilient_mode == 1
       if (fi.error_resilient && fi.sequence.enable_order_hint) {
-        unimplemented!();
-        //for _ in 0..REF_FRAMES {
-        //  self.write(order_hint_bits_minus_1,ref_order_hint[i])?; // order_hint
-        //}
+        for i in 0..REF_FRAMES {
+          let n = fi.sequence.order_hint_bits_minus_1 + 1;
+          let mask = (1 << n) - 1;
+          if let Some(ref rec) = fi.rec_buffer.frames[i] {
+            let ref_hint = rec.order_hint;
+            self.write(n, ref_hint & mask)?;
+          } else {
+            self.write(n, 0)?;
+          }
+        }
       }
     }
 
     // if KEY or INTRA_ONLY frame
-    // FIXME: Not sure whether putting frame/render size here is good idea
     if fi.intra_only {
-      if frame_size_override_flag {
-        unimplemented!();
-      }
-      if fi.sequence.enable_superres {
-        unimplemented!();
-      }
-      self.write_bit(false)?; // render_and_frame_size_different
-                              // if render_and_frame_size_different { }
-      if fi.allow_screen_content_tools != 0 { // TODO: && UpscaledWidth == FrameWidth.
+      self.write_frame_size(fi)?;
+      self.write_render_size(fi)?;
+      if fi.allow_screen_content_tools != 0 {
+        // TODO: && UpscaledWidth == FrameWidth.
         self.write_bit(fi.allow_intrabc)?;
       }
     }
@@ -588,16 +631,11 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
         }
       }
 
-      if fi.error_resilient && frame_size_override_flag {
-        unimplemented!();
+      if !fi.error_resilient && fi.frame_size_override_flag {
+        self.write_frame_size_with_refs(fi)?;
       } else {
-        if frame_size_override_flag {
-          unimplemented!();
-        }
-        if fi.sequence.enable_superres {
-          unimplemented!();
-        }
-        self.write_bit(false)?; // render_and_frame_size_different
+        self.write_frame_size(fi)?;
+        self.write_render_size(fi)?;
       }
 
       if fi.force_integer_mv == 0 {
@@ -605,37 +643,86 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
       }
 
       self.write_bit(fi.is_filter_switchable)?;
+      if !fi.is_filter_switchable {
+        self.write(2, fi.default_filter as u8)?;
+      }
       self.write_bit(fi.is_motion_mode_switchable)?;
-      self.write(2, 0)?; // EIGHTTAP_REGULAR
 
       if (!fi.error_resilient && fi.sequence.enable_ref_frame_mvs) {
         self.write_bit(fi.use_ref_frame_mvs)?;
       }
     }
 
-    if !fi.sequence.reduced_still_picture_hdr && !fi.disable_cdf_update {
+    if fi.sequence.reduced_still_picture_hdr || fi.disable_cdf_update {
+      assert!(fi.disable_frame_end_update_cdf);
+    } else {
       self.write_bit(fi.disable_frame_end_update_cdf)?;
     }
 
-    // tile <https://aomediacodec.github.io/av1-spec/#tile-info-syntax>
-    self.write_bit(true)?; // uniform_tile_spacing_flag
+    // tile
+    // <https://aomediacodec.github.io/av1-spec/#tile-info-syntax>
 
+    // Can we use the uniform spacing tile syntax?  'Uniform spacing'
+    // is a slight misnomer; it's more constrained than just a uniform
+    // spacing.
     let ti = &fi.tiling;
 
-    let cols_ones = ti.tile_cols_log2 - ti.min_tile_cols_log2;
-    for _ in 0..cols_ones {
-      self.write_bit(true);
-    }
-    if ti.tile_cols_log2 < ti.max_tile_cols_log2 {
-      self.write_bit(false);
-    }
+    if fi.sb_width.align_power_of_two_and_shift(ti.tile_cols_log2)
+      == ti.tile_width_sb
+      && fi.sb_height.align_power_of_two_and_shift(ti.tile_rows_log2)
+        == ti.tile_height_sb
+    {
+      // yes; our actual tile width/height setting (which is always
+      // currently uniform) also matches the constrained width/height
+      // calculation implicit in the uniform spacing flag.
 
-    let rows_ones = ti.tile_rows_log2 - ti.min_tile_rows_log2;
-    for _ in 0..rows_ones {
-      self.write_bit(true);
-    }
-    if ti.tile_rows_log2 < ti.max_tile_rows_log2 {
-      self.write_bit(false);
+      self.write_bit(true)?; // uniform_tile_spacing_flag
+
+      let cols_ones = ti.tile_cols_log2 - ti.min_tile_cols_log2;
+      for _ in 0..cols_ones {
+        self.write_bit(true);
+      }
+      if ti.tile_cols_log2 < ti.max_tile_cols_log2 {
+        self.write_bit(false);
+      }
+
+      let rows_ones = ti.tile_rows_log2 - ti.min_tile_rows_log2;
+      for _ in 0..rows_ones {
+        self.write_bit(true);
+      }
+      if ti.tile_rows_log2 < ti.max_tile_rows_log2 {
+        self.write_bit(false);
+      }
+    } else {
+      self.write_bit(false)?; // uniform_tile_spacing_flag
+      let mut sofar = 0;
+      let mut widest_tile_sb = 0;
+      for _ in 0..ti.cols {
+        let max = (MAX_TILE_WIDTH
+          >> if fi.sequence.use_128x128_superblock { 7 } else { 6 })
+        .min(fi.sb_width - sofar) as u16;
+        let this_sb_width = ti.tile_width_sb.min(fi.sb_width - sofar);
+        self.write_quniform(max, (this_sb_width - 1) as u16);
+        sofar += this_sb_width;
+        widest_tile_sb = widest_tile_sb.max(this_sb_width);
+      }
+
+      let max_tile_area_sb = if ti.min_tiles_log2 > 0 {
+        (fi.sb_height * fi.sb_width) >> (ti.min_tiles_log2 + 1)
+      } else {
+        fi.sb_height * fi.sb_width
+      };
+
+      let max_tile_height_sb = (max_tile_area_sb / widest_tile_sb).max(1);
+
+      sofar = 0;
+      for i in 0..ti.rows {
+        let max = max_tile_height_sb.min(fi.sb_height - sofar) as u16;
+        let this_sb_height = ti.tile_height_sb.min(fi.sb_height - sofar);
+
+        self.write_quniform(max, (this_sb_height - 1) as u16);
+        sofar += this_sb_height;
+      }
     }
 
     let tiles_log2 = ti.tile_cols_log2 + ti.tile_rows_log2;
@@ -652,21 +739,17 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
     assert!(fi.base_q_idx > 0);
     self.write(8, fi.base_q_idx)?; // base_q_idx
     self.write_delta_q(fi.dc_delta_q[0])?;
-    assert!(fi.ac_delta_q[0] == 0);
-    let diff_uv_delta = fi.sequence.separate_uv_delta_q
-      && (fi.dc_delta_q[1] != fi.dc_delta_q[2]
-          || fi.ac_delta_q[1] != fi.ac_delta_q[2]);
-    if fi.sequence.separate_uv_delta_q {
+    if fi.sequence.chroma_sampling != ChromaSampling::Cs400 {
+      assert!(fi.ac_delta_q[0] == 0);
+      let diff_uv_delta = fi.dc_delta_q[1] != fi.dc_delta_q[2]
+        || fi.ac_delta_q[1] != fi.ac_delta_q[2];
       self.write_bit(diff_uv_delta)?;
-    } else {
-      assert!(fi.dc_delta_q[1] == fi.dc_delta_q[2]);
-      assert!(fi.ac_delta_q[1] == fi.ac_delta_q[2]);
-    }
-    self.write_delta_q(fi.dc_delta_q[1])?;
-    self.write_delta_q(fi.ac_delta_q[1])?;
-    if diff_uv_delta {
-      self.write_delta_q(fi.dc_delta_q[2])?;
-      self.write_delta_q(fi.ac_delta_q[2])?;
+      self.write_delta_q(fi.dc_delta_q[1])?;
+      self.write_delta_q(fi.ac_delta_q[1])?;
+      if diff_uv_delta {
+        self.write_delta_q(fi.dc_delta_q[2])?;
+        self.write_delta_q(fi.ac_delta_q[2])?;
+      }
     }
     self.write_bit(false)?; // no qm
 
@@ -699,7 +782,7 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
     }
 
     let skip_mode_allowed =
-      fi.sequence.get_skip_mode_allowed(fi, reference_select);
+      fi.sequence.get_skip_mode_allowed(fi, inter_cfg, reference_select);
     if skip_mode_allowed {
       self.write_bit(false)?; // skip_mode_present
     }
@@ -737,18 +820,18 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
               (1 << bits) + 1,
               3,
               mv_x_ref >> bits_diff,
-              mv_x >> bits_diff
+              mv_x >> bits_diff,
             )?;
             BCodeWriter::write_s_refsubexpfin(
               self,
               (1 << bits) + 1,
               3,
               mv_y_ref >> bits_diff,
-              mv_y >> bits_diff
+              mv_y >> bits_diff,
             )?;
           }
           GlobalMVMode::ROTZOOM => unimplemented!(),
-          GlobalMVMode::AFFINE => unimplemented!()
+          GlobalMVMode::AFFINE => unimplemented!(),
         };
       }
     }
@@ -767,22 +850,88 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
   }
   // End of OBU Headers
 
-  fn write_frame_size<T: Pixel>(&mut self, fi: &FrameInvariants<T>) -> io::Result<()> {
+  fn write_max_frame_size<T: Pixel>(
+    &mut self, fi: &FrameInvariants<T>,
+  ) -> io::Result<()> {
     // width_bits and height_bits will have to be moved to the sequence header OBU
     // when we add support for it.
-    let width_bits = 32 - (fi.width as u32).leading_zeros();
-    let height_bits = 32 - (fi.height as u32).leading_zeros();
+    let width = fi.width - 1;
+    let height = fi.height - 1;
+    let width_bits = 32 - (width as u32).leading_zeros();
+    let height_bits = 32 - (height as u32).leading_zeros();
     assert!(width_bits <= 16);
     assert!(height_bits <= 16);
     self.write(4, width_bits - 1)?;
     self.write(4, height_bits - 1)?;
-    self.write(width_bits, (fi.width - 1) as u16)?;
-    self.write(height_bits, (fi.height - 1) as u16)?;
+    self.write(width_bits, width as u16)?;
+    self.write(height_bits, height as u16)?;
+    Ok(())
+  }
+
+  fn write_frame_size<T: Pixel>(
+    &mut self, fi: &FrameInvariants<T>,
+  ) -> io::Result<()> {
+    // width_bits and height_bits will have to be moved to the sequence header OBU
+    // when we add support for it.
+    if fi.frame_size_override_flag {
+      let width = fi.width - 1;
+      let height = fi.height - 1;
+      let width_bits = 32 - (width as u32).leading_zeros();
+      let height_bits = 32 - (height as u32).leading_zeros();
+      assert!(width_bits <= 16);
+      assert!(height_bits <= 16);
+      self.write(width_bits, width as u16)?;
+      self.write(height_bits, height as u16)?;
+    }
+    if fi.sequence.enable_superres {
+      unimplemented!();
+    }
+    Ok(())
+  }
+
+  fn write_render_size<T: Pixel>(
+    &mut self, fi: &FrameInvariants<T>,
+  ) -> io::Result<()> {
+    self.write_bit(fi.render_and_frame_size_different)?;
+    if fi.render_and_frame_size_different {
+      self.write(16, fi.render_width - 1)?;
+      self.write(16, fi.render_height - 1)?;
+    }
+    Ok(())
+  }
+
+  fn write_frame_size_with_refs<T: Pixel>(
+    &mut self, fi: &FrameInvariants<T>,
+  ) -> io::Result<()> {
+    let mut found_ref = false;
+    for i in 0..INTER_REFS_PER_FRAME {
+      if let Some(ref rec) = fi.rec_buffer.frames[fi.ref_frames[i] as usize] {
+        if rec.width == fi.width as u32
+          && rec.height == fi.height as u32
+          && rec.render_width == fi.render_width
+          && rec.render_height == fi.render_height
+        {
+          self.write_bit(true)?;
+          found_ref = true;
+          break;
+        } else {
+          self.write_bit(false)?;
+        }
+      } else {
+        self.write_bit(false)?;
+      }
+    }
+    if !found_ref {
+      self.write_frame_size(fi)?;
+      self.write_render_size(fi)?;
+    } else if fi.sequence.enable_superres {
+      unimplemented!();
+    }
     Ok(())
   }
 
   fn write_deblock_filter_a<T: Pixel>(
-    &mut self, fi: &FrameInvariants<T>, deblock: &DeblockState
+    &mut self, fi: &FrameInvariants<T>, deblock: &DeblockState,
   ) -> io::Result<()> {
     if fi.delta_q_present {
       if !fi.allow_intrabc {
@@ -797,13 +946,18 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
   }
 
   fn write_deblock_filter_b<T: Pixel>(
-    &mut self, fi: &FrameInvariants<T>, deblock: &DeblockState
+    &mut self, fi: &FrameInvariants<T>, deblock: &DeblockState,
   ) -> io::Result<()> {
+    let planes = if fi.sequence.chroma_sampling == ChromaSampling::Cs400 {
+      1
+    } else {
+      MAX_PLANES
+    };
     assert!(deblock.levels[0] < 64);
     self.write(6, deblock.levels[0])?; // loop deblocking filter level 0
     assert!(deblock.levels[1] < 64);
     self.write(6, deblock.levels[1])?; // loop deblocking filter level 1
-    if PLANES > 1 && (deblock.levels[0] > 0 || deblock.levels[1] > 0) {
+    if planes > 1 && (deblock.levels[0] > 0 || deblock.levels[1] > 0) {
       assert!(deblock.levels[2] < 64);
       self.write(6, deblock.levels[2])?; // loop deblocking filter level 2
       assert!(deblock.levels[3] < 64);
@@ -849,7 +1003,9 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
     Ok(())
   }
 
-  fn write_frame_cdef<T: Pixel>(&mut self, fi: &FrameInvariants<T>) -> io::Result<()> {
+  fn write_frame_cdef<T: Pixel>(
+    &mut self, fi: &FrameInvariants<T>,
+  ) -> io::Result<()> {
     if fi.sequence.enable_cdef {
       assert!(fi.cdef_damping >= 3);
       assert!(fi.cdef_damping <= 6);
@@ -857,24 +1013,30 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
       assert!(fi.cdef_bits < 4);
       self.write(2, fi.cdef_bits)?; // cdef bits
       for i in 0..(1 << fi.cdef_bits) {
-        let j = i << (3 - fi.cdef_bits);
-        assert!(fi.cdef_y_strengths[j] < 64);
-        assert!(fi.cdef_uv_strengths[j] < 64);
-        self.write(6, fi.cdef_y_strengths[j])?; // cdef y strength
-        self.write(6, fi.cdef_uv_strengths[j])?; // cdef uv strength
+        assert!(fi.cdef_y_strengths[i] < 64);
+        assert!(fi.cdef_uv_strengths[i] < 64);
+        self.write(6, fi.cdef_y_strengths[i])?; // cdef y strength
+        if fi.sequence.chroma_sampling != ChromaSampling::Cs400 {
+          self.write(6, fi.cdef_uv_strengths[i])?; // cdef uv strength
+        }
       }
     }
     Ok(())
   }
 
   fn write_frame_lrf<T: Pixel>(
-    &mut self, fi: &FrameInvariants<T>, rs: &RestorationState
+    &mut self, fi: &FrameInvariants<T>, rs: &RestorationState,
   ) -> io::Result<()> {
     if fi.sequence.enable_restoration && !fi.allow_intrabc {
       // && !self.lossless
+      let planes = if fi.sequence.chroma_sampling == ChromaSampling::Cs400 {
+        1
+      } else {
+        MAX_PLANES
+      };
       let mut use_lrf = false;
       let mut use_chroma_lrf = false;
-      for i in 0..PLANES {
+      for i in 0..planes {
         self.write(2, rs.planes[i].cfg.lrf_type)?; // filter type by plane
         if rs.planes[i].cfg.lrf_type != RESTORE_NONE {
           use_lrf = true;
@@ -886,17 +1048,25 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
       if use_lrf {
         // The Y shift value written here indicates shift up from superblock size
         if !fi.sequence.use_128x128_superblock {
-          self.write(1, if rs.planes[0].cfg.unit_size > 64 { 1 } else { 0 })?;
+          self
+            .write(1, if rs.planes[0].cfg.unit_size > 64 { 1 } else { 0 })?;
         }
 
         if rs.planes[0].cfg.unit_size > 64 {
-          self.write(1, if rs.planes[0].cfg.unit_size > 128 { 1 } else { 0 })?;
+          self
+            .write(1, if rs.planes[0].cfg.unit_size > 128 { 1 } else { 0 })?;
         }
 
-        if use_chroma_lrf && fi.sequence.chroma_sampling == ChromaSampling::Cs420 {
+        if use_chroma_lrf
+          && fi.sequence.chroma_sampling == ChromaSampling::Cs420
+        {
           self.write(
             1,
-            if rs.planes[0].cfg.unit_size > rs.planes[1].cfg.unit_size { 1 } else { 0 }
+            if rs.planes[0].cfg.unit_size > rs.planes[1].cfg.unit_size {
+              1
+            } else {
+              0
+            },
           )?;
         }
       }
@@ -905,9 +1075,11 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
   }
 
   fn write_segment_data<T: Pixel>(
-    &mut self, fi: &FrameInvariants<T>, segmentation: &SegmentationState
+    &mut self, fi: &FrameInvariants<T>, segmentation: &SegmentationState,
   ) -> io::Result<()> {
-    self.write_bit(segmentation.enabled)?;
+    assert_eq!(fi.enable_segmentation, segmentation.enabled);
+    self.write_bit(fi.enable_segmentation)?;
+
     if segmentation.enabled {
       if fi.primary_ref_frame == PRIMARY_REF_NONE {
         assert_eq!(segmentation.update_map, true);
@@ -942,6 +1114,7 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
   fn write_delta_q(&mut self, delta_q: i8) -> io::Result<()> {
     self.write_bit(delta_q != 0)?;
     if delta_q != 0 {
+      assert!(delta_q >= -63 && delta_q <= 63);
       self.write_signed(6 + 1, delta_q)?;
     }
     Ok(())

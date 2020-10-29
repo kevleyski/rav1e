@@ -1,5 +1,5 @@
 // Copyright (c) 2001-2016, Alliance for Open Media. All rights reserved
-// Copyright (c) 2017-2018, The rav1e contributors. All rights reserved
+// Copyright (c) 2017-2020, The rav1e contributors. All rights reserved
 //
 // This source code is subject to the terms of the BSD 2 Clause License and
 // the Alliance for Open Media Patent License 1.0. If the BSD 2 Clause License
@@ -10,11 +10,17 @@
 
 #![allow(non_camel_case_types)]
 
-use bitstream_io::{BitWriter, BigEndian};
-use std;
+cfg_if::cfg_if! {
+  if #[cfg(nasm_x86_64)] {
+    pub use crate::asm::x86::ec::*;
+  } else {
+    pub use self::rust::*;
+  }
+}
+
+use crate::util::{msb, ILog};
+use bitstream_io::{BigEndian, BitWriter};
 use std::io;
-use crate::util::ILog;
-use crate::util::msb;
 
 pub const OD_BITRES: u8 = 3;
 const EC_PROB_SHIFT: u32 = 6;
@@ -44,7 +50,7 @@ pub trait Writer {
   /// Write literal bits with flat probability
   fn literal(&mut self, bits: u8, s: u32);
   /// Write passed level as a golomb code
-  fn write_golomb(&mut self, level: u16);
+  fn write_golomb(&mut self, level: u32);
   /// Write a value v in [0, n-1] quasi-uniformly
   fn write_quniform(&mut self, n: u32, v: u32);
   /// Return fractional bits needed to write Write a value v in [0,
@@ -61,14 +67,20 @@ pub trait Writer {
   /// Return fractional bits beed to write symbol v in [0, n-1] with
   /// parameter k as finite subexponential based on a reference ref
   /// also in [0, n-1].
-  fn count_unsigned_subexp_with_ref(&self, v: u32, mx: u32, k: u8, r: u32) -> u32;
+  fn count_unsigned_subexp_with_ref(
+    &self, v: u32, mx: u32, k: u8, r: u32,
+  ) -> u32;
   /// Write symbol v in [-(n-1), n-1] with parameter k as finite
   /// subexponential based on a reference ref also in [-(n-1), n-1].
-  fn write_signed_subexp_with_ref(&mut self, v: i32, low: i32, high: i32, k: u8, r: i32);
+  fn write_signed_subexp_with_ref(
+    &mut self, v: i32, low: i32, high: i32, k: u8, r: i32,
+  );
   /// Return fractional bits needed to write symbol v in [-(n-1), n-1]
   /// with parameter k as finite subexponential based on a reference
   /// ref also in [-(n-1), n-1].
-  fn count_signed_subexp_with_ref(&self, v: i32, low: i32, high: i32, k: u8, r: i32) -> u32;
+  fn count_signed_subexp_with_ref(
+    &self, v: i32, low: i32, high: i32, k: u8, r: i32,
+  ) -> u32;
   /// Return current length of range-coded bitstream in integer bits
   fn tell(&mut self) -> u32;
   /// Return currrent length of range-coded bitstream in fractional
@@ -110,13 +122,13 @@ pub struct WriterBase<S> {
   /// of actually coding a symbol
   fake_bits_frac: u32,
   /// Use-specific storage
-  s: S
+  s: S,
 }
 
 #[derive(Debug, Clone)]
 pub struct WriterCounter {
   /// Bytes that would be shifted out to date
-  bytes: usize
+  bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -124,7 +136,7 @@ pub struct WriterRecorder {
   /// Storage for tokens
   storage: Vec<(u16, u16, u16)>,
   /// Bytes that would be shifted out to date
-  bytes: usize
+  bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -132,7 +144,7 @@ pub struct WriterEncoder {
   /// A buffer for output bytes with their associated carry flags.
   precarry: Vec<u16>,
   /// The low end of the current range.
-  low: ec_window
+  low: ec_window,
 }
 
 #[derive(Clone)]
@@ -144,11 +156,12 @@ pub struct WriterCheckpoint {
   /// Saved number of values in the current range.
   rng: u16,
   /// Saved number of bits of data in the current value.
-  cnt: i16
+  cnt: i16,
 }
 
 /// Constructor for a counting Writer
 impl WriterCounter {
+  #[inline]
   pub fn new() -> WriterBase<WriterCounter> {
     WriterBase::new(WriterCounter { bytes: 0 })
   }
@@ -156,6 +169,7 @@ impl WriterCounter {
 
 /// Constructor for a recording Writer
 impl WriterRecorder {
+  #[inline]
   pub fn new() -> WriterBase<WriterRecorder> {
     WriterBase::new(WriterRecorder { storage: Vec::new(), bytes: 0 })
   }
@@ -163,6 +177,7 @@ impl WriterRecorder {
 
 /// Constructor for a encoding Writer
 impl WriterEncoder {
+  #[inline]
   pub fn new() -> WriterBase<WriterEncoder> {
     WriterBase::new(WriterEncoder { precarry: Vec::new(), low: 0 })
   }
@@ -171,35 +186,32 @@ impl WriterEncoder {
 /// The Counter stores nothing we write to it, it merely counts the
 /// bit usage like in an Encoder for cost analysis.
 impl StorageBackend for WriterBase<WriterCounter> {
+  #[inline]
   fn store(&mut self, fl: u16, fh: u16, nms: u16) {
     let (_l, r) = self.lr_compute(fl, fh, nms);
     let d = 16 - r.ilog();
-    let mut c = self.cnt;
-    let mut s = c + (d as i16);
+    let mut s = self.cnt + (d as i16);
 
-    if s >= 0 {
-      c += 16;
-      if s >= 8 {
-        self.s.bytes += 1;
-        c -= 8;
-      }
-      self.s.bytes += 1;
-      s = c + (d as i16) - 24;
-    }
+    self.s.bytes += (s >= 0) as usize + (s >= 8) as usize;
+    s -= 8 * ((s >= 0) as i16 + (s >= 8) as i16);
+
     self.rng = r << d;
     self.cnt = s;
   }
+  #[inline]
   fn stream_bytes(&mut self) -> usize {
     self.s.bytes
   }
+  #[inline]
   fn checkpoint(&mut self) -> WriterCheckpoint {
     WriterCheckpoint {
       stream_bytes: self.s.bytes,
       backend_var: 0,
       rng: self.rng,
-      cnt: self.cnt
+      cnt: self.cnt,
     }
   }
+  #[inline]
   fn rollback(&mut self, checkpoint: &WriterCheckpoint) {
     self.rng = checkpoint.rng;
     self.cnt = checkpoint.cnt;
@@ -212,36 +224,33 @@ impl StorageBackend for WriterBase<WriterCounter> {
 /// neds to be able to report bit costs for RDO decisions.  It stores a
 /// pair of mostly-computed range coding values per token recorded.
 impl StorageBackend for WriterBase<WriterRecorder> {
+  #[inline]
   fn store(&mut self, fl: u16, fh: u16, nms: u16) {
     let (_l, r) = self.lr_compute(fl, fh, nms);
     let d = 16 - r.ilog();
-    let mut c = self.cnt;
-    let mut s = c + (d as i16);
+    let mut s = self.cnt + (d as i16);
 
-    if s >= 0 {
-      c += 16;
-      if s >= 8 {
-        self.s.bytes += 1;
-        c -= 8;
-      }
-      self.s.bytes += 1;
-      s = c + (d as i16) - 24;
-    }
+    self.s.bytes += (s >= 0) as usize + (s >= 8) as usize;
+    s -= 8 * ((s >= 0) as i16 + (s >= 8) as i16);
+
     self.rng = r << d;
     self.cnt = s;
     self.s.storage.push((fl, fh, nms));
   }
+  #[inline]
   fn stream_bytes(&mut self) -> usize {
     self.s.bytes
   }
+  #[inline]
   fn checkpoint(&mut self) -> WriterCheckpoint {
     WriterCheckpoint {
       stream_bytes: self.s.bytes,
       backend_var: self.s.storage.len(),
       rng: self.rng,
-      cnt: self.cnt
+      cnt: self.cnt,
     }
   }
+  #[inline]
   fn rollback(&mut self, checkpoint: &WriterCheckpoint) {
     self.rng = checkpoint.rng;
     self.cnt = checkpoint.cnt;
@@ -279,15 +288,17 @@ impl StorageBackend for WriterBase<WriterEncoder> {
     self.rng = r << d;
     self.cnt = s;
   }
+  #[inline]
   fn stream_bytes(&mut self) -> usize {
     self.s.precarry.len()
   }
+  #[inline]
   fn checkpoint(&mut self) -> WriterCheckpoint {
     WriterCheckpoint {
       stream_bytes: self.s.precarry.len(),
       backend_var: self.s.low as usize,
       rng: self.rng,
-      cnt: self.cnt
+      cnt: self.cnt,
     }
   }
   fn rollback(&mut self, checkpoint: &WriterCheckpoint) {
@@ -303,11 +314,20 @@ impl StorageBackend for WriterBase<WriterEncoder> {
 impl<S> WriterBase<S> {
   /// Internal constructor called by the subtypes that implement the
   /// actual encoder and Recorder.
+  #[inline]
   fn new(storage: S) -> Self {
-    #[cfg(feature = "desync_finder")] {
-      WriterBase { rng: 0x8000, cnt: -9, debug: std::env::var_os("RAV1E_DEBUG").is_some(), fake_bits_frac: 0, s: storage }
+    #[cfg(feature = "desync_finder")]
+    {
+      WriterBase {
+        rng: 0x8000,
+        cnt: -9,
+        debug: std::env::var_os("RAV1E_DEBUG").is_some(),
+        fake_bits_frac: 0,
+        s: storage,
+      }
     }
-    #[cfg(not(feature = "desync_finder"))] {
+    #[cfg(not(feature = "desync_finder"))]
+    {
       WriterBase { rng: 0x8000, cnt: -9, fake_bits_frac: 0, s: storage }
     }
   }
@@ -364,47 +384,6 @@ impl<S> WriterBase<S> {
     nbits - l
   }
 
-  // Function to update the CDF for Writer calls that do so.
-  pub fn update_cdf(cdf: &mut [u16], val: u32) {
-    let nsymbs = cdf.len() - 1;
-    let rate = 3 + (nsymbs >> 1).min(2) + (cdf[nsymbs] >> 4) as usize;
-    cdf[nsymbs] += 1 - (cdf[nsymbs] >> 5);
-
-    // Single loop (faster)
-    for (i, v) in cdf[..nsymbs - 1].iter_mut().enumerate() {
-      if i as u32 >= val {
-        *v -= *v >> rate;
-      } else {
-        *v += (32768 - *v) >> rate;
-      }
-    }
-  }
-
-  #[cfg(target_arch = "x86_64")]
-  pub fn update_cdf_4_sse2(cdf: &mut [u16], val: u32) {
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
-    let nsymbs = 4;
-    let rate = 3 + (nsymbs >> 1).min(2) + (cdf[nsymbs] >> 4) as usize;
-    cdf[nsymbs] += 1 - (cdf[nsymbs] >> 5);
-    #[target_feature(enable = "sse2")]
-    unsafe {
-      let val_idx = _mm_set_epi16(0, 0, 0, 0, 3, 2, 1, 0);
-      let val_splat = _mm_set1_epi16(val as i16);
-      let mask = _mm_cmpgt_epi16(val_splat, val_idx);
-      let v = _mm_loadl_epi64(cdf.as_ptr() as *const __m128i);
-      // *v -= *v >> rate;
-      let shrunk_v = _mm_sub_epi16(v, _mm_srl_epi16(v, _mm_cvtsi64_si128(rate as i64)));
-      // *v += (32768 - *v) >> rate;
-      let expanded_v = _mm_add_epi16(v, _mm_srl_epi16(
-        _mm_sub_epi16(_mm_set1_epi16(-32768), v),
-        _mm_cvtsi64_si128(rate as i64)
-      ));
-      let out_v = _mm_or_si128(_mm_andnot_si128(mask, shrunk_v), _mm_and_si128(mask, expanded_v));
-      _mm_storel_epi64(cdf.as_mut_ptr() as *mut __m128i, out_v);
-    }
-  }
-
   fn recenter(r: u32, v: u32) -> u32 {
     if v > (r << 1) {
       v
@@ -443,8 +422,7 @@ impl WriterBase<WriterRecorder> {
   /// storage and into the passed in Writer, which may be an Encoder
   /// or another Recorder.  Clears the Recorder after replay.
   pub fn replay(&mut self, dest: &mut dyn StorageBackend) {
-    for i in 0..self.s.storage.len() {
-      let (fl, fh, nms) = self.s.storage[i];
+    for &(fl, fh, nms) in &self.s.storage {
       dest.store(fl, fh, nms);
     }
     self.rng = 0x8000;
@@ -488,6 +466,7 @@ impl WriterBase<WriterEncoder> {
 
     let mut c = 0;
     let mut offs = self.s.precarry.len();
+    // dynamic allocation: grows during encode
     let mut out = vec![0 as u8; offs];
     while offs > 0 {
       offs -= 1;
@@ -503,7 +482,7 @@ impl WriterBase<WriterEncoder> {
 /// Generic/shared implementation for Writers with StorageBackends (ie, Encoders and Recorders)
 impl<S> Writer for WriterBase<S>
 where
-  WriterBase<S>: StorageBackend
+  WriterBase<S>: StorageBackend,
 {
   /// Encode a single binary value.
   /// `val`: The value to encode (0 or 1).
@@ -538,6 +517,7 @@ where
   ///        `[s > 0 ? cdf[s - 1] : 0, cdf[s])`.
   ///       The values must be monotonically non-decreasing, and the last value
   ///       must be exactly 32768. There should be at most 16 values.
+  #[inline(always)]
   fn symbol(&mut self, s: u32, cdf: &[u16]) {
     debug_assert!(cdf[cdf.len() - 1] == 0);
     let nms = cdf.len() - s as usize;
@@ -565,14 +545,7 @@ where
     }
     self.symbol(s, &cdf[..nsymbs]);
 
-    #[cfg(target_arch = "x86_64")]
-    {
-      if cdf.len() == 5 && cfg!(target_feature = "sse2") {
-        return Self::update_cdf_4_sse2(cdf, s);
-      }
-    }
-
-    Self::update_cdf(cdf, s);
+    update_cdf(cdf, s);
   }
   /// Returns approximate cost for a symbol given a cumulative
   /// distribution function (CDF) table and current write state.
@@ -589,10 +562,13 @@ where
     let fh = cdf[s as usize] as u32 >> EC_PROB_SHIFT;
     let r = if s > 0 {
       let fl = cdf[s as usize - 1] as u32 >> EC_PROB_SHIFT;
-      ((rng * fl) >> (7 - EC_PROB_SHIFT)) - ((rng * fh) >> (7 - EC_PROB_SHIFT)) + EC_MIN_PROB
+      ((rng * fl) >> (7 - EC_PROB_SHIFT)) - ((rng * fh) >> (7 - EC_PROB_SHIFT))
+        + EC_MIN_PROB
     } else {
       let nms1 = cdf.len() as u32 - s - 1;
-      self.rng as u32 - ((rng * fh) >> (7 - EC_PROB_SHIFT)) - nms1 * EC_MIN_PROB
+      self.rng as u32
+        - ((rng * fh) >> (7 - EC_PROB_SHIFT))
+        - nms1 * EC_MIN_PROB
     };
 
     // The 9 here counteracts the offset of -9 baked into cnt.  Don't include a termination bit.
@@ -614,23 +590,16 @@ where
   }
   /// Encode a golomb to the bitstream.
   /// 'level': passed in value to encode
-  fn write_golomb(&mut self, level: u16) {
+  fn write_golomb(&mut self, level: u32) {
     let x = level + 1;
-    let mut i = x;
-    let mut length = 0;
-
-    while i != 0 {
-      i >>= 1;
-      length += 1;
-    }
-    debug_assert!(length > 0);
+    let length = 32 - x.leading_zeros();
 
     for _ in 0..length - 1 {
       self.bit(0);
     }
 
     for i in (0..length).rev() {
-      self.bit((x >> i) & 0x01);
+      self.bit(((x >> i) & 0x01) as u16);
     }
   }
   /// Write a value v in [0, n-1] quasi-uniformly
@@ -671,7 +640,7 @@ where
     let mut i = 0;
     let mut mk = 0;
     loop {
-      let b = if i != 0 {k + i - 1} else {k};
+      let b = if i != 0 { k + i - 1 } else { k };
       let a = 1 << b;
       if n <= mk + 3 * a {
         self.write_quniform(n - mk, v - mk);
@@ -698,7 +667,7 @@ where
     let mut mk = 0;
     let mut bits = 0;
     loop {
-      let b = if i != 0 {k + i - 1} else {k};
+      let b = if i != 0 { k + i - 1 } else { k };
       let a = 1 << b;
       if n <= mk + 3 * a {
         bits += self.count_quniform(n - mk, v - mk);
@@ -727,7 +696,7 @@ where
     if (r << 1) <= n {
       self.write_subexp(n, k, Self::recenter(r, v));
     } else {
-      self.write_subexp(n, k, Self::recenter(n-1-r, n-1-v));
+      self.write_subexp(n, k, Self::recenter(n - 1 - r, n - 1 - v));
     }
   }
   /// Returns QOD_BITRES bits for symbol v in [0, n-1] with parameter k as finite
@@ -736,11 +705,13 @@ where
   /// n: size of interval
   /// k: 'parameter'
   /// r: reference
-  fn count_unsigned_subexp_with_ref(&self, v: u32, n: u32, k: u8, r: u32) -> u32 {
+  fn count_unsigned_subexp_with_ref(
+    &self, v: u32, n: u32, k: u8, r: u32,
+  ) -> u32 {
     if (r << 1) <= n {
       self.count_subexp(n, k, Self::recenter(r, v))
     } else {
-      self.count_subexp(n, k, Self::recenter(n-1-r, n-1-v))
+      self.count_subexp(n, k, Self::recenter(n - 1 - r, n - 1 - v))
     }
   }
   /// Write symbol v in [-(n-1), n-1] with parameter k as finite
@@ -749,8 +720,15 @@ where
   /// n: size of interval
   /// k: 'parameter'
   /// r: reference
-  fn write_signed_subexp_with_ref(&mut self, v: i32, low: i32, high: i32, k: u8, r: i32) {
-    self.write_unsigned_subexp_with_ref((v - low) as u32, (high - low) as u32, k, (r - low) as u32);
+  fn write_signed_subexp_with_ref(
+    &mut self, v: i32, low: i32, high: i32, k: u8, r: i32,
+  ) {
+    self.write_unsigned_subexp_with_ref(
+      (v - low) as u32,
+      (high - low) as u32,
+      k,
+      (r - low) as u32,
+    );
   }
   /// Returns QOD_BITRES bits for symbol v in [-(n-1), n-1] with parameter k as finite
   /// subexponential based on a reference ref also in [-(n-1), n-1].
@@ -758,8 +736,15 @@ where
   /// n: size of interval
   /// k: 'parameter'
   /// r: reference
-  fn count_signed_subexp_with_ref(&self, v: i32, low: i32, high: i32, k: u8, r: i32) -> u32 {
-    self.count_unsigned_subexp_with_ref((v - low) as u32, (high - low) as u32, k, (r - low) as u32)
+  fn count_signed_subexp_with_ref(
+    &self, v: i32, low: i32, high: i32, k: u8, r: i32,
+  ) -> u32 {
+    self.count_unsigned_subexp_with_ref(
+      (v - low) as u32,
+      (high - low) as u32,
+      k,
+      (r - low) as u32,
+    )
   }
   /// Returns the number of bits "used" by the encoded symbols so far.
   /// This same number can be computed in either the encoder or the
@@ -771,7 +756,8 @@ where
   fn tell(&mut self) -> u32 {
     // The 10 here counteracts the offset of -9 baked into cnt, and adds 1 extra
     // bit, which we reserve for terminating the stream.
-    (((self.stream_bytes() * 8) as i32) + (self.cnt as i32) + 10) as u32 + (self.fake_bits_frac >> 8)
+    (((self.stream_bytes() * 8) as i32) + (self.cnt as i32) + 10) as u32
+      + (self.fake_bits_frac >> 8)
   }
   /// Returns the number of bits "used" by the encoded symbols so far.
   /// This same number can be computed in either the encoder or the
@@ -802,13 +788,13 @@ pub trait BCodeWriter {
   fn recenter_finite_nonneg(&mut self, n: u16, r: u16, v: u16) -> u16;
   fn write_quniform(&mut self, n: u16, v: u16) -> Result<(), std::io::Error>;
   fn write_subexpfin(
-    &mut self, n: u16, k: u16, v: u16
+    &mut self, n: u16, k: u16, v: u16,
   ) -> Result<(), std::io::Error>;
   fn write_refsubexpfin(
-    &mut self, n: u16, k: u16, r: i16, v: i16
+    &mut self, n: u16, k: u16, r: i16, v: i16,
   ) -> Result<(), std::io::Error>;
   fn write_s_refsubexpfin(
-    &mut self, n: u16, k: u16, r: i16, v: i16
+    &mut self, n: u16, k: u16, r: i16, v: i16,
   ) -> Result<(), std::io::Error>;
 }
 
@@ -825,7 +811,7 @@ impl<W: io::Write> BCodeWriter for BitWriter<W, BigEndian> {
   }
   fn recenter_finite_nonneg(&mut self, n: u16, r: u16, v: u16) -> u16 {
     /* Recenters a non-negative literal v in [0, n-1] around a
-           reference r also in [0, n-1] */
+    reference r also in [0, n-1] */
     if (r << 1) <= n {
       self.recenter_nonneg(r, v)
     } else {
@@ -833,21 +819,21 @@ impl<W: io::Write> BCodeWriter for BitWriter<W, BigEndian> {
     }
   }
   fn write_quniform(&mut self, n: u16, v: u16) -> Result<(), std::io::Error> {
-    /* Encodes a value v in [0, n-1] quasi-uniformly */
-    if n <= 1 {
-      return Ok(());
-    };
-    let l = 31 ^ ((n - 1) + 1).leading_zeros();
-    let m = (1 << l) - n;
-    if v < m {
-      self.write(l - 1, v)
+    if n > 1 {
+      let l = msb(n as i32) as u8 + 1;
+      let m = (1 << l) - n;
+      if v < m {
+        self.write(l as u32 - 1, v)
+      } else {
+        self.write(l as u32 - 1, m + ((v - m) >> 1))?;
+        self.write(1, (v - m) & 1)
+      }
     } else {
-      self.write(l - 1, m + ((v - m) >> 1))?;
-      self.write_bit(((v - m) & 1) != 0)
+      Ok(())
     }
   }
   fn write_subexpfin(
-    &mut self, n: u16, k: u16, v: u16
+    &mut self, n: u16, k: u16, v: u16,
   ) -> Result<(), std::io::Error> {
     /* Finite subexponential code that codes a symbol v in [0, n-1] with parameter k */
     let mut i = 0;
@@ -870,24 +856,42 @@ impl<W: io::Write> BCodeWriter for BitWriter<W, BigEndian> {
     }
   }
   fn write_refsubexpfin(
-    &mut self, n: u16, k: u16, r: i16, v: i16
+    &mut self, n: u16, k: u16, r: i16, v: i16,
   ) -> Result<(), std::io::Error> {
     /* Finite subexponential code that codes a symbol v in [0, n-1] with
-           parameter k based on a reference ref also in [0, n-1].
-           Recenters symbol around r first and then uses a finite subexponential code. */
+    parameter k based on a reference ref also in [0, n-1].
+    Recenters symbol around r first and then uses a finite subexponential code. */
     let recentered_v = self.recenter_finite_nonneg(n, r as u16, v as u16);
     self.write_subexpfin(n, k, recentered_v)
   }
   fn write_s_refsubexpfin(
-    &mut self, n: u16, k: u16, r: i16, v: i16
+    &mut self, n: u16, k: u16, r: i16, v: i16,
   ) -> Result<(), std::io::Error> {
     /* Signed version of the above function */
     self.write_refsubexpfin(
       (n << 1) - 1,
       k,
       r + (n - 1) as i16,
-      v + (n - 1) as i16
+      v + (n - 1) as i16,
     )
+  }
+}
+
+pub(crate) mod rust {
+  // Function to update the CDF for Writer calls that do so.
+  pub fn update_cdf(cdf: &mut [u16], val: u32) {
+    let nsymbs = cdf.len() - 1;
+    let rate = 3 + (nsymbs >> 1).min(2) + (cdf[nsymbs] >> 4) as usize;
+    cdf[nsymbs] += 1 - (cdf[nsymbs] >> 5);
+
+    // Single loop (faster)
+    for (i, v) in cdf[..nsymbs - 1].iter_mut().enumerate() {
+      if i as u32 >= val {
+        *v -= *v >> rate;
+      } else {
+        *v += (32768 - *v) >> rate;
+      }
+    }
   }
 }
 
@@ -953,7 +957,8 @@ mod test {
       let r = self.rng as u32;
       assert!(self.dif >> (WINDOW_SIZE - 16) < r);
       assert!(32768 <= r);
-      let v = ((r >> 8) * (f >> EC_PROB_SHIFT) >> (7 - EC_PROB_SHIFT)) + EC_MIN_PROB;
+      let v = (((r >> 8) * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT))
+        + EC_MIN_PROB;
       let vw = v << (WINDOW_SIZE - 16);
       let (dif, rng, ret) = if self.dif >= vw {
         (self.dif - vw, r - v, false)
@@ -973,12 +978,14 @@ mod test {
       let mut v = self.rng as u32;
       let mut ret = 0i32;
       let mut u = v;
-      v = (r >> 8) * (icdf[ret as usize] as u32 >> EC_PROB_SHIFT) >> (7 - EC_PROB_SHIFT);
+      v = ((r >> 8) * (icdf[ret as usize] as u32 >> EC_PROB_SHIFT))
+        >> (7 - EC_PROB_SHIFT);
       v += EC_MIN_PROB * (n - ret as u32);
       while c < v {
         u = v;
         ret += 1;
-        v = (r >> 8) * (icdf[ret as usize] as u32 >> EC_PROB_SHIFT) >> (7 - EC_PROB_SHIFT);
+        v = ((r >> 8) * (icdf[ret as usize] as u32 >> EC_PROB_SHIFT))
+          >> (7 - EC_PROB_SHIFT);
         v += EC_MIN_PROB * (n - ret as u32);
       }
       assert!(v < u);
@@ -1041,17 +1048,6 @@ mod test {
     assert_eq!(r.symbol(&cdf), 2);
     assert_eq!(r.symbol(&cdf), 2);
     assert_eq!(r.symbol(&cdf), 2);
-  }
-
-  #[test]
-  fn update_cdf_4_sse2() {
-    let mut cdf = [7296, 3819, 1616, 0, 0];
-    let mut cdf2 = [7296, 3819, 1616, 0, 0];
-    for i in 0..4 {
-      WriterBase::<WriterRecorder>::update_cdf(&mut cdf, i);
-      WriterBase::<WriterRecorder>::update_cdf_4_sse2(&mut cdf2, i);
-      assert_eq!(cdf, cdf2);
-    }
   }
 
   #[test]
