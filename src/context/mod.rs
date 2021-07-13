@@ -183,56 +183,57 @@ pub fn get_mv_class(z: u32, offset: &mut u32) -> usize {
   c
 }
 
-pub fn encode_mv_component(
-  w: &mut dyn Writer, comp: i32, mvcomp: &mut NMVComponent,
-  precision: MvSubpelPrecision,
-) {
-  assert!(comp != 0);
-  assert!(MV_LOW <= comp && comp <= MV_UPP);
-  let mut offset: u32 = 0;
-  let sign: u32 = if comp < 0 { 1 } else { 0 };
-  let mag: u32 = if sign == 1 { -comp as u32 } else { comp as u32 };
-  let mv_class = get_mv_class(mag - 1, &mut offset);
-  let d = offset >> 3; // int mv data
-  let fr = (offset >> 1) & 3; // fractional mv data
-  let hp = offset & 1; // high precision mv data
+impl<'a> ContextWriter<'a> {
+  pub fn encode_mv_component<W: Writer>(
+    &mut self, w: &mut W, comp: i32, axis: usize, precision: MvSubpelPrecision,
+  ) {
+    assert!(comp != 0);
+    assert!(MV_LOW <= comp && comp <= MV_UPP);
+    let mvcomp = &mut self.fc.nmv_context.comps[axis];
+    let mut offset: u32 = 0;
+    let sign: u32 = if comp < 0 { 1 } else { 0 };
+    let mag: u32 = if sign == 1 { -comp as u32 } else { comp as u32 };
+    let mv_class = get_mv_class(mag - 1, &mut offset);
+    let d = offset >> 3; // int mv data
+    let fr = (offset >> 1) & 3; // fractional mv data
+    let hp = offset & 1; // high precision mv data
 
-  // Sign
-  w.symbol_with_update(sign, &mut mvcomp.sign_cdf);
+    // Sign
+    let cdf = &mut mvcomp.sign_cdf;
+    symbol_with_update!(self, w, sign, cdf, 2);
 
-  // Class
-  w.symbol_with_update(mv_class as u32, &mut mvcomp.classes_cdf);
+    // Class
+    symbol_with_update!(self, w, mv_class as u32, &mut mvcomp.classes_cdf);
 
-  // Integer bits
-  if mv_class == MV_CLASS_0 {
-    w.symbol_with_update(d, &mut mvcomp.class0_cdf);
-  } else {
-    let n = mv_class + CLASS0_BITS - 1; // number of bits
-    for i in 0..n {
-      w.symbol_with_update((d >> i) & 1, &mut mvcomp.bits_cdf[i]);
+    // Integer bits
+    if mv_class == MV_CLASS_0 {
+      let cdf = &mut mvcomp.class0_cdf;
+      symbol_with_update!(self, w, d, cdf, 2);
+    } else {
+      let n = mv_class + CLASS0_BITS - 1; // number of bits
+      for i in 0..n {
+        let cdf = &mut mvcomp.bits_cdf[i];
+        symbol_with_update!(self, w, (d >> i) & 1, cdf, 2);
+      }
     }
-  }
-  // Fractional bits
-  if precision > MvSubpelPrecision::MV_SUBPEL_NONE {
-    w.symbol_with_update(
-      fr,
-      if mv_class == MV_CLASS_0 {
+    // Fractional bits
+    if precision > MvSubpelPrecision::MV_SUBPEL_NONE {
+      let cdf = if mv_class == MV_CLASS_0 {
         &mut mvcomp.class0_fp_cdf[d as usize]
       } else {
         &mut mvcomp.fp_cdf
-      },
-    );
-  }
+      };
+      symbol_with_update!(self, w, fr, cdf, 4);
+    }
 
-  // High precision bit
-  if precision > MvSubpelPrecision::MV_SUBPEL_LOW_PRECISION {
-    w.symbol_with_update(
-      hp,
-      if mv_class == MV_CLASS_0 {
+    // High precision bit
+    if precision > MvSubpelPrecision::MV_SUBPEL_LOW_PRECISION {
+      let cdf = if mv_class == MV_CLASS_0 {
         &mut mvcomp.class0_hp_cdf
       } else {
         &mut mvcomp.hp_cdf
-      },
-    );
+      };
+      symbol_with_update!(self, w, hp, cdf, 2);
+    }
   }
 }

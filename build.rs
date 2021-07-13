@@ -80,23 +80,32 @@ fn build_nasm_files() {
   config_file.write(b"	%define PIC 1\n").unwrap();
   config_file.write(b" %define STACK_ALIGNMENT 16\n").unwrap();
   config_file.write(b" %define HAVE_AVX512ICL 1\n").unwrap();
-  if env::var("CARGO_CFG_TARGET_OS").unwrap() == "macos" {
+  if env::var("CARGO_CFG_TARGET_VENDOR").unwrap() == "apple" {
     config_file.write(b" %define PREFIX 1\n").unwrap();
   }
 
   let asm_files = &[
-    "src/x86/ipred.asm",
-    "src/x86/ipred_ssse3.asm",
-    "src/x86/itx.asm",
-    "src/x86/itx_ssse3.asm",
-    "src/x86/mc.asm",
-    "src/x86/mc_ssse3.asm",
+    "src/x86/ipred_avx2.asm",
+    "src/x86/ipred_sse.asm",
+    "src/x86/ipred16_avx2.asm",
+    "src/x86/itx_avx2.asm",
+    "src/x86/itx_sse.asm",
+    "src/x86/itx16_avx2.asm",
+    "src/x86/looprestoration_avx2.asm",
+    "src/x86/looprestoration16_avx2.asm",
+    "src/x86/mc_avx2.asm",
+    "src/x86/mc16_avx2.asm",
+    "src/x86/mc_avx512.asm",
+    "src/x86/mc_sse.asm",
     "src/x86/me.asm",
     "src/x86/sad_sse2.asm",
     "src/x86/sad_avx.asm",
     "src/x86/satd.asm",
     "src/x86/sse.asm",
-    "src/x86/cdef.asm",
+    "src/x86/cdef_rav1e.asm",
+    "src/x86/cdef_sse.asm",
+    "src/x86/cdef16_avx2.asm",
+    "src/x86/cdef16_sse.asm",
     "src/x86/tables.asm",
   ];
 
@@ -106,14 +115,22 @@ fn build_nasm_files() {
     let mut config_include_arg = String::from("-I");
     config_include_arg.push_str(&out_dir);
     config_include_arg.push('/');
-    nasm_rs::compile_library_args(
-      "rav1easm",
-      asm_files,
-      &[&config_include_arg, "-Isrc/"],
-    )
-    .expect(
+    let mut nasm = nasm_rs::Build::new();
+    for file in asm_files {
+      nasm.file(file);
+    }
+    nasm.flag(&config_include_arg);
+    nasm.flag("-Isrc/");
+    let obj = nasm.compile_objects().expect(
       "NASM build failed. Make sure you have nasm installed. https://nasm.us",
     );
+    // cc is better at finding the correct archiver
+    let mut cc = cc::Build::new();
+    for o in obj {
+      cc.object(o);
+    }
+    cc.compile("rav1easm");
+
     std::fs::write(hash_path, &hash[..]).unwrap();
   } else {
     println!("cargo:rustc-link-search={}", out_dir);
@@ -131,6 +148,9 @@ fn build_asm_files() {
 
   let dest_path = Path::new(&out_dir).join("config.h");
   let mut config_file = File::create(&dest_path).unwrap();
+  if env::var("CARGO_CFG_TARGET_VENDOR").unwrap() == "apple" {
+    config_file.write(b" #define PREFIX 1\n").unwrap();
+  }
   config_file.write(b" #define PRIVATE_PREFIX rav1e_\n").unwrap();
   config_file.write(b" #define ARCH_AARCH64 1\n").unwrap();
   config_file.write(b" #define ARCH_ARM 0\n").unwrap();
@@ -169,8 +189,9 @@ fn build_asm_files() {
 }
 
 fn rustc_version_check() {
-  // This should match the version in .travis.yml
-  const REQUIRED_VERSION: &str = "1.36.0";
+  // This should match the version in the CI
+  // Make sure to updated README.md when this changes.
+  const REQUIRED_VERSION: &str = "1.51.0";
   if version().unwrap() < Version::parse(REQUIRED_VERSION).unwrap() {
     eprintln!("rav1e requires rustc >= {}.", REQUIRED_VERSION);
     exit(1);

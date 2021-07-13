@@ -21,9 +21,9 @@ use crate::encoder::FrameInvariants;
 use crate::frame::{
   AsRegion, Frame, Plane, PlaneConfig, PlaneOffset, PlaneSlice,
 };
-use crate::hawktracer::*;
 use crate::tiling::{Area, PlaneRegion, PlaneRegionMut, Rect};
 use crate::util::{clamp, CastFromPrimitive, ILog, Pixel};
+use rust_hawktracer::*;
 
 use crate::api::SGRComplexityLevel;
 use std::cmp;
@@ -83,7 +83,7 @@ const SGRPROJ_ALL_SETS: &[u8] =
 // parameters as non-zero. The other two are distinguishable by which of the
 // two parameters is zero. There are an even number of each of these groups and
 // the non-zero parameters grow as the indices increase. This array uses the
-// 1nd, 3rd, ... smallest params of each group.
+// 1st, 3rd, ... smallest params of each group.
 const SGRPROJ_REDUCED_SETS: &[u8] = &[1, 3, 5, 7, 9, 11, 13, 15];
 
 pub fn get_sgr_sets(complexity: SGRComplexityLevel) -> &'static [u8] {
@@ -1367,15 +1367,15 @@ impl RestorationState {
     let mut y_unit_size = 1 << (RESTORATION_TILESIZE_MAX_LOG2 - lrf_y_shift);
     let mut uv_unit_size = 1 << (RESTORATION_TILESIZE_MAX_LOG2 - lrf_uv_shift);
 
+    let tiling = fi.sequence.tiling;
     // Right now we defer to tiling setup: don't choose an LRU size
     // large enough that a tile is not an integer number of LRUs
     // wide/high.
-    if fi.tiling.cols > 1 || fi.tiling.rows > 1 {
+    if tiling.cols > 1 || tiling.rows > 1 {
       // despite suggestions to the contrary, tiles can be
       // non-powers-of-2.
-      let trailing_h_zeros = fi.tiling.tile_width_sb.trailing_zeros() as usize;
-      let trailing_v_zeros =
-        fi.tiling.tile_height_sb.trailing_zeros() as usize;
+      let trailing_h_zeros = tiling.tile_width_sb.trailing_zeros() as usize;
+      let trailing_v_zeros = tiling.tile_height_sb.trailing_zeros() as usize;
       let tile_aligned_y_unit_size =
         1 << (y_sb_log2 + trailing_h_zeros.min(trailing_v_zeros));
       let tile_aligned_uv_h_unit_size = 1 << (uv_sb_h_log2 + trailing_h_zeros);

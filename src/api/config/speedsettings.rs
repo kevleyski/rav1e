@@ -73,8 +73,10 @@ pub struct SpeedSettings {
   /// Enabled is slower.
   pub non_square_partition: bool,
 
-  /// Use segmentation.
-  pub enable_segmentation: bool,
+  /// Search level for segmentation.
+  ///
+  /// Full search is at least twice as slow.
+  pub segmentation: SegmentationLevel,
 
   /// Enable tx split for inter mode block.
   pub enable_inter_tx_split: bool,
@@ -114,7 +116,7 @@ impl Default for SpeedSettings {
       sgr_complexity: SGRComplexityLevel::Full,
       use_satd_subpel: true,
       non_square_partition: true,
-      enable_segmentation: true,
+      segmentation: SegmentationLevel::Full,
       enable_inter_tx_split: false,
       fine_directional_intra: false,
     }
@@ -125,21 +127,23 @@ impl SpeedSettings {
   /// Set the speed setting according to a numeric speed preset.
   ///
   /// The speed settings vary depending on speed value from 0 to 10.
-  /// - 10 (fastest): min block size 64x64, reduced TX set, fast deblock, fast scenechange detection.
+  /// - 10 (fastest): fixed block size 32x32, reduced TX set, fast deblock, fast scenechange detection.
   /// - 9: min block size 32x32, reduced TX set, fast deblock.
   /// - 8: min block size 8x8, reduced TX set, fast deblock.
   /// - 7: min block size 8x8, reduced TX set.
   /// - 6 (default): min block size 8x8, reduced TX set, complex pred modes for keyframes.
   /// - 5: min block size 8x8, complex pred modes for keyframes, RDO TX decision.
-  /// - 4: min block size 8x8, complex pred modes for keyframes, RDO TX decision, full SGR search.
+  /// - 4: min block size 8x8, complex pred modes for keyframes, RDO TX decision, include near MVs,
+  ///        full SGR search.
   /// - 3: min block size 8x8, complex pred modes for keyframes, RDO TX decision, include near MVs,
-  ///        full SGR search.
-  /// - 2: min block size 4x4, complex pred modes, RDO TX decision, include near MVs,
-  ///        full SGR search.
-  /// - 1: min block size 4x4, complex pred modes, RDO TX decision, include near MVs,
   ///        bottom-up encoding, full SGR search.
-  /// - 0 (slowest): min block size 4x4, complex pred modes, RDO TX decision, include near MVs,
+  /// - 2: min block size 4x4, complex pred modes, RDO TX decision, include near MVs,
+  ///        bottom-up encoding, full SGR search.
+  /// - 1: min block size 4x4, complex pred modes, RDO TX decision, include near MVs,
   ///        bottom-up encoding with non-square partitions everywhere, full SGR search.
+  /// - 0 (slowest): min block size 4x4, complex pred modes, RDO TX decision, include near MVs,
+  ///        bottom-up encoding with non-square partitions everywhere, full SGR search,
+  ///        full segmentation search.
   pub fn from_preset(speed: usize) -> Self {
     SpeedSettings {
       partition_range: Self::partition_range_preset(speed),
@@ -159,7 +163,7 @@ impl SpeedSettings {
       sgr_complexity: Self::sgr_complexity_preset(speed),
       use_satd_subpel: Self::use_satd_subpel(speed),
       non_square_partition: Self::non_square_partition_preset(speed),
-      enable_segmentation: Self::enable_segmentation_preset(speed),
+      segmentation: Self::segmentation_preset(speed),
       enable_inter_tx_split: Self::enable_inter_tx_split_preset(speed),
       fine_directional_intra: Self::fine_directional_intra_preset(speed),
     }
@@ -206,7 +210,18 @@ impl SpeedSettings {
   }
 
   const fn encode_bottomup_preset(speed: usize) -> bool {
-    speed <= 1
+    speed <= 3
+  }
+
+  /// Set default rdo-lookahead-frames for different speed settings
+  pub fn rdo_lookahead_frames(speed: usize) -> usize {
+    match speed {
+      9..=10 => 10,
+      6..=8 => 20,
+      3..=5 => 30,
+      0..=2 => 40,
+      _ => 40,
+    }
   }
 
   const fn rdo_tx_decision_preset(speed: usize) -> bool {
@@ -224,7 +239,7 @@ impl SpeedSettings {
   }
 
   const fn include_near_mvs_preset(speed: usize) -> bool {
-    speed <= 3
+    speed <= 4
   }
 
   const fn no_scene_detection_preset(_speed: usize) -> bool {
@@ -256,14 +271,15 @@ impl SpeedSettings {
   }
 
   const fn non_square_partition_preset(speed: usize) -> bool {
-    speed == 0
+    speed <= 1
   }
 
-  // FIXME: this is currently only enabled at speed 0 because choosing a segment
-  // requires doing RDO, but once that is replaced by a less bruteforce
-  // solution we should be able to enable segmentation at all speeds.
-  const fn enable_segmentation_preset(speed: usize) -> bool {
-    speed == 0
+  fn segmentation_preset(speed: usize) -> SegmentationLevel {
+    if speed == 0 {
+      SegmentationLevel::Full
+    } else {
+      SegmentationLevel::Simple
+    }
   }
 
   // FIXME: With unknown reasons, inter_tx_split does not work if reduced_tx_set is false
@@ -358,6 +374,40 @@ impl fmt::Display for SGRComplexityLevel {
       match self {
         SGRComplexityLevel::Full => "Full",
         SGRComplexityLevel::Reduced => "Reduced",
+      }
+    )
+  }
+}
+
+/// Search level for segmentation
+#[derive(
+  Clone,
+  Copy,
+  Debug,
+  PartialOrd,
+  PartialEq,
+  FromPrimitive,
+  Serialize,
+  Deserialize,
+)]
+pub enum SegmentationLevel {
+  /// No segmentation is signalled.
+  Disabled,
+  /// Segmentation index is derived from source statistics.
+  Simple,
+  /// Search all segmentation indices.
+  Full,
+}
+
+impl fmt::Display for SegmentationLevel {
+  fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+    write!(
+      f,
+      "{}",
+      match self {
+        SegmentationLevel::Disabled => "Disabled",
+        SegmentationLevel::Simple => "Simple",
+        SegmentationLevel::Full => "Full",
       }
     )
   }

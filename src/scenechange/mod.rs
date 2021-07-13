@@ -8,21 +8,23 @@
 // PATENTS file, you can obtain it at www.aomedia.org/license/patent.
 
 use crate::api::lookahead::*;
-use crate::api::{EncoderConfig, InterConfig};
+use crate::api::EncoderConfig;
 use crate::cpu_features::CpuFeatureLevel;
 use crate::encoder::Sequence;
 use crate::frame::*;
-use crate::hawktracer::*;
 use crate::util::{CastFromPrimitive, Pixel};
+use rust_hawktracer::*;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 /// Runs keyframe detection on frames from the lookahead queue.
-pub(crate) struct SceneChangeDetector {
+pub struct SceneChangeDetector {
   /// Minimum average difference between YUV deltas that will trigger a scene change.
   threshold: u64,
   /// Fast scene cut detection mode, uses simple SAD instead of encoder cost estimates.
   fast_mode: bool,
+  /// Determine whether or not short scene flashes should be excluded
+  exclude_scene_flashes: bool,
   /// Frames that cannot be marked as keyframes due to the algorithm excluding them.
   /// Storing the frame numbers allows us to avoid looking back more than one frame.
   excluded_frames: BTreeSet<u64>,
@@ -31,13 +33,15 @@ pub(crate) struct SceneChangeDetector {
   /// The CPU feature level to be used.
   cpu_feature_level: CpuFeatureLevel,
   encoder_config: EncoderConfig,
-  sequence: Sequence,
+  lookahead_distance: usize,
+  sequence: Arc<Sequence>,
 }
 
 impl SceneChangeDetector {
   pub fn new(
-    bit_depth: usize, fast_mode: bool, cpu_feature_level: CpuFeatureLevel,
-    encoder_config: EncoderConfig, sequence: Sequence,
+    encoder_config: EncoderConfig, cpu_feature_level: CpuFeatureLevel,
+    lookahead_distance: usize, sequence: Arc<Sequence>,
+    exclude_scene_flashes: bool,
   ) -> Self {
     // This implementation is based on a Python implementation at
     // https://pyscenedetect.readthedocs.io/en/latest/reference/detection-methods/.
@@ -51,13 +55,19 @@ impl SceneChangeDetector {
     //
     // This threshold is only used for the fast scenecut implementation.
     const BASE_THRESHOLD: u64 = 12;
+    let bit_depth = encoder_config.bit_depth;
+    let fast_mode = encoder_config.speed_settings.fast_scene_detection
+      || encoder_config.low_latency;
+
     Self {
       threshold: BASE_THRESHOLD * bit_depth as u64 / 8,
       fast_mode,
+      exclude_scene_flashes,
       excluded_frames: BTreeSet::new(),
       bit_depth,
       cpu_feature_level,
       encoder_config,
+      lookahead_distance,
       sequence,
     }
   }
@@ -73,29 +83,30 @@ impl SceneChangeDetector {
   #[hawktracer(analyze_next_frame)]
   pub fn analyze_next_frame<T: Pixel>(
     &mut self, frame_set: &[Arc<Frame<T>>], input_frameno: u64,
-    previous_keyframe: u64, config: &EncoderConfig, inter_cfg: &InterConfig,
+    previous_keyframe: u64,
   ) -> bool {
     // Find the distance to the previous keyframe.
     let distance = input_frameno - previous_keyframe;
 
-    // Handle minimum and maximum key frame intervals.
-    if distance < config.min_key_frame_interval {
+    if frame_set.len() < 2 {
       return false;
     }
-    if distance >= config.max_key_frame_interval {
+
+    // Handle minimum and maximum key frame intervals.
+    if distance < self.encoder_config.min_key_frame_interval {
+      return false;
+    }
+    if distance >= self.encoder_config.max_key_frame_interval {
       return true;
     }
 
-    if config.speed_settings.no_scene_detection {
+    if self.encoder_config.speed_settings.no_scene_detection {
       return false;
     }
 
-    self.exclude_scene_flashes(
-      frame_set,
-      input_frameno,
-      inter_cfg,
-      previous_keyframe,
-    );
+    if self.exclude_scene_flashes {
+      self.exclude_scene_flashes(frame_set, input_frameno, previous_keyframe);
+    }
 
     self.is_key_frame(
       frame_set[0].clone(),
@@ -136,17 +147,15 @@ impl SceneChangeDetector {
   /// Saves excluded frame numbers in `self.excluded_frames`.
   fn exclude_scene_flashes<T: Pixel>(
     &mut self, frame_subset: &[Arc<Frame<T>>], frameno: u64,
-    inter_cfg: &InterConfig, previous_keyframe: u64,
+    previous_keyframe: u64,
   ) {
-    let lookahead_distance = inter_cfg.keyframe_lookahead_distance() as usize;
+    let lookahead_distance = self.lookahead_distance;
 
     if frame_subset.len() - 1 < lookahead_distance {
       // Don't add a keyframe in the last frame pyramid.
       // It's effectively the same as a scene flash,
       // and really wasteful for compression.
-      for frame in
-        frameno..=(frameno + inter_cfg.keyframe_lookahead_distance())
-      {
+      for frame in frameno..=(frameno + lookahead_distance as u64) {
         self.excluded_frames.insert(frame);
       }
       return;
@@ -240,22 +249,29 @@ impl SceneChangeDetector {
         has_scenecut: delta >= threshold,
       }
     } else {
-      let intra_costs =
-        estimate_intra_costs(&*frame2, self.bit_depth, self.cpu_feature_level);
-      let intra_cost = intra_costs.iter().map(|&cost| cost as u64).sum::<u64>()
-        as f64
-        / intra_costs.len() as f64;
-
-      let inter_costs = estimate_inter_costs(
-        frame2,
-        frame1,
-        self.bit_depth,
-        self.encoder_config,
-        self.sequence,
+      let frame2_ref2 = Arc::clone(&frame2);
+      let (intra_cost, inter_cost) = crate::rayon::join(
+        move || {
+          let intra_costs = estimate_intra_costs(
+            &*frame2,
+            self.bit_depth,
+            self.cpu_feature_level,
+          );
+          intra_costs.iter().map(|&cost| cost as u64).sum::<u64>() as f64
+            / intra_costs.len() as f64
+        },
+        move || {
+          let inter_costs = estimate_inter_costs(
+            frame2_ref2,
+            frame1,
+            self.bit_depth,
+            self.encoder_config,
+            self.sequence.clone(),
+          );
+          inter_costs.iter().map(|&cost| cost as u64).sum::<u64>() as f64
+            / inter_costs.len() as f64
+        },
       );
-      let inter_cost = inter_costs.iter().map(|&cost| cost as u64).sum::<u64>()
-        as f64
-        / inter_costs.len() as f64;
 
       // Sliding scale, more likely to choose a keyframe
       // as we get farther from the last keyframe.

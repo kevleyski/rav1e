@@ -11,10 +11,8 @@ use thiserror::Error;
 
 use std::sync::Arc;
 
-use crate::api::{ChromaSampling, Context, ContextInner};
-use crate::cpu_features::CpuFeatureLevel;
+use crate::api::{ChromaSampling, Context, ContextInner, PixelRange};
 use crate::rayon::{ThreadPool, ThreadPoolBuilder};
-use crate::tiling::TilingInfo;
 use crate::util::Pixel;
 
 mod encoder;
@@ -26,6 +24,8 @@ pub use rate::{RateControlConfig, RateControlSummary};
 
 mod speedsettings;
 pub use speedsettings::*;
+
+pub use crate::tiling::TilingInfo;
 
 /// Enumeration of possible invalid configuration errors.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Error)]
@@ -111,6 +111,10 @@ pub enum InvalidConfig {
   /// The configuration
   #[error("Mismatch in the rate control configuration")]
   RateControlConfigurationMismatch,
+
+  /// The color configuration mismatches AV1 constraints.
+  #[error("Mismatch in the color configuration")]
+  ColorConfigurationMismatch,
 }
 
 /// Contains the encoder configuration.
@@ -124,6 +128,9 @@ pub struct Config {
   pub(crate) threads: usize,
   /// Shared thread pool
   pub(crate) pool: Option<Arc<ThreadPool>>,
+  #[cfg(feature = "unstable")]
+  /// Number of parallel encoding slots
+  pub(crate) slots: usize,
 }
 
 impl Config {
@@ -147,6 +154,9 @@ impl Config {
   ///
   /// The threadpool is shared across all the different parallel
   /// components in the encoder.
+  ///
+  /// If it is left unset, the encoder will use the default global
+  /// threadpool provided by Rayon instead.
   pub fn with_threads(mut self, threads: usize) -> Self {
     self.threads = threads;
     self
@@ -162,8 +172,17 @@ impl Config {
 
   #[cfg(feature = "unstable")]
   /// Use the provided threadpool
+  ///
+  /// It takes priority over `with_threads()`
   pub fn with_thread_pool(mut self, pool: Arc<ThreadPool>) -> Self {
     self.pool = Some(pool);
+    self
+  }
+
+  #[cfg(feature = "unstable")]
+  /// Set the maximum number of GOPs to encode in parallel
+  pub fn with_parallel_gops(mut self, slots: usize) -> Self {
+    self.slots = slots;
     self
   }
 }
@@ -190,12 +209,6 @@ impl Config {
     );
 
     self.validate()?;
-
-    // Because we don't have a FrameInvariants yet,
-    // this is the only way to get the CpuFeatureLevel in use.
-    // Since we only call this once, this shouldn't cause
-    // performance issues.
-    info!("CPU Feature Level: {}", CpuFeatureLevel::default());
 
     let mut config = self.enc;
     config.set_key_frame_interval(
@@ -225,6 +238,21 @@ impl Config {
 
     Ok(inner)
   }
+
+  /// Create a new threadpool with this configuration if set,
+  /// or return `None` if global threadpool should be used instead.
+  pub(crate) fn new_thread_pool(&self) -> Option<Arc<ThreadPool>> {
+    if let Some(ref p) = self.pool {
+      Some(p.clone())
+    } else if self.threads != 0 {
+      let pool =
+        ThreadPoolBuilder::new().num_threads(self.threads).build().unwrap();
+      Some(Arc::new(pool))
+    } else {
+      None
+    }
+  }
+
   /// Creates a [`Context`] with this configuration.
   ///
   /// # Examples
@@ -242,14 +270,8 @@ impl Config {
   /// [`Context`]: struct.Context.html
   pub fn new_context<T: Pixel>(&self) -> Result<Context<T>, InvalidConfig> {
     let inner = self.new_inner()?;
-    let config = inner.config;
-    let pool = if let Some(ref p) = self.pool {
-      p.clone()
-    } else {
-      let pool =
-        ThreadPoolBuilder::new().num_threads(self.threads).build().unwrap();
-      Arc::new(pool)
-    };
+    let config = *inner.config;
+    let pool = self.new_thread_pool();
 
     Ok(Context { is_flushing: false, inner, pool, config })
   }
@@ -260,10 +282,16 @@ impl Config {
 
     let config = &self.enc;
 
-    if config.width < 16 || config.width > u16::max_value() as usize {
+    if (config.still_picture && config.width < 1)
+      || (!config.still_picture && config.width < 16)
+      || config.width > u16::max_value() as usize
+    {
       return Err(InvalidWidth(config.width));
     }
-    if config.height < 16 || config.height > u16::max_value() as usize {
+    if (config.still_picture && config.height < 1)
+      || (!config.still_picture && config.height < 16)
+      || config.height > u16::max_value() as usize
+    {
       return Err(InvalidHeight(config.height));
     }
 
@@ -327,7 +355,7 @@ impl Config {
     }
 
     if let Some(delay) = config.reservoir_frame_delay {
-      if delay < 12 || delay > 131_072 {
+      if !(12..=131_072).contains(&delay) {
         return Err(InvalidReservoirFrameDelay(delay));
       }
     }
@@ -340,6 +368,20 @@ impl Config {
       return Err(InvalidOptionWithStillPicture("enable_timing_info"));
     }
 
+    // <https://aomediacodec.github.io/av1-spec/#color-config-syntax>
+    if let Some(color_description) = config.color_description {
+      if config.chroma_sampling != ChromaSampling::Cs400
+        && color_description.is_srgb_triple()
+      {
+        if config.pixel_range != PixelRange::Full {
+          return Err(ColorConfigurationMismatch);
+        }
+        if config.chroma_sampling != ChromaSampling::Cs444 {
+          return Err(ColorConfigurationMismatch);
+        }
+      }
+    }
+
     // TODO: add more validation
     let rc = &self.rate_control;
 
@@ -348,5 +390,16 @@ impl Config {
     }
 
     Ok(())
+  }
+
+  /// Provide the tiling information for the current Config
+  ///
+  /// Useful for reporting and debugging.
+  pub fn tiling_info(&self) -> Result<TilingInfo, InvalidConfig> {
+    self.validate()?;
+
+    let seq = crate::encoder::Sequence::new(&self.enc);
+
+    Ok(seq.tiling)
   }
 }

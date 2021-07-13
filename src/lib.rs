@@ -46,6 +46,7 @@
 #![allow(clippy::wrong_self_convention)]
 #![allow(clippy::missing_safety_doc)]
 #![allow(clippy::comparison_chain)]
+#![allow(clippy::upper_case_acronyms)]
 #![warn(clippy::expl_impl_clone_on_copy)]
 #![warn(clippy::linkedlist)]
 #![warn(clippy::map_flatten)]
@@ -75,16 +76,6 @@ mod serialize {
   }
 }
 
-mod hawktracer {
-  cfg_if::cfg_if! {
-    if #[cfg(feature="tracing")] {
-      pub use rust_hawktracer::*;
-    } else {
-      pub use noop_proc_macro::hawktracer;
-    }
-  }
-}
-
 mod wasm_bindgen {
   cfg_if::cfg_if! {
     if #[cfg(feature="wasm")] {
@@ -97,7 +88,7 @@ mod wasm_bindgen {
 
 mod rayon {
   cfg_if::cfg_if! {
-    if #[cfg(target_arch="wasm32")] {
+    if #[cfg(all(target_arch="wasm32", not(target_feature = "atomics")))] {
       pub struct ThreadPoolBuilder ();
       impl ThreadPoolBuilder {
         pub fn new() -> ThreadPoolBuilder {
@@ -157,6 +148,49 @@ mod rayon {
             }
         }
 
+        pub trait ParallelIterator: Iterator {
+          fn flat_map_iter<U, F>(self, f: F) -> std::iter::FlatMap<Self, U, F>
+          where
+            Self: Sized,
+            U: IntoIterator,
+            F: FnMut(<Self as Iterator>::Item) -> U,
+          {
+            self.flat_map(f)
+          }
+        }
+
+        impl<I: Iterator> ParallelIterator for I {}
+      }
+
+      pub mod slice {
+        pub trait ParallelSlice<T: Sync> {
+          fn par_chunks_exact(
+            &self, chunk_size: usize,
+          ) -> std::slice::ChunksExact<'_, T>;
+        }
+
+        impl<T: Sync> ParallelSlice<T> for [T] {
+          #[inline]
+          fn par_chunks_exact(
+            &self, chunk_size: usize,
+          ) -> std::slice::ChunksExact<'_, T> {
+            self.chunks_exact(chunk_size)
+          }
+        }
+      }
+
+      pub mod prelude {
+        pub use super::iter::*;
+        pub use super::slice::*;
+      }
+
+      pub fn join<A, B, RA, RB>(oper_a: A, oper_b: B) -> (RA, RB)
+      where
+        A: FnOnce() -> RA + Send,
+        B: FnOnce() -> RB + Send,
+        RA: Send,
+        RB: Send {
+        (oper_a(), oper_b())
       }
     } else {
       pub use rayon::*;
@@ -194,6 +228,9 @@ mod me;
 mod rate;
 mod recon_intra;
 mod scan_order;
+#[cfg(feature = "scenechange")]
+pub mod scenechange;
+#[cfg(not(feature = "scenechange"))]
 mod scenechange;
 mod segmentation;
 mod stats;
@@ -215,7 +252,7 @@ pub use crate::util::{CastFromPrimitive, Pixel, PixelType};
 /// Commonly used types and traits.
 pub mod prelude {
   pub use crate::api::*;
-  pub use crate::encoder::Tune;
+  pub use crate::encoder::{Sequence, Tune};
   pub use crate::frame::{
     Frame, FrameParameters, FrameTypeOverride, Plane, PlaneConfig,
   };
@@ -243,6 +280,7 @@ pub mod config {
     Config, EncoderConfig, InvalidConfig, PredictionModesSetting,
     RateControlConfig, RateControlError, RateControlSummary, SpeedSettings,
   };
+  pub use crate::cpu_features::CpuFeatureLevel;
 }
 
 /// Version information

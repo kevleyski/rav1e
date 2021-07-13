@@ -12,6 +12,7 @@ use rav1e::data::EncoderStats;
 use rav1e::prelude::Rational;
 use rav1e::prelude::*;
 use rav1e::{Packet, Pixel};
+use rust_hawktracer::*;
 use std::fmt;
 use std::time::Instant;
 
@@ -29,6 +30,7 @@ pub struct FrameSummary {
   pub enc_stats: EncoderStats,
 }
 
+#[hawktracer(build_frame_summary)]
 pub fn build_frame_summary<T: Pixel>(
   packets: Packet<T>, bit_depth: usize, chroma_sampling: ChromaSampling,
   metrics_cli: MetricsEnabled,
@@ -740,6 +742,7 @@ pub enum MetricsEnabled {
   All,
 }
 
+#[hawktracer(calculate_frame_metrics)]
 pub fn calculate_frame_metrics<T: Pixel>(
   frame1: &Frame<T>, frame2: &Frame<T>, bit_depth: usize, cs: ChromaSampling,
   metrics: MetricsEnabled,
@@ -758,20 +761,23 @@ pub fn calculate_frame_metrics<T: Pixel>(
 
   match metrics {
     MetricsEnabled::None => QualityMetrics::default(),
-    MetricsEnabled::Psnr => {
-      let mut metrics = QualityMetrics::default();
-      metrics.psnr =
-        Some(psnr::calculate_frame_psnr(&frame1_info, &frame2_info).unwrap());
-      metrics
-    }
+    MetricsEnabled::Psnr => QualityMetrics {
+      psnr: Some(
+        psnr::calculate_frame_psnr(&frame1_info, &frame2_info).unwrap(),
+      ),
+      ..Default::default()
+    },
     MetricsEnabled::All => {
-      let mut metrics = QualityMetrics::default();
-      metrics.psnr =
-        Some(psnr::calculate_frame_psnr(&frame1_info, &frame2_info).unwrap());
-      metrics.psnr_hvs = Some(
-        psnr_hvs::calculate_frame_psnr_hvs(&frame1_info, &frame2_info)
-          .unwrap(),
-      );
+      let mut metrics = QualityMetrics {
+        psnr: Some(
+          psnr::calculate_frame_psnr(&frame1_info, &frame2_info).unwrap(),
+        ),
+        psnr_hvs: Some(
+          psnr_hvs::calculate_frame_psnr_hvs(&frame1_info, &frame2_info)
+            .unwrap(),
+        ),
+        ..Default::default()
+      };
       let ssim = ssim::calculate_frame_ssim(&frame1_info, &frame2_info);
       metrics.ssim = Some(ssim.unwrap());
       let ms_ssim = ssim::calculate_frame_msssim(&frame1_info, &frame2_info);

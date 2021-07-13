@@ -8,18 +8,18 @@
 // PATENTS file, you can obtain it at www.aomedia.org/license/patent.
 
 use crate::frame::*;
-use crate::hawktracer::*;
+use crate::rdo::{ssim_boost, DistortionScale};
 use crate::tiling::*;
 use crate::util::*;
+use itertools::izip;
+use rust_hawktracer::*;
 
 #[derive(Debug, Default, Clone)]
 pub struct ActivityMask {
-  variances: Vec<f64>,
+  variances: Box<[u32]>,
   // Width and height of the original frame that is masked
   width: usize,
   height: usize,
-  // Side of unit (square) activity block in log2
-  granularity: usize,
 }
 
 impl ActivityMask {
@@ -27,91 +27,77 @@ impl ActivityMask {
   pub fn from_plane<T: Pixel>(luma_plane: &Plane<T>) -> ActivityMask {
     let PlaneConfig { width, height, .. } = luma_plane.cfg;
 
-    let granularity = 3;
+    // Width and height are padded to 8×8 block size.
+    let w_in_imp_b = width.align_power_of_two_and_shift(3);
+    let h_in_imp_b = height.align_power_of_two_and_shift(3);
 
     let aligned_luma = Rect {
       x: 0_isize,
       y: 0_isize,
-      width: (width >> granularity) << granularity,
-      height: (height >> granularity) << granularity,
+      width: w_in_imp_b << 3,
+      height: h_in_imp_b << 3,
     };
     let luma = PlaneRegion::new(luma_plane, aligned_luma);
 
-    let mut variances =
-      Vec::with_capacity((height >> granularity) * (width >> granularity));
+    let mut variances = Vec::with_capacity(w_in_imp_b * h_in_imp_b);
 
-    for y in 0..height >> granularity {
-      for x in 0..width >> granularity {
+    for y in 0..h_in_imp_b {
+      for x in 0..w_in_imp_b {
         let block_rect = Area::Rect {
-          x: (x << granularity) as isize,
-          y: (y << granularity) as isize,
+          x: (x << 3) as isize,
+          y: (y << 3) as isize,
           width: 8,
           height: 8,
         };
 
         let block = luma.subregion(block_rect);
-
-        let mean: f64 = block
-          .rows_iter()
-          .flatten()
-          .map(|&pix| {
-            let pix: i16 = CastFromPrimitive::cast_from(pix);
-            pix as f64
-          })
-          .sum::<f64>()
-          / 64.0_f64;
-        let variance: f64 = block
-          .rows_iter()
-          .flatten()
-          .map(|&pix| {
-            let pix: i16 = CastFromPrimitive::cast_from(pix);
-            (pix as f64 - mean).powi(2)
-          })
-          .sum::<f64>();
+        let variance = variance_8x8(&block);
         variances.push(variance);
       }
     }
-    ActivityMask { variances, width, height, granularity }
+    ActivityMask { variances: variances.into_boxed_slice(), width, height }
   }
 
-  pub fn variance_at(&self, x: usize, y: usize) -> Option<f64> {
-    let (dec_width, dec_height) =
-      (self.width >> self.granularity, self.height >> self.granularity);
-    if x > dec_width || y > dec_height {
-      None
-    } else {
-      Some(*self.variances.get(x + dec_width * y).unwrap())
+  #[hawktracer(activity_mask_fill_scales)]
+  pub fn fill_scales(
+    &self, bit_depth: usize, activity_scales: &mut Box<[DistortionScale]>,
+  ) {
+    for (dst, &src) in activity_scales.iter_mut().zip(self.variances.iter()) {
+      *dst = ssim_boost(src as i64, src as i64, bit_depth);
+    }
+  }
+}
+
+// Adapted from the source variance calculation in cdef_dist_wxh_8x8.
+#[inline(never)]
+fn variance_8x8<T: Pixel>(src: &PlaneRegion<'_, T>) -> u32 {
+  debug_assert!(src.plane_cfg.xdec == 0);
+  debug_assert!(src.plane_cfg.ydec == 0);
+
+  // Sum into columns to improve auto-vectorization
+  let mut sum_s_cols: [u16; 8] = [0; 8];
+  let mut sum_s2_cols: [u32; 8] = [0; 8];
+
+  // Check upfront that 8 rows are available.
+  let _row = &src[7];
+
+  for j in 0..8 {
+    let row = &src[j][0..8];
+    for (sum_s, sum_s2, s) in izip!(&mut sum_s_cols, &mut sum_s2_cols, row) {
+      // Don't convert directly to u32 to allow better vectorization
+      let s: u16 = u16::cast_from(*s);
+      *sum_s += s;
+
+      // Convert to u32 to avoid overflows when multiplying
+      let s: u32 = s as u32;
+      *sum_s2 += s * s;
     }
   }
 
-  pub fn mean_activity_of(&self, rect: Rect) -> Option<f64> {
-    let Rect { x, y, width, height } = rect;
-    let (x, y) = (x as usize, y as usize);
-    let granularity = self.granularity;
-    let (dec_x, dec_y) = (x >> granularity, y >> granularity);
-    let (dec_width, dec_height) =
-      (width >> granularity, height >> granularity);
+  // Sum together the sum of columns
+  let sum_s = sum_s_cols.iter().map(|&a| u32::cast_from(a)).sum::<u32>();
+  let sum_s2 = sum_s2_cols.iter().sum::<u32>();
 
-    if x > self.width
-      || y > self.height
-      || (x + width) > self.width
-      || (y + height) > self.height
-      || dec_width == 0
-      || dec_height == 0
-    {
-      // Region lies out of the frame or is smaller than 8x8 on some axis
-      None
-    } else {
-      let activity = self
-        .variances
-        .chunks_exact(self.width >> granularity)
-        .skip(dec_y)
-        .take(dec_height)
-        .map(|row| row.iter().skip(dec_x).take(dec_width).sum::<f64>())
-        .sum::<f64>()
-        / (dec_width as f64 * dec_height as f64);
-
-      Some(activity.cbrt().sqrt())
-    }
-  }
+  // Use sums to calculate variance
+  sum_s2 - ((sum_s * sum_s + 32) >> 6)
 }

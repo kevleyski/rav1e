@@ -7,7 +7,6 @@ use crate::encoder::{
   FrameInvariants, FrameState, Sequence, IMPORTANCE_BLOCK_SIZE,
 };
 use crate::frame::{AsRegion, PlaneOffset};
-use crate::hawktracer::*;
 use crate::me::estimate_tile_motion;
 use crate::partition::{get_intra_edges, BlockSize};
 use crate::predict::{IntraParam, PredictionMode};
@@ -15,6 +14,7 @@ use crate::rayon::iter::*;
 use crate::tiling::{Area, TileRect};
 use crate::transform::TxSize;
 use crate::{Frame, Pixel};
+use rust_hawktracer::*;
 use std::sync::Arc;
 
 pub(crate) const IMP_BLOCK_MV_UNITS_PER_PIXEL: i64 = 8;
@@ -23,6 +23,7 @@ pub(crate) const IMP_BLOCK_SIZE_IN_MV_UNITS: i64 =
 pub(crate) const IMP_BLOCK_AREA_IN_MV_UNITS: i64 =
   IMP_BLOCK_SIZE_IN_MV_UNITS * IMP_BLOCK_SIZE_IN_MV_UNITS;
 
+#[hawktracer(estimate_intra_costs)]
 pub(crate) fn estimate_intra_costs<T: Pixel>(
   frame: &Frame<T>, bit_depth: usize, cpu_feature_level: CpuFeatureLevel,
 ) -> Box<[u32]> {
@@ -114,14 +115,15 @@ pub(crate) fn estimate_intra_costs<T: Pixel>(
   intra_costs.into_boxed_slice()
 }
 
+#[hawktracer(estimate_inter_costs)]
 pub(crate) fn estimate_inter_costs<T: Pixel>(
   frame: Arc<Frame<T>>, ref_frame: Arc<Frame<T>>, bit_depth: usize,
-  mut config: EncoderConfig, sequence: Sequence,
+  mut config: EncoderConfig, sequence: Arc<Sequence>,
 ) -> Box<[u32]> {
   config.low_latency = true;
   config.speed_settings.multiref = false;
   let inter_cfg = InterConfig::new(&config);
-  let last_fi = FrameInvariants::new_key_frame(config, sequence, 0);
+  let last_fi = FrameInvariants::new_key_frame(Arc::new(config), sequence, 0);
   let mut fi =
     FrameInvariants::new_inter_frame(&last_fi, &inter_cfg, 0, 1, 2, false);
 
@@ -180,7 +182,8 @@ pub(crate) fn compute_motion_vectors<T: Pixel>(
   fi: &mut FrameInvariants<T>, fs: &mut FrameState<T>, inter_cfg: &InterConfig,
 ) {
   let mut blocks = FrameBlocks::new(fi.w_in_b, fi.h_in_b);
-  fi.tiling
+  fi.sequence
+    .tiling
     .tile_iter_mut(fs, &mut blocks)
     .collect::<Vec<_>>()
     .into_par_iter()

@@ -154,6 +154,7 @@ unsafe fn dequantize_avx2(
 #[cfg(test)]
 mod test {
   use super::*;
+  use rand::distributions::{Distribution, Uniform};
   use rand::{thread_rng, Rng};
 
   #[test]
@@ -170,7 +171,7 @@ mod test {
     let bd: usize = 8;
 
     for &tx_size in &tx_sizes {
-      let qindex: u8 = rng.gen_range(MINQ as u8, MAXQ as u8);
+      let qindex: u8 = rng.gen_range((MINQ as u8)..(MAXQ as u8));
       let dc_quant: i16 = dc_q(qindex, 0, bd);
       let ac_quant: i16 = ac_q(qindex, 0, bd);
 
@@ -181,7 +182,7 @@ mod test {
         out[0] = 0;
         out[1] = area;
         for eob in out.iter_mut().skip(2) {
-          *eob = rng.gen_range(0, area);
+          *eob = rng.gen_range(0..area);
         }
         out
       };
@@ -190,10 +191,11 @@ mod test {
         let mut qcoeffs = Aligned::new([0i16; 32 * 32]);
         let mut rcoeffs = Aligned::new([0i16; 32 * 32]);
 
-        // Generate quantized coefficients upto the eob
+        // Generate quantized coefficients up to the eob
+        let between = Uniform::from(-std::i16::MAX..=std::i16::MAX);
         for (i, qcoeff) in qcoeffs.data.iter_mut().enumerate().take(eob) {
-          *qcoeff =
-            rng.gen::<i16>() / if i == 0 { dc_quant } else { ac_quant };
+          *qcoeff = between.sample(&mut rng)
+            / if i == 0 { dc_quant } else { ac_quant };
         }
 
         // Rely on quantize's internal tests

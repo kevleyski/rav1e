@@ -32,13 +32,14 @@ const SEG_TEMPORAL_PRED_CTXS: usize = 3;
 const TX_SIZE_LUMA_MIN: usize = TxSize::TX_4X4 as usize;
 const TX_SIZE_CTX_MIN: usize = TX_SIZE_LUMA_MIN + 1;
 pub const MAX_TX_CATS: usize = TxSize::TX_SIZES - TX_SIZE_CTX_MIN;
+pub const BIG_TX_CATS: usize = MAX_TX_CATS - 1; // All except 8x8, which has lower max depth.
 pub const MAX_TX_DEPTH: usize = 2;
 pub const TXFM_PARTITION_CONTEXTS: usize = 21; // (TxSize::TX_SIZES - TxSize::TX_8X8) * 6 - 3;
 
 // LUTS ---------------------
 
-pub static default_kf_y_mode_cdf: [[[u16; cdf_size!(INTRA_MODES)];
-  KF_MODE_CONTEXTS]; KF_MODE_CONTEXTS] = [
+pub static default_kf_y_mode_cdf: [[[u16; INTRA_MODES]; KF_MODE_CONTEXTS];
+  KF_MODE_CONTEXTS] = [
   [
     cdf!(
       15588, 17027, 19338, 20218, 20682, 21110, 21825, 23244, 24189, 28165,
@@ -151,8 +152,7 @@ pub static default_kf_y_mode_cdf: [[[u16; cdf_size!(INTRA_MODES)];
   ],
 ];
 
-pub static default_angle_delta_cdf: [[u16;
-  cdf_size!(2 * MAX_ANGLE_DELTA + 1)];
+pub static default_angle_delta_cdf: [[u16; 2 * MAX_ANGLE_DELTA + 1];
   DIRECTIONAL_MODES] = [
   cdf!(2180, 5032, 7567, 22776, 26989, 30217),
   cdf!(2301, 5608, 8801, 23487, 26974, 30330),
@@ -164,8 +164,7 @@ pub static default_angle_delta_cdf: [[u16;
   cdf!(3605, 10428, 12459, 17676, 21244, 30655),
 ];
 
-pub static default_if_y_mode_cdf: [[u16; cdf_size!(INTRA_MODES)];
-  BLOCK_SIZE_GROUPS] = [
+pub static default_if_y_mode_cdf: [[u16; INTRA_MODES]; BLOCK_SIZE_GROUPS] = [
   cdf!(
     22801, 23489, 24293, 24756, 25601, 26123, 26606, 27418, 27945, 29228,
     29685, 30349
@@ -184,124 +183,125 @@ pub static default_if_y_mode_cdf: [[u16; cdf_size!(INTRA_MODES)];
   ),
 ];
 
-pub static default_uv_mode_cdf: [[[u16; cdf_size!(UV_INTRA_MODES)];
-  INTRA_MODES]; 2] = [
-  [
-    cdf!(
-      22631, 24152, 25378, 25661, 25986, 26520, 27055, 27923, 28244, 30059,
-      30941, 31961, CDFMAX
-    ),
-    cdf!(
-      9513, 26881, 26973, 27046, 27118, 27664, 27739, 27824, 28359, 29505,
-      29800, 31796, CDFMAX
-    ),
-    cdf!(
-      9845, 9915, 28663, 28704, 28757, 28780, 29198, 29822, 29854, 30764,
-      31777, 32029, CDFMAX
-    ),
-    cdf!(
-      13639, 13897, 14171, 25331, 25606, 25727, 25953, 27148, 28577, 30612,
-      31355, 32493, CDFMAX
-    ),
-    cdf!(
-      9764, 9835, 9930, 9954, 25386, 27053, 27958, 28148, 28243, 31101, 31744,
-      32363, CDFMAX
-    ),
-    cdf!(
-      11825, 13589, 13677, 13720, 15048, 29213, 29301, 29458, 29711, 31161,
-      31441, 32550, CDFMAX
-    ),
-    cdf!(
-      14175, 14399, 16608, 16821, 17718, 17775, 28551, 30200, 30245, 31837,
-      32342, 32667, CDFMAX
-    ),
-    cdf!(
-      12885, 13038, 14978, 15590, 15673, 15748, 16176, 29128, 29267, 30643,
-      31961, 32461, CDFMAX
-    ),
-    cdf!(
-      12026, 13661, 13874, 15305, 15490, 15726, 15995, 16273, 28443, 30388,
-      30767, 32416, CDFMAX
-    ),
-    cdf!(
-      19052, 19840, 20579, 20916, 21150, 21467, 21885, 22719, 23174, 28861,
-      30379, 32175, CDFMAX
-    ),
-    cdf!(
-      18627, 19649, 20974, 21219, 21492, 21816, 22199, 23119, 23527, 27053,
-      31397, 32148, CDFMAX
-    ),
-    cdf!(
-      17026, 19004, 19997, 20339, 20586, 21103, 21349, 21907, 22482, 25896,
-      26541, 31819, CDFMAX
-    ),
-    cdf!(
-      12124, 13759, 14959, 14992, 15007, 15051, 15078, 15166, 15255, 15753,
-      16039, 16606, CDFMAX
-    ),
-  ],
-  [
-    cdf!(
-      10407, 11208, 12900, 13181, 13823, 14175, 14899, 15656, 15986, 20086,
-      20995, 22455, 24212
-    ),
-    cdf!(
-      4532, 19780, 20057, 20215, 20428, 21071, 21199, 21451, 22099, 24228,
-      24693, 27032, 29472
-    ),
-    cdf!(
-      5273, 5379, 20177, 20270, 20385, 20439, 20949, 21695, 21774, 23138,
-      24256, 24703, 26679
-    ),
-    cdf!(
-      6740, 7167, 7662, 14152, 14536, 14785, 15034, 16741, 18371, 21520,
-      22206, 23389, 24182
-    ),
-    cdf!(
-      4987, 5368, 5928, 6068, 19114, 20315, 21857, 22253, 22411, 24911, 25380,
-      26027, 26376
-    ),
-    cdf!(
-      5370, 6889, 7247, 7393, 9498, 21114, 21402, 21753, 21981, 24780, 25386,
-      26517, 27176
-    ),
-    cdf!(
-      4816, 4961, 7204, 7326, 8765, 8930, 20169, 20682, 20803, 23188, 23763,
-      24455, 24940
-    ),
-    cdf!(
-      6608, 6740, 8529, 9049, 9257, 9356, 9735, 18827, 19059, 22336, 23204,
-      23964, 24793
-    ),
-    cdf!(
-      5998, 7419, 7781, 8933, 9255, 9549, 9753, 10417, 18898, 22494, 23139,
-      24764, 25989
-    ),
-    cdf!(
-      10660, 11298, 12550, 12957, 13322, 13624, 14040, 15004, 15534, 20714,
-      21789, 23443, 24861
-    ),
-    cdf!(
-      10522, 11530, 12552, 12963, 13378, 13779, 14245, 15235, 15902, 20102,
-      22696, 23774, 25838
-    ),
-    cdf!(
-      10099, 10691, 12639, 13049, 13386, 13665, 14125, 15163, 15636, 19676,
-      20474, 23519, 25208
-    ),
-    cdf!(
-      3144, 5087, 7382, 7504, 7593, 7690, 7801, 8064, 8232, 9248, 9875, 10521,
-      29048
-    ),
-  ],
+pub static default_uv_mode_cdf: [[u16; INTRA_MODES]; INTRA_MODES] = [
+  cdf!(
+    22631, 24152, 25378, 25661, 25986, 26520, 27055, 27923, 28244, 30059,
+    30941, 31961
+  ),
+  cdf!(
+    9513, 26881, 26973, 27046, 27118, 27664, 27739, 27824, 28359, 29505,
+    29800, 31796
+  ),
+  cdf!(
+    9845, 9915, 28663, 28704, 28757, 28780, 29198, 29822, 29854, 30764, 31777,
+    32029
+  ),
+  cdf!(
+    13639, 13897, 14171, 25331, 25606, 25727, 25953, 27148, 28577, 30612,
+    31355, 32493
+  ),
+  cdf!(
+    9764, 9835, 9930, 9954, 25386, 27053, 27958, 28148, 28243, 31101, 31744,
+    32363
+  ),
+  cdf!(
+    11825, 13589, 13677, 13720, 15048, 29213, 29301, 29458, 29711, 31161,
+    31441, 32550
+  ),
+  cdf!(
+    14175, 14399, 16608, 16821, 17718, 17775, 28551, 30200, 30245, 31837,
+    32342, 32667
+  ),
+  cdf!(
+    12885, 13038, 14978, 15590, 15673, 15748, 16176, 29128, 29267, 30643,
+    31961, 32461
+  ),
+  cdf!(
+    12026, 13661, 13874, 15305, 15490, 15726, 15995, 16273, 28443, 30388,
+    30767, 32416
+  ),
+  cdf!(
+    19052, 19840, 20579, 20916, 21150, 21467, 21885, 22719, 23174, 28861,
+    30379, 32175
+  ),
+  cdf!(
+    18627, 19649, 20974, 21219, 21492, 21816, 22199, 23119, 23527, 27053,
+    31397, 32148
+  ),
+  cdf!(
+    17026, 19004, 19997, 20339, 20586, 21103, 21349, 21907, 22482, 25896,
+    26541, 31819
+  ),
+  cdf!(
+    12124, 13759, 14959, 14992, 15007, 15051, 15078, 15166, 15255, 15753,
+    16039, 16606
+  ),
 ];
 
-pub const default_partition_cdf: [[u16; cdf_size!(EXT_PARTITION_TYPES)];
-  PARTITION_CONTEXTS] = [
-  cdf!(19132, 25510, 30392, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX),
-  cdf!(13928, 19855, 28540, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX),
-  cdf!(12522, 23679, 28629, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX),
-  cdf!(9896, 18783, 25853, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX),
+pub static default_uv_mode_cfl_cdf: [[u16; UV_INTRA_MODES]; INTRA_MODES] = [
+  cdf!(
+    10407, 11208, 12900, 13181, 13823, 14175, 14899, 15656, 15986, 20086,
+    20995, 22455, 24212
+  ),
+  cdf!(
+    4532, 19780, 20057, 20215, 20428, 21071, 21199, 21451, 22099, 24228,
+    24693, 27032, 29472
+  ),
+  cdf!(
+    5273, 5379, 20177, 20270, 20385, 20439, 20949, 21695, 21774, 23138, 24256,
+    24703, 26679
+  ),
+  cdf!(
+    6740, 7167, 7662, 14152, 14536, 14785, 15034, 16741, 18371, 21520, 22206,
+    23389, 24182
+  ),
+  cdf!(
+    4987, 5368, 5928, 6068, 19114, 20315, 21857, 22253, 22411, 24911, 25380,
+    26027, 26376
+  ),
+  cdf!(
+    5370, 6889, 7247, 7393, 9498, 21114, 21402, 21753, 21981, 24780, 25386,
+    26517, 27176
+  ),
+  cdf!(
+    4816, 4961, 7204, 7326, 8765, 8930, 20169, 20682, 20803, 23188, 23763,
+    24455, 24940
+  ),
+  cdf!(
+    6608, 6740, 8529, 9049, 9257, 9356, 9735, 18827, 19059, 22336, 23204,
+    23964, 24793
+  ),
+  cdf!(
+    5998, 7419, 7781, 8933, 9255, 9549, 9753, 10417, 18898, 22494, 23139,
+    24764, 25989
+  ),
+  cdf!(
+    10660, 11298, 12550, 12957, 13322, 13624, 14040, 15004, 15534, 20714,
+    21789, 23443, 24861
+  ),
+  cdf!(
+    10522, 11530, 12552, 12963, 13378, 13779, 14245, 15235, 15902, 20102,
+    22696, 23774, 25838
+  ),
+  cdf!(
+    10099, 10691, 12639, 13049, 13386, 13665, 14125, 15163, 15636, 19676,
+    20474, 23519, 25208
+  ),
+  cdf!(
+    3144, 5087, 7382, 7504, 7593, 7690, 7801, 8064, 8232, 9248, 9875, 10521,
+    29048
+  ),
+];
+
+pub const default_partition_w8_cdf: [[u16; 4]; PARTITION_TYPES] = [
+  cdf!(19132, 25510, 30392),
+  cdf!(13928, 19855, 28540),
+  cdf!(12522, 23679, 28629),
+  cdf!(9896, 18783, 25853),
+];
+
+pub const default_partition_cdf: [[u16; EXT_PARTITION_TYPES];
+  3 * PARTITION_TYPES] = [
   cdf!(15597, 20929, 24571, 26706, 27664, 28821, 29601, 30571, 31902),
   cdf!(7925, 11043, 16785, 22470, 23971, 25043, 26651, 28701, 29834),
   cdf!(5414, 13269, 15111, 20488, 22360, 24500, 25537, 26336, 32117),
@@ -314,517 +314,184 @@ pub const default_partition_cdf: [[u16; cdf_size!(EXT_PARTITION_TYPES)];
   cdf!(6732, 7490, 9497, 27944, 28250, 28515, 28969, 29630, 30104),
   cdf!(5945, 7663, 8348, 28683, 29117, 29749, 30064, 30298, 32238),
   cdf!(870, 1212, 1487, 31198, 31394, 31574, 31743, 31881, 32332),
-  cdf!(27899, 28219, 28529, 32484, 32539, 32619, 32639, CDFMAX, CDFMAX),
-  cdf!(6607, 6990, 8268, 32060, 32219, 32338, 32371, CDFMAX, CDFMAX),
-  cdf!(5429, 6676, 7122, 32027, 32227, 32531, 32582, CDFMAX, CDFMAX),
-  cdf!(711, 966, 1172, 32448, 32538, 32617, 32664, CDFMAX, CDFMAX),
 ];
 
-pub static default_intra_ext_tx_cdf: [[[[u16; cdf_size!(TX_TYPES)];
-  INTRA_MODES]; TX_SIZE_SQR_CONTEXTS];
-  TX_SETS_INTRA] = [
-  [[[0; cdf_size!(TX_TYPES)]; INTRA_MODES]; TX_SIZE_SQR_CONTEXTS],
+pub const default_partition_w128_cdf: [[u16; 8]; PARTITION_TYPES] = [
+  cdf!(27899, 28219, 28529, 32484, 32539, 32619, 32639),
+  cdf!(6607, 6990, 8268, 32060, 32219, 32338, 32371),
+  cdf!(5429, 6676, 7122, 32027, 32227, 32531, 32582),
+  cdf!(711, 966, 1172, 32448, 32538, 32617, 32664),
+];
+
+pub static default_intra_tx_1_cdf: [[[u16; 7]; INTRA_MODES];
+  TX_SIZE_SQR_CONTEXTS] = [
   [
-    [
-      cdf!(
-        1535, 8035, 9461, 12751, 23467, 27825, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        564, 3335, 9709, 10870, 18143, 28094, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        672, 3247, 3676, 11982, 19415, 23127, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        5279, 13885, 15487, 18044, 23527, 30252, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        4423, 6074, 7985, 10416, 25693, 29298, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        1486, 4241, 9460, 10662, 16456, 27694, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        439, 2838, 3522, 6737, 18058, 23754, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        1190, 4233, 4855, 11670, 20281, 24377, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        1045, 4312, 8647, 10159, 18644, 29335, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        202, 3734, 4747, 7298, 17127, 24016, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        447, 4312, 6819, 8884, 16010, 23858, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        277, 4369, 5255, 8905, 16465, 22271, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        3409, 5436, 10599, 15599, 19687, 24040, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-    ],
-    [
-      cdf!(
-        1870, 13742, 14530, 16498, 23770, 27698, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        326, 8796, 14632, 15079, 19272, 27486, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        484, 7576, 7712, 14443, 19159, 22591, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        1126, 15340, 15895, 17023, 20896, 30279, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        655, 4854, 5249, 5913, 22099, 27138, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        1299, 6458, 8885, 9290, 14851, 25497, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        311, 5295, 5552, 6885, 16107, 22672, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        883, 8059, 8270, 11258, 17289, 21549, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        741, 7580, 9318, 10345, 16688, 29046, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        110, 7406, 7915, 9195, 16041, 23329, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        363, 7974, 9357, 10673, 15629, 24474, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        153, 7647, 8112, 9936, 15307, 19996, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        3511, 6332, 11165, 15335, 19323, 23594, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-    ],
-    [
-      cdf!(
-        4681, 9362, 14043, 18725, 23406, 28087, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        4681, 9362, 14043, 18725, 23406, 28087, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        4681, 9362, 14043, 18725, 23406, 28087, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        4681, 9362, 14043, 18725, 23406, 28087, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        4681, 9362, 14043, 18725, 23406, 28087, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        4681, 9362, 14043, 18725, 23406, 28087, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        4681, 9362, 14043, 18725, 23406, 28087, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        4681, 9362, 14043, 18725, 23406, 28087, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        4681, 9362, 14043, 18725, 23406, 28087, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        4681, 9362, 14043, 18725, 23406, 28087, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        4681, 9362, 14043, 18725, 23406, 28087, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        4681, 9362, 14043, 18725, 23406, 28087, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        4681, 9362, 14043, 18725, 23406, 28087, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-    ],
-    [
-      cdf!(
-        4681, 9362, 14043, 18725, 23406, 28087, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        4681, 9362, 14043, 18725, 23406, 28087, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        4681, 9362, 14043, 18725, 23406, 28087, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        4681, 9362, 14043, 18725, 23406, 28087, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        4681, 9362, 14043, 18725, 23406, 28087, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        4681, 9362, 14043, 18725, 23406, 28087, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        4681, 9362, 14043, 18725, 23406, 28087, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        4681, 9362, 14043, 18725, 23406, 28087, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        4681, 9362, 14043, 18725, 23406, 28087, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        4681, 9362, 14043, 18725, 23406, 28087, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        4681, 9362, 14043, 18725, 23406, 28087, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        4681, 9362, 14043, 18725, 23406, 28087, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        4681, 9362, 14043, 18725, 23406, 28087, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-    ],
+    cdf!(1535, 8035, 9461, 12751, 23467, 27825),
+    cdf!(564, 3335, 9709, 10870, 18143, 28094),
+    cdf!(672, 3247, 3676, 11982, 19415, 23127),
+    cdf!(5279, 13885, 15487, 18044, 23527, 30252),
+    cdf!(4423, 6074, 7985, 10416, 25693, 29298),
+    cdf!(1486, 4241, 9460, 10662, 16456, 27694),
+    cdf!(439, 2838, 3522, 6737, 18058, 23754),
+    cdf!(1190, 4233, 4855, 11670, 20281, 24377),
+    cdf!(1045, 4312, 8647, 10159, 18644, 29335),
+    cdf!(202, 3734, 4747, 7298, 17127, 24016),
+    cdf!(447, 4312, 6819, 8884, 16010, 23858),
+    cdf!(277, 4369, 5255, 8905, 16465, 22271),
+    cdf!(3409, 5436, 10599, 15599, 19687, 24040),
   ],
   [
-    [
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-    ],
-    [
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-    ],
-    [
-      cdf!(
-        1127, 12814, 22772, 27483, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        145, 6761, 11980, 26667, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        362, 5887, 11678, 16725, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        385, 15213, 18587, 30693, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        25, 2914, 23134, 27903, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        60, 4470, 11749, 23991, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        37, 3332, 14511, 21448, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        157, 6320, 13036, 17439, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        119, 6719, 12906, 29396, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        47, 5537, 12576, 21499, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        269, 6076, 11258, 23115, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        83, 5615, 12001, 17228, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        1968, 5556, 12023, 18547, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-    ],
-    [
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-      cdf!(
-        6554, 13107, 19661, 26214, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-        CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-      ),
-    ],
+    cdf!(1870, 13742, 14530, 16498, 23770, 27698),
+    cdf!(326, 8796, 14632, 15079, 19272, 27486),
+    cdf!(484, 7576, 7712, 14443, 19159, 22591),
+    cdf!(1126, 15340, 15895, 17023, 20896, 30279),
+    cdf!(655, 4854, 5249, 5913, 22099, 27138),
+    cdf!(1299, 6458, 8885, 9290, 14851, 25497),
+    cdf!(311, 5295, 5552, 6885, 16107, 22672),
+    cdf!(883, 8059, 8270, 11258, 17289, 21549),
+    cdf!(741, 7580, 9318, 10345, 16688, 29046),
+    cdf!(110, 7406, 7915, 9195, 16041, 23329),
+    cdf!(363, 7974, 9357, 10673, 15629, 24474),
+    cdf!(153, 7647, 8112, 9936, 15307, 19996),
+    cdf!(3511, 6332, 11165, 15335, 19323, 23594),
+  ],
+  [
+    cdf!(4681, 9362, 14043, 18725, 23406, 28087),
+    cdf!(4681, 9362, 14043, 18725, 23406, 28087),
+    cdf!(4681, 9362, 14043, 18725, 23406, 28087),
+    cdf!(4681, 9362, 14043, 18725, 23406, 28087),
+    cdf!(4681, 9362, 14043, 18725, 23406, 28087),
+    cdf!(4681, 9362, 14043, 18725, 23406, 28087),
+    cdf!(4681, 9362, 14043, 18725, 23406, 28087),
+    cdf!(4681, 9362, 14043, 18725, 23406, 28087),
+    cdf!(4681, 9362, 14043, 18725, 23406, 28087),
+    cdf!(4681, 9362, 14043, 18725, 23406, 28087),
+    cdf!(4681, 9362, 14043, 18725, 23406, 28087),
+    cdf!(4681, 9362, 14043, 18725, 23406, 28087),
+    cdf!(4681, 9362, 14043, 18725, 23406, 28087),
+  ],
+  [
+    cdf!(4681, 9362, 14043, 18725, 23406, 28087),
+    cdf!(4681, 9362, 14043, 18725, 23406, 28087),
+    cdf!(4681, 9362, 14043, 18725, 23406, 28087),
+    cdf!(4681, 9362, 14043, 18725, 23406, 28087),
+    cdf!(4681, 9362, 14043, 18725, 23406, 28087),
+    cdf!(4681, 9362, 14043, 18725, 23406, 28087),
+    cdf!(4681, 9362, 14043, 18725, 23406, 28087),
+    cdf!(4681, 9362, 14043, 18725, 23406, 28087),
+    cdf!(4681, 9362, 14043, 18725, 23406, 28087),
+    cdf!(4681, 9362, 14043, 18725, 23406, 28087),
+    cdf!(4681, 9362, 14043, 18725, 23406, 28087),
+    cdf!(4681, 9362, 14043, 18725, 23406, 28087),
+    cdf!(4681, 9362, 14043, 18725, 23406, 28087),
   ],
 ];
 
-pub static default_inter_ext_tx_cdf: [[[u16; cdf_size!(TX_TYPES)];
-  TX_SIZE_SQR_CONTEXTS]; TX_SETS_INTER] = [
-  [[0; cdf_size!(TX_TYPES)]; TX_SIZE_SQR_CONTEXTS],
+pub static default_intra_tx_2_cdf: [[[u16; 5]; INTRA_MODES];
+  TX_SIZE_SQR_CONTEXTS] = [
   [
-    cdf!(
-      4458, 5560, 7695, 9709, 13330, 14789, 17537, 20266, 21504, 22848, 23934,
-      25474, 27727, 28915, 30631
-    ),
-    cdf!(
-      1645, 2573, 4778, 5711, 7807, 8622, 10522, 15357, 17674, 20408, 22517,
-      25010, 27116, 28856, 30749
-    ),
-    cdf!(
-      2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384, 18432, 20480, 22528,
-      24576, 26624, 28672, 30720
-    ),
-    cdf!(
-      2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384, 18432, 20480, 22528,
-      24576, 26624, 28672, 30720
-    ),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
   ],
   [
-    cdf!(
-      2731, 5461, 8192, 10923, 13653, 16384, 19115, 21845, 24576, 27307,
-      30037, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-    ),
-    cdf!(
-      2731, 5461, 8192, 10923, 13653, 16384, 19115, 21845, 24576, 27307,
-      30037, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-    ),
-    cdf!(
-      770, 2421, 5225, 12907, 15819, 18927, 21561, 24089, 26595, 28526, 30529,
-      CDFMAX, CDFMAX, CDFMAX, CDFMAX
-    ),
-    cdf!(
-      2731, 5461, 8192, 10923, 13653, 16384, 19115, 21845, 24576, 27307,
-      30037, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-    ),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
   ],
   [
-    cdf!(
-      16384, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-      CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-    ),
-    cdf!(
-      4167, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-      CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-    ),
-    cdf!(
-      1998, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-      CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-    ),
-    cdf!(
-      748, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX,
-      CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX, CDFMAX
-    ),
+    cdf!(1127, 12814, 22772, 27483),
+    cdf!(145, 6761, 11980, 26667),
+    cdf!(362, 5887, 11678, 16725),
+    cdf!(385, 15213, 18587, 30693),
+    cdf!(25, 2914, 23134, 27903),
+    cdf!(60, 4470, 11749, 23991),
+    cdf!(37, 3332, 14511, 21448),
+    cdf!(157, 6320, 13036, 17439),
+    cdf!(119, 6719, 12906, 29396),
+    cdf!(47, 5537, 12576, 21499),
+    cdf!(269, 6076, 11258, 23115),
+    cdf!(83, 5615, 12001, 17228),
+    cdf!(1968, 5556, 12023, 18547),
+  ],
+  [
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
+    cdf!(6554, 13107, 19661, 26214),
   ],
 ];
 
-pub static default_cfl_sign_cdf: [u16; cdf_size!(CFL_JOINT_SIGNS)] =
+pub static default_inter_tx_1_cdf: [[u16; TX_TYPES]; TX_SIZE_SQR_CONTEXTS] = [
+  cdf!(
+    4458, 5560, 7695, 9709, 13330, 14789, 17537, 20266, 21504, 22848, 23934,
+    25474, 27727, 28915, 30631
+  ),
+  cdf!(
+    1645, 2573, 4778, 5711, 7807, 8622, 10522, 15357, 17674, 20408, 22517,
+    25010, 27116, 28856, 30749
+  ),
+  cdf!(
+    2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384, 18432, 20480, 22528,
+    24576, 26624, 28672, 30720
+  ),
+  cdf!(
+    2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384, 18432, 20480, 22528,
+    24576, 26624, 28672, 30720
+  ),
+];
+
+pub static default_inter_tx_2_cdf: [[u16; 12]; TX_SIZE_SQR_CONTEXTS] = [
+  cdf!(
+    2731, 5461, 8192, 10923, 13653, 16384, 19115, 21845, 24576, 27307, 30037
+  ),
+  cdf!(
+    2731, 5461, 8192, 10923, 13653, 16384, 19115, 21845, 24576, 27307, 30037
+  ),
+  cdf!(
+    770, 2421, 5225, 12907, 15819, 18927, 21561, 24089, 26595, 28526, 30529
+  ),
+  cdf!(
+    2731, 5461, 8192, 10923, 13653, 16384, 19115, 21845, 24576, 27307, 30037
+  ),
+];
+
+pub static default_inter_tx_3_cdf: [[u16; 2]; TX_SIZE_SQR_CONTEXTS] =
+  [cdf!(16384), cdf!(4167), cdf!(1998), cdf!(748)];
+
+pub static default_cfl_sign_cdf: [u16; CFL_JOINT_SIGNS] =
   cdf!(1418, 2123, 13340, 18405, 26972, 28343, 32294);
 
-pub static default_cfl_alpha_cdf: [[u16; cdf_size!(CFL_ALPHABET_SIZE)];
+pub static default_cfl_alpha_cdf: [[u16; CFL_ALPHABET_SIZE];
   CFL_ALPHA_CONTEXTS] = [
   cdf!(
     7637, 20719, 31401, 32481, 32657, 32688, 32692, 32696, 32700, 32704,
@@ -857,8 +524,7 @@ const SWITCHABLE_FILTERS: usize = 3;
 const SWITCHABLE_FILTER_CONTEXTS: usize = (SWITCHABLE_FILTERS + 1) * 4;
 
 #[allow(unused)]
-pub static default_switchable_interp_cdf: [[u16;
-  cdf_size!(SWITCHABLE_FILTERS)];
+pub static default_switchable_interp_cdf: [[u16; SWITCHABLE_FILTERS];
   SWITCHABLE_FILTER_CONTEXTS] = [
   cdf!(31935, 32720),
   cdf!(5568, 32719),
@@ -878,20 +544,20 @@ pub static default_switchable_interp_cdf: [[u16;
   cdf!(14969, 21398),
 ];
 
-pub static default_newmv_cdf: [[u16; cdf_size!(2)]; NEWMV_MODE_CONTEXTS] = [
+pub static default_newmv_cdf: [[u16; 2]; NEWMV_MODE_CONTEXTS] = [
   cdf!(24035),
   cdf!(16630),
   cdf!(15339),
   cdf!(8386),
   cdf!(12222),
   cdf!(4676),
-  [0; cdf_size!(2)],
+  [0; 2],
 ];
 
-pub static default_zeromv_cdf: [[u16; cdf_size!(2)]; GLOBALMV_MODE_CONTEXTS] =
+pub static default_zeromv_cdf: [[u16; 2]; GLOBALMV_MODE_CONTEXTS] =
   [cdf!(2175), cdf!(1054)];
 
-pub static default_refmv_cdf: [[u16; cdf_size!(2)]; REFMV_MODE_CONTEXTS] = [
+pub static default_refmv_cdf: [[u16; 2]; REFMV_MODE_CONTEXTS] = [
   cdf!(23974),
   cdf!(24188),
   cdf!(17848),
@@ -900,11 +566,10 @@ pub static default_refmv_cdf: [[u16; cdf_size!(2)]; REFMV_MODE_CONTEXTS] = [
   cdf!(19923),
 ];
 
-pub static default_drl_cdf: [[u16; cdf_size!(2)]; DRL_MODE_CONTEXTS] =
+pub static default_drl_cdf: [[u16; 2]; DRL_MODE_CONTEXTS] =
   [cdf!(13104), cdf!(24560), cdf!(18945)];
 
-pub static default_compound_mode_cdf: [[u16;
-  cdf_size!(INTER_COMPOUND_MODES)];
+pub static default_compound_mode_cdf: [[u16; INTER_COMPOUND_MODES];
   INTER_MODE_CONTEXTS] = [
   cdf!(7760, 13823, 15808, 17641, 19156, 20666, 26891),
   cdf!(10730, 19452, 21145, 22749, 24039, 25131, 28724),
@@ -917,12 +582,12 @@ pub static default_compound_mode_cdf: [[u16;
 ];
 
 #[allow(unused)]
-pub static default_interintra_cdf: [[u16; cdf_size!(2)]; BLOCK_SIZE_GROUPS] =
+pub static default_interintra_cdf: [[u16; 2]; BLOCK_SIZE_GROUPS] =
   [cdf!(16384), cdf!(26887), cdf!(27597), cdf!(30237)];
 
 #[allow(unused)]
 pub static default_interintra_mode_cdf: [[u16;
-  cdf_size!(InterIntraMode::INTERINTRA_MODES as usize)];
+  InterIntraMode::INTERINTRA_MODES as usize];
   BLOCK_SIZE_GROUPS as usize] = [
   cdf!(8192, 16384, 24576),
   cdf!(1875, 11082, 27332),
@@ -931,7 +596,7 @@ pub static default_interintra_mode_cdf: [[u16;
 ];
 
 #[allow(unused)]
-pub static default_wedge_interintra_cdf: [[u16; cdf_size!(2)];
+pub static default_wedge_interintra_cdf: [[u16; 2];
   BlockSize::BLOCK_SIZES_ALL] = [
   cdf!(16384),
   cdf!(16384),
@@ -959,7 +624,7 @@ pub static default_wedge_interintra_cdf: [[u16; cdf_size!(2)];
 
 #[allow(unused)]
 pub static default_compound_type_cdf: [[u16;
-  cdf_size!(CompoundType::COMPOUND_TYPES as usize - 1)];
+  CompoundType::COMPOUND_TYPES as usize - 1];
   BlockSize::BLOCK_SIZES_ALL as usize] = [
   cdf!(16384),
   cdf!(16384),
@@ -986,8 +651,7 @@ pub static default_compound_type_cdf: [[u16;
 ];
 
 #[allow(unused)]
-pub static default_wedge_idx_cdf: [[u16; cdf_size!(16)];
-  BlockSize::BLOCK_SIZES_ALL] = [
+pub static default_wedge_idx_cdf: [[u16; 16]; BlockSize::BLOCK_SIZES_ALL] = [
   cdf!(
     2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384, 18432, 20480, 22528,
     24576, 26624, 28672, 30720
@@ -1080,7 +744,7 @@ pub static default_wedge_idx_cdf: [[u16; cdf_size!(16)];
 
 #[allow(unused)]
 pub static default_motion_mode_cdf: [[u16;
-  cdf_size!(MotionMode::MOTION_MODES as usize)];
+  MotionMode::MOTION_MODES as usize];
   BlockSize::BLOCK_SIZES_ALL as usize] = [
   cdf!(10923, 21845),
   cdf!(10923, 21845),
@@ -1107,8 +771,7 @@ pub static default_motion_mode_cdf: [[u16;
 ];
 
 #[allow(unused)]
-pub static default_obmc_cdf: [[u16; cdf_size!(2)];
-  BlockSize::BLOCK_SIZES_ALL] = [
+pub static default_obmc_cdf: [[u16; 2]; BlockSize::BLOCK_SIZES_ALL] = [
   cdf!(16384),
   cdf!(16384),
   cdf!(16384),
@@ -1133,26 +796,24 @@ pub static default_obmc_cdf: [[u16; cdf_size!(2)];
   cdf!(26879),
 ];
 
-pub static default_intra_inter_cdf: [[u16; cdf_size!(2)];
-  INTRA_INTER_CONTEXTS] = [cdf!(806), cdf!(16662), cdf!(20186), cdf!(26538)];
+pub static default_intra_inter_cdf: [[u16; 2]; INTRA_INTER_CONTEXTS] =
+  [cdf!(806), cdf!(16662), cdf!(20186), cdf!(26538)];
 
-pub static default_comp_mode_cdf: [[u16; cdf_size!(2)]; COMP_INTER_CONTEXTS] =
+pub static default_comp_mode_cdf: [[u16; 2]; COMP_INTER_CONTEXTS] =
   [cdf!(26828), cdf!(24035), cdf!(12031), cdf!(10640), cdf!(2901)];
 
-pub static default_comp_ref_type_cdf: [[u16; cdf_size!(2)];
-  COMP_REF_TYPE_CONTEXTS] =
+pub static default_comp_ref_type_cdf: [[u16; 2]; COMP_REF_TYPE_CONTEXTS] =
   [cdf!(1198), cdf!(2070), cdf!(9166), cdf!(7499), cdf!(22475)];
 
 #[allow(unused)]
-pub static default_uni_comp_ref_cdf: [[[u16; cdf_size!(2)];
-  UNIDIR_COMP_REFS - 1];
+pub static default_uni_comp_ref_cdf: [[[u16; 2]; UNIDIR_COMP_REFS - 1];
   UNI_COMP_REF_CONTEXTS] = [
   [cdf!(5284), cdf!(3865), cdf!(3128)],
   [cdf!(23152), cdf!(14173), cdf!(15270)],
   [cdf!(31774), cdf!(25120), cdf!(26710)],
 ];
 
-pub static default_single_ref_cdf: [[[u16; cdf_size!(2)]; SINGLE_REFS - 1];
+pub static default_single_ref_cdf: [[[u16; 2]; SINGLE_REFS - 1];
   REF_CONTEXTS] = [
   [cdf!(4897), cdf!(1555), cdf!(4236), cdf!(8650), cdf!(904), cdf!(1444)],
   [
@@ -1173,15 +834,13 @@ pub static default_single_ref_cdf: [[[u16; cdf_size!(2)]; SINGLE_REFS - 1];
   ],
 ];
 
-pub static default_comp_ref_cdf: [[[u16; cdf_size!(2)]; FWD_REFS - 1];
-  REF_CONTEXTS] = [
+pub static default_comp_ref_cdf: [[[u16; 2]; FWD_REFS - 1]; REF_CONTEXTS] = [
   [cdf!(4946), cdf!(9468), cdf!(1503)],
   [cdf!(19891), cdf!(22441), cdf!(15160)],
   [cdf!(30731), cdf!(31059), cdf!(27544)],
 ];
 
-pub static default_comp_bwdref_cdf: [[[u16; cdf_size!(2)]; BWD_REFS - 1];
-  REF_CONTEXTS] = [
+pub static default_comp_bwdref_cdf: [[[u16; 2]; BWD_REFS - 1]; REF_CONTEXTS] = [
   [cdf!(2235), cdf!(1423)],
   [cdf!(17182), cdf!(15175)],
   [cdf!(30606), cdf!(30489)],
@@ -1189,7 +848,7 @@ pub static default_comp_bwdref_cdf: [[[u16; cdf_size!(2)]; BWD_REFS - 1];
 
 #[allow(unused)]
 pub static default_palette_y_size_cdf: [[u16;
-  cdf_size!(PaletteSize::PALETTE_SIZES as usize)];
+  PaletteSize::PALETTE_SIZES as usize];
   PALETTE_BSIZE_CTXS] = [
   cdf!(7952, 13000, 18149, 21478, 25527, 29241),
   cdf!(7139, 11421, 16195, 19544, 23666, 28073),
@@ -1202,7 +861,7 @@ pub static default_palette_y_size_cdf: [[u16;
 
 #[allow(unused)]
 pub static default_palette_uv_size_cdf: [[u16;
-  cdf_size!(PaletteSize::PALETTE_SIZES as usize)];
+  PaletteSize::PALETTE_SIZES as usize];
   PALETTE_BSIZE_CTXS] = [
   cdf!(8713, 19979, 27128, 29609, 31331, 32272),
   cdf!(5839, 15573, 23581, 26947, 29848, 31700),
@@ -1213,8 +872,7 @@ pub static default_palette_uv_size_cdf: [[u16;
   cdf!(1269, 5435, 10433, 18963, 21700, 25865),
 ];
 
-pub static default_palette_y_mode_cdfs: [[[u16; cdf_size!(2)];
-  PALETTE_Y_MODE_CONTEXTS];
+pub static default_palette_y_mode_cdfs: [[[u16; 2]; PALETTE_Y_MODE_CONTEXTS];
   PALETTE_BSIZE_CTXS] = [
   [cdf!(31676), cdf!(3419), cdf!(1261)],
   [cdf!(31912), cdf!(2859), cdf!(980)],
@@ -1225,12 +883,12 @@ pub static default_palette_y_mode_cdfs: [[[u16; cdf_size!(2)];
   [cdf!(32450), cdf!(7946), cdf!(129)],
 ];
 
-pub static default_palette_uv_mode_cdfs: [[u16; cdf_size!(2)];
-  PALETTE_UV_MODE_CONTEXTS] = [cdf!(32461), cdf!(21488)];
+pub static default_palette_uv_mode_cdfs: [[u16; 2]; PALETTE_UV_MODE_CONTEXTS] =
+  [cdf!(32461), cdf!(21488)];
 
 #[allow(unused)]
 pub static default_palette_y_color_index_cdf: [[[u16;
-  cdf_size!(PaletteColor::PALETTE_COLORS as usize)];
+  PaletteColor::PALETTE_COLORS as usize];
   PALETTE_COLOR_INDEX_CONTEXTS];
   PaletteSize::PALETTE_SIZES as usize] = [
   [
@@ -1286,7 +944,7 @@ pub static default_palette_y_color_index_cdf: [[[u16;
 
 #[allow(unused)]
 pub static default_palette_uv_color_index_cdf: [[[u16;
-  cdf_size!(PaletteColor::PALETTE_COLORS as usize)];
+  PaletteColor::PALETTE_COLORS as usize];
   PALETTE_COLOR_INDEX_CONTEXTS];
   PaletteSize::PALETTE_SIZES as usize] = [
   [
@@ -1340,8 +998,7 @@ pub static default_palette_uv_color_index_cdf: [[[u16;
   ],
 ];
 
-pub static default_txfm_partition_cdf: [[u16; cdf_size!(2)];
-  TXFM_PARTITION_CONTEXTS] = [
+pub static default_txfm_partition_cdf: [[u16; 2]; TXFM_PARTITION_CONTEXTS] = [
   cdf!(28581),
   cdf!(23846),
   cdf!(20847),
@@ -1365,21 +1022,19 @@ pub static default_txfm_partition_cdf: [[u16; cdf_size!(2)];
   cdf!(16088),
 ];
 
-pub static default_skip_cdfs: [[u16; cdf_size!(2)]; SKIP_CONTEXTS] =
+pub static default_skip_cdfs: [[u16; 2]; SKIP_CONTEXTS] =
   [cdf!(31671), cdf!(16515), cdf!(4576)];
 
 #[allow(unused)]
-pub static default_skip_mode_cdfs: [[u16; cdf_size!(2)]; SKIP_MODE_CONTEXTS] =
+pub static default_skip_mode_cdfs: [[u16; 2]; SKIP_MODE_CONTEXTS] =
   [cdf!(32621), cdf!(20708), cdf!(8127)];
 
 #[allow(unused)]
-pub static default_compound_idx_cdfs: [[u16; cdf_size!(2)];
-  COMP_INDEX_CONTEXTS] =
+pub static default_compound_idx_cdfs: [[u16; 2]; COMP_INDEX_CONTEXTS] =
   [cdf!(18244), cdf!(12865), cdf!(7053), cdf!(13259), cdf!(9334), cdf!(4644)];
 
 #[allow(unused)]
-pub static default_comp_group_idx_cdfs: [[u16; cdf_size!(2)];
-  COMP_GROUP_IDX_CONTEXTS] = [
+pub static default_comp_group_idx_cdfs: [[u16; 2]; COMP_GROUP_IDX_CONTEXTS] = [
   cdf!(26607),
   cdf!(22891),
   cdf!(18840),
@@ -1389,15 +1044,14 @@ pub static default_comp_group_idx_cdfs: [[u16; cdf_size!(2)];
 ];
 
 #[allow(unused)]
-pub static default_intrabc_cdf: [u16; cdf_size!(2)] = cdf!(30531);
+pub static default_intrabc_cdf: [u16; 2] = cdf!(30531);
 
 #[allow(unused)]
 pub static default_filter_intra_mode_cdf: [u16;
-  cdf_size!(FilterIntraMode::FILTER_INTRA_MODES as usize)] =
+  FilterIntraMode::FILTER_INTRA_MODES as usize] =
   cdf!(8949, 12776, 17211, 29558);
 
-pub static default_filter_intra_cdfs: [[u16; cdf_size!(2)];
-  BlockSize::BLOCK_SIZES_ALL] = [
+pub static default_filter_intra_cdfs: [[u16; 2]; BlockSize::BLOCK_SIZES_ALL] = [
   cdf!(4621),
   cdf!(6743),
   cdf!(5893),
@@ -1422,18 +1076,18 @@ pub static default_filter_intra_cdfs: [[u16; cdf_size!(2)];
   cdf!(16384),
 ];
 
-pub static default_switchable_restore_cdf: [u16;
-  cdf_size!(RESTORE_SWITCHABLE_TYPES)] = cdf!(9413, 22581);
+pub static default_switchable_restore_cdf: [u16; RESTORE_SWITCHABLE_TYPES] =
+  cdf!(9413, 22581);
 
-pub static default_wiener_restore_cdf: [u16; cdf_size!(2)] = cdf!(11570);
+pub static default_wiener_restore_cdf: [u16; 2] = cdf!(11570);
 
-pub static default_sgrproj_restore_cdf: [u16; cdf_size!(2)] = cdf!(16855);
+pub static default_sgrproj_restore_cdf: [u16; 2] = cdf!(16855);
 
 #[allow(unused)]
-pub static default_delta_q_cdf: [u16; cdf_size!(DELTA_Q_PROBS + 1)] =
+pub static default_delta_q_cdf: [u16; DELTA_Q_PROBS + 1] =
   cdf!(28160, 32120, 32677);
 
-pub static default_delta_lf_multi_cdf: [[u16; cdf_size!(DELTA_LF_PROBS + 1)];
+pub static default_delta_lf_multi_cdf: [[u16; DELTA_LF_PROBS + 1];
   FRAME_LF_COUNT] = [
   cdf!(28160, 32120, 32677),
   cdf!(28160, 32120, 32677),
@@ -1441,30 +1095,30 @@ pub static default_delta_lf_multi_cdf: [[u16; cdf_size!(DELTA_LF_PROBS + 1)];
   cdf!(28160, 32120, 32677),
 ];
 
-pub static default_delta_lf_cdf: [u16; cdf_size!(DELTA_LF_PROBS + 1)] =
+pub static default_delta_lf_cdf: [u16; DELTA_LF_PROBS + 1] =
   cdf!(28160, 32120, 32677);
 
 // FIXME(someone) need real defaults here
 #[allow(unused)]
-pub static default_seg_tree_cdf: [u16; cdf_size!(MAX_SEGMENTS)] =
+pub static default_seg_tree_cdf: [u16; MAX_SEGMENTS] =
   cdf!(4096, 8192, 12288, 16384, 20480, 24576, 28672);
 
 #[allow(unused)]
-pub static default_segment_pred_cdf: [[u16; cdf_size!(2)];
-  SEG_TEMPORAL_PRED_CTXS] =
+pub static default_segment_pred_cdf: [[u16; 2]; SEG_TEMPORAL_PRED_CTXS] =
   [cdf!(128 * 128), cdf!(128 * 128), cdf!(128 * 128)];
 
-pub static default_spatial_pred_seg_tree_cdf: [[u16;
-  cdf_size!(MAX_SEGMENTS)];
+pub static default_spatial_pred_seg_tree_cdf: [[u16; MAX_SEGMENTS];
   SPATIAL_PREDICTION_PROBS] = [
   cdf!(5622, 7893, 16093, 18233, 27809, 28373, 32533),
   cdf!(14274, 18230, 22557, 24935, 29980, 30851, 32344),
   cdf!(27527, 28487, 28723, 28890, 32397, 32647, 32679),
 ];
 
-pub static default_tx_size_cdf: [[[u16; cdf_size!(MAX_TX_DEPTH + 1)];
-  TX_SIZE_CONTEXTS]; MAX_TX_CATS] = [
-  [cdf!(19968, CDFMAX), cdf!(19968, CDFMAX), cdf!(24320, CDFMAX)],
+pub static default_tx_size_8x8_cdf: [[u16; MAX_TX_DEPTH]; TX_SIZE_CONTEXTS] =
+  [cdf!(19968), cdf!(19968), cdf!(24320)];
+
+pub static default_tx_size_cdf: [[[u16; MAX_TX_DEPTH + 1]; TX_SIZE_CONTEXTS];
+  BIG_TX_CATS] = [
   [cdf!(12272, 30172), cdf!(12272, 30172), cdf!(18677, 30848)],
   [cdf!(12986, 15180), cdf!(12986, 15180), cdf!(24302, 25602)],
   [cdf!(5782, 11475), cdf!(5782, 11475), cdf!(16803, 22759)],

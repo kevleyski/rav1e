@@ -22,7 +22,7 @@ use crate::FrameState;
 use crate::SegmentationState;
 use crate::Sequence;
 
-use bitstream_io::{BigEndian, BitWriter, LittleEndian};
+use bitstream_io::{BigEndian, BitWrite, BitWriter, LittleEndian};
 
 use std::io;
 
@@ -123,7 +123,7 @@ impl<W: io::Write> ULEB128Writer for BitWriter<W, BigEndian> {
       leb_size
     }
 
-    let mut coded_payload_length = [0 as u8; 8];
+    let mut coded_payload_length: [u8; 8] = [0; 8];
     let leb_size = uleb_encode(payload, &mut coded_payload_length);
     for i in 0..leb_size {
       self.write(8, coded_payload_length[i])?;
@@ -152,7 +152,7 @@ pub trait UncompressedHeader {
     &mut self, obu_type: ObuType, obu_extension: u32,
   ) -> io::Result<()>;
   fn write_metadata_obu(
-    &mut self, obu_meta_type: ObuMetaType, seq: Sequence,
+    &mut self, obu_meta_type: ObuMetaType, seq: &Sequence,
   ) -> io::Result<()>;
   fn write_sequence_header_obu<T: Pixel>(
     &mut self, fi: &FrameInvariants<T>,
@@ -218,7 +218,7 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
   }
 
   fn write_metadata_obu(
-    &mut self, obu_meta_type: ObuMetaType, seq: Sequence,
+    &mut self, obu_meta_type: ObuMetaType, seq: &Sequence,
   ) -> io::Result<()> {
     // header
     self.write_obu_header(ObuType::OBU_METADATA, 0)?;
@@ -273,8 +273,8 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
     self.write_bit(fi.sequence.reduced_still_picture_hdr)?; // reduced_still_picture_header
 
     if fi.sequence.reduced_still_picture_hdr {
-      assert_eq!(fi.sequence.timing_info_present, false);
-      assert_eq!(fi.sequence.decoder_model_info_present_flag, false);
+      assert!(!fi.sequence.timing_info_present);
+      assert!(!fi.sequence.decoder_model_info_present_flag);
       assert_eq!(fi.sequence.operating_points_cnt_minus_1, 0);
       assert_eq!(fi.sequence.operating_point_idc[0], 0);
       self.write(5, 31)?; // level
@@ -283,8 +283,8 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
       self.write_bit(fi.sequence.timing_info_present)?; // timing info present
 
       if fi.sequence.timing_info_present {
-        self.write(32, fi.config.time_base.num)?;
-        self.write(32, fi.config.time_base.den)?;
+        self.write(32, fi.sequence.time_base.num)?;
+        self.write(32, fi.sequence.time_base.den)?;
 
         self.write_bit(true)?; // equal picture interval
         self.write_bit(true)?; // zero interval
@@ -382,72 +382,58 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
     Ok(())
   }
 
+  // <https://aomediacodec.github.io/av1-spec/#color-config-syntax>
   fn write_color_config(&mut self, seq: &Sequence) -> io::Result<()> {
-    let high_bd = seq.bit_depth > 8;
-
-    self.write_bit(high_bd)?;
-
-    if seq.profile == 2 && high_bd {
-      self.write_bit(seq.bit_depth == 12)?;
+    let high_bitdepth = seq.bit_depth > 8;
+    self.write_bit(high_bitdepth)?;
+    if seq.profile == 2 && high_bitdepth {
+      self.write_bit(seq.bit_depth == 12)?; // twelve_bit
     }
 
     let monochrome = seq.chroma_sampling == ChromaSampling::Cs400;
     if seq.profile == 1 {
       assert!(!monochrome);
     } else {
-      self.write_bit(monochrome)?;
+      self.write_bit(monochrome)?; // mono_chrome
     }
 
-    // color description present
+    // color_description_present_flag
     self.write_bit(seq.color_description.is_some())?;
-
-    let mut write_color_range = true;
-
+    let mut srgb_triple = false;
     if let Some(color_description) = seq.color_description {
       self.write(8, color_description.color_primaries as u8)?;
       self.write(8, color_description.transfer_characteristics as u8)?;
       self.write(8, color_description.matrix_coefficients as u8)?;
-
-      if color_description.color_primaries == ColorPrimaries::BT709
-        && color_description.transfer_characteristics
-          == TransferCharacteristics::SRGB
-        && color_description.matrix_coefficients
-          == MatrixCoefficients::Identity
-      {
-        write_color_range = false;
-        assert!(seq.chroma_sampling == ChromaSampling::Cs444);
-      }
+      srgb_triple = color_description.is_srgb_triple();
     }
 
-    if write_color_range {
-      self.write_bit(seq.pixel_range == PixelRange::Full)?; // full color range
-
-      if monochrome {
-        return Ok(());
-      }
-
-      let subsampling_x = seq.chroma_sampling != ChromaSampling::Cs444;
-      let subsampling_y = seq.chroma_sampling == ChromaSampling::Cs420;
-
+    if monochrome || !srgb_triple {
+      self.write_bit(seq.pixel_range == PixelRange::Full)?; // color_range
+    }
+    if monochrome {
+      return Ok(());
+    } else if srgb_triple {
+      assert!(seq.pixel_range == PixelRange::Full);
+      assert!(seq.chroma_sampling == ChromaSampling::Cs444);
+    } else {
       if seq.profile == 0 {
         assert!(seq.chroma_sampling == ChromaSampling::Cs420);
       } else if seq.profile == 1 {
         assert!(seq.chroma_sampling == ChromaSampling::Cs444);
       } else if seq.bit_depth == 12 {
+        let subsampling_x = seq.chroma_sampling != ChromaSampling::Cs444;
+        let subsampling_y = seq.chroma_sampling == ChromaSampling::Cs420;
         self.write_bit(subsampling_x)?;
-
         if subsampling_x {
           self.write_bit(subsampling_y)?;
         }
       } else {
         assert!(seq.chroma_sampling == ChromaSampling::Cs422);
       }
-
       if seq.chroma_sampling == ChromaSampling::Cs420 {
         self.write(2, seq.chroma_sample_position as u32)?;
       }
     }
-
     self.write_bit(true)?; // separate_uv_delta_q
 
     Ok(())
@@ -578,11 +564,10 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
       // Inter frame info goes here
       if fi.intra_only {
         assert!(fi.refresh_frame_flags != ALL_REF_FRAMES_MASK);
-        self.write(REF_FRAMES as u32, fi.refresh_frame_flags)?;
       } else {
         // TODO: This should be set once inter mode is used
-        self.write(REF_FRAMES as u32, fi.refresh_frame_flags)?;
       }
+      self.write(REF_FRAMES as u32, fi.refresh_frame_flags)?;
     };
 
     if (!fi.intra_only || fi.refresh_frame_flags != ALL_REF_FRAMES_MASK) {
@@ -665,7 +650,7 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
     // Can we use the uniform spacing tile syntax?  'Uniform spacing'
     // is a slight misnomer; it's more constrained than just a uniform
     // spacing.
-    let ti = &fi.tiling;
+    let ti = &fi.sequence.tiling;
 
     if fi.sb_width.align_power_of_two_and_shift(ti.tile_cols_log2)
       == ti.tile_width_sb
@@ -843,7 +828,6 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
     if fi.large_scale_tile {
       unimplemented!();
     }
-    self.write_bit(true)?; // trailing bit
     self.byte_align()?;
 
     Ok(())
@@ -857,8 +841,8 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
     // when we add support for it.
     let width = fi.width - 1;
     let height = fi.height - 1;
-    let width_bits = 32 - (width as u32).leading_zeros();
-    let height_bits = 32 - (height as u32).leading_zeros();
+    let width_bits = log_in_base_2(width as u32) as u32 + 1;
+    let height_bits = log_in_base_2(height as u32) as u32 + 1;
     assert!(width_bits <= 16);
     assert!(height_bits <= 16);
     self.write(4, width_bits - 1)?;
@@ -876,8 +860,8 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
     if fi.frame_size_override_flag {
       let width = fi.width - 1;
       let height = fi.height - 1;
-      let width_bits = 32 - (width as u32).leading_zeros();
-      let height_bits = 32 - (height as u32).leading_zeros();
+      let width_bits = log_in_base_2(width as u32) as u32 + 1;
+      let height_bits = log_in_base_2(height as u32) as u32 + 1;
       assert!(width_bits <= 16);
       assert!(height_bits <= 16);
       self.write(width_bits, width as u16)?;
@@ -1006,7 +990,7 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
   fn write_frame_cdef<T: Pixel>(
     &mut self, fi: &FrameInvariants<T>,
   ) -> io::Result<()> {
-    if fi.sequence.enable_cdef {
+    if fi.sequence.enable_cdef && !fi.allow_intrabc {
       assert!(fi.cdef_damping >= 3);
       assert!(fi.cdef_damping <= 6);
       self.write(2, fi.cdef_damping - 3)?;
@@ -1082,8 +1066,8 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
 
     if segmentation.enabled {
       if fi.primary_ref_frame == PRIMARY_REF_NONE {
-        assert_eq!(segmentation.update_map, true);
-        assert_eq!(segmentation.update_data, true);
+        assert!(segmentation.update_map);
+        assert!(segmentation.update_data);
       } else {
         self.write_bit(segmentation.update_map)?;
         if segmentation.update_map {

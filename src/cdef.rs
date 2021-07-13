@@ -11,9 +11,9 @@ use crate::color::ChromaSampling::Cs400;
 use crate::context::*;
 use crate::encoder::FrameInvariants;
 use crate::frame::*;
-use crate::hawktracer::*;
 use crate::tiling::*;
 use crate::util::{clamp, msb, CastFromPrimitive, Pixel};
+use rust_hawktracer::*;
 
 use crate::cpu_features::CpuFeatureLevel;
 use std::cmp;
@@ -255,7 +255,7 @@ pub(crate) mod rust {
         for j in 0..xsize {
           let ptr_in = input.offset(i * istride + j);
           let x = i32::cast_from(*ptr_in);
-          let mut sum = 0 as i32;
+          let mut sum: i32 = 0;
           let mut max = x;
           let mut min = x;
           for k in 0..2usize {
@@ -386,7 +386,7 @@ pub fn cdef_analyze_superblock<T: Pixel>(
 //   provided blocks co-locate with the output region.  The TileBlocks
 //   provide by-[super]qblock CDEF parameters.
 
-//   output: TileMut detination for filtered pixels.  The output's
+//   output: TileMut destination for filtered pixels.  The output's
 //   rect specifies the region of the input to be processed (x and y
 //   are relative to the input Frame's origin).  Note that an
 //   additional area of 2 pixels of padding is used for CDEF.  When
@@ -578,7 +578,7 @@ pub fn cdef_filter_superblock<T: Pixel>(
 //   tb: the TileBlocks associated with the filtered region; the
 //   provided blocks co-locate with the output region.
 
-//   output: TileMut detination for filtered pixels.  The output's
+//   output: TileMut destination for filtered pixels.  The output's
 //   rect specifies the region of the input to be processed (x and y
 //   are relative to the input Frame's origin).  Note that an
 //   additional area of 2 pixels of padding is used for CDEF.  When

@@ -211,13 +211,15 @@ impl Default for Block {
 
 #[derive(Clone)]
 pub struct BlockContextCheckpoint {
+  x: usize,
+  chroma_sampling: ChromaSampling,
   cdef_coded: bool,
-  above_partition_context: [u8; PARTITION_CONTEXT_MAX_WIDTH],
+  above_partition_context: [u8; MIB_SIZE >> 1],
   // left context is also at 8x8 granularity
   left_partition_context: [u8; MIB_SIZE >> 1],
-  above_tx_context: [u8; COEFF_CONTEXT_MAX_WIDTH],
+  above_tx_context: [u8; MIB_SIZE],
   left_tx_context: [u8; MIB_SIZE],
-  above_coeff_context: [[u8; COEFF_CONTEXT_MAX_WIDTH]; MAX_PLANES],
+  above_coeff_context: [[u8; MIB_SIZE]; MAX_PLANES],
   left_coeff_context: [[u8; MIB_SIZE]; MAX_PLANES],
 }
 
@@ -256,25 +258,64 @@ impl<'a> BlockContext<'a> {
     }
   }
 
-  pub const fn checkpoint(&self) -> BlockContextCheckpoint {
-    BlockContextCheckpoint {
+  pub fn checkpoint(
+    &self, tile_bo: &TileBlockOffset, chroma_sampling: ChromaSampling,
+  ) -> BlockContextCheckpoint {
+    let x = tile_bo.0.x & (COEFF_CONTEXT_MAX_WIDTH - MIB_SIZE);
+    let mut checkpoint = BlockContextCheckpoint {
+      x,
+      chroma_sampling,
       cdef_coded: self.cdef_coded,
-      above_partition_context: self.above_partition_context,
+      above_partition_context: [0; MIB_SIZE >> 1],
       left_partition_context: self.left_partition_context,
-      above_tx_context: self.above_tx_context,
+      above_tx_context: [0; MIB_SIZE],
       left_tx_context: self.left_tx_context,
-      above_coeff_context: self.above_coeff_context,
+      above_coeff_context: [[0; MIB_SIZE]; MAX_PLANES],
       left_coeff_context: self.left_coeff_context,
+    };
+    checkpoint.above_partition_context.copy_from_slice(
+      &self.above_partition_context[(x >> 1)..][..(MIB_SIZE >> 1)],
+    );
+    checkpoint
+      .above_tx_context
+      .copy_from_slice(&self.above_tx_context[x..][..MIB_SIZE]);
+    let num_planes =
+      if chroma_sampling == ChromaSampling::Cs400 { 1 } else { 3 };
+    for (p, (dst, src)) in checkpoint
+      .above_coeff_context
+      .iter_mut()
+      .zip(self.above_coeff_context.iter())
+      .enumerate()
+      .take(num_planes)
+    {
+      let xdec = (p > 0 && chroma_sampling != ChromaSampling::Cs444) as usize;
+      dst.copy_from_slice(&src[(x >> xdec)..][..MIB_SIZE]);
     }
+    checkpoint
   }
 
   pub fn rollback(&mut self, checkpoint: &BlockContextCheckpoint) {
+    let x = checkpoint.x & (COEFF_CONTEXT_MAX_WIDTH - MIB_SIZE);
     self.cdef_coded = checkpoint.cdef_coded;
-    self.above_partition_context = checkpoint.above_partition_context;
+    self.above_partition_context[(x >> 1)..][..(MIB_SIZE >> 1)]
+      .copy_from_slice(&checkpoint.above_partition_context);
     self.left_partition_context = checkpoint.left_partition_context;
-    self.above_tx_context = checkpoint.above_tx_context;
+    self.above_tx_context[x..][..MIB_SIZE]
+      .copy_from_slice(&checkpoint.above_tx_context);
     self.left_tx_context = checkpoint.left_tx_context;
-    self.above_coeff_context = checkpoint.above_coeff_context;
+    let num_planes =
+      if checkpoint.chroma_sampling == ChromaSampling::Cs400 { 1 } else { 3 };
+    for (p, (dst, src)) in self
+      .above_coeff_context
+      .iter_mut()
+      .zip(checkpoint.above_coeff_context.iter())
+      .enumerate()
+      .take(num_planes)
+    {
+      let xdec = (p > 0 && checkpoint.chroma_sampling != ChromaSampling::Cs444)
+        as usize;
+      dst[(x >> xdec)..][..MIB_SIZE].copy_from_slice(src);
+    }
     self.left_coeff_context = checkpoint.left_coeff_context;
   }
 
@@ -484,20 +525,28 @@ impl<'a> BlockContext<'a> {
 }
 
 #[derive(Clone, Copy)]
+#[repr(C)]
 pub struct NMVComponent {
-  pub classes_cdf: [u16; MV_CLASSES + 1],
-  pub class0_fp_cdf: [[u16; MV_FP_SIZE + 1]; CLASS0_SIZE],
-  pub fp_cdf: [u16; MV_FP_SIZE + 1],
-  pub sign_cdf: [u16; 2 + 1],
-  pub class0_hp_cdf: [u16; 2 + 1],
-  pub hp_cdf: [u16; 2 + 1],
-  pub class0_cdf: [u16; CLASS0_SIZE + 1],
-  pub bits_cdf: [[u16; 2 + 1]; MV_OFFSET_BITS],
+  pub sign_cdf: [u16; 2],
+  pub class0_hp_cdf: [u16; 2],
+  pub hp_cdf: [u16; 2],
+  pub class0_cdf: [u16; CLASS0_SIZE],
+  pub bits_cdf: [[u16; 2]; MV_OFFSET_BITS],
+
+  pub class0_fp_cdf: [[u16; MV_FP_SIZE]; CLASS0_SIZE],
+  pub fp_cdf: [u16; MV_FP_SIZE],
+
+  pub classes_cdf: [u16; MV_CLASSES],
+  // MV_CLASSES + 5 == 16; pad the last CDF for rollback.
+  padding: [u16; 5],
 }
 
 #[derive(Clone, Copy)]
+#[repr(C)]
 pub struct NMVContext {
-  pub joints_cdf: [u16; MV_JOINTS + 1],
+  pub joints_cdf: [u16; MV_JOINTS],
+  // MV_JOINTS + 12 == 16; pad the last CDF for rollback.
+  padding: [u16; 12],
   pub comps: [NMVComponent; 2],
 }
 
@@ -505,6 +554,7 @@ pub struct NMVContext {
 pub static default_nmv_context: NMVContext = {
   NMVContext {
     joints_cdf: cdf!(4096, 11264, 19328),
+    padding: [0; 12],
     comps: [
       NMVComponent {
         classes_cdf: cdf!(
@@ -528,6 +578,7 @@ pub static default_nmv_context: NMVContext = {
           cdf!(128 * 234),
           cdf!(128 * 240),
         ],
+        padding: [0; 5],
       },
       NMVComponent {
         classes_cdf: cdf!(
@@ -551,6 +602,7 @@ pub static default_nmv_context: NMVContext = {
           cdf!(128 * 234),
           cdf!(128 * 240),
         ],
+        padding: [0; 5],
       },
     ],
   }
@@ -625,7 +677,7 @@ impl IndexMut<PlaneBlockOffset> for FrameBlocks {
 impl<'a> ContextWriter<'a> {
   pub fn get_cdf_intra_mode_kf(
     &self, bo: TileBlockOffset,
-  ) -> &[u16; INTRA_MODES + 1] {
+  ) -> &[u16; INTRA_MODES] {
     static intra_mode_context: [usize; INTRA_MODES] =
       [0, 1, 2, 3, 4, 4, 4, 4, 3, 0, 1, 2, 0];
     let above_mode = if bo.0.y > 0 {
@@ -643,8 +695,8 @@ impl<'a> ContextWriter<'a> {
     &self.fc.kf_y_cdf[above_ctx][left_ctx]
   }
 
-  pub fn write_intra_mode_kf(
-    &mut self, w: &mut dyn Writer, bo: TileBlockOffset, mode: PredictionMode,
+  pub fn write_intra_mode_kf<W: Writer>(
+    &mut self, w: &mut W, bo: TileBlockOffset, mode: PredictionMode,
   ) {
     static intra_mode_context: [usize; INTRA_MODES] =
       [0, 1, 2, 3, 4, 4, 4, 4, 3, 0, 1, 2, 0];
@@ -664,15 +716,13 @@ impl<'a> ContextWriter<'a> {
     symbol_with_update!(self, w, mode as u32, cdf);
   }
 
-  pub fn get_cdf_intra_mode(
-    &self, bsize: BlockSize,
-  ) -> &[u16; INTRA_MODES + 1] {
+  pub fn get_cdf_intra_mode(&self, bsize: BlockSize) -> &[u16; INTRA_MODES] {
     &self.fc.y_mode_cdf[size_group_lookup[bsize as usize] as usize]
   }
 
   #[inline]
-  pub fn write_intra_mode(
-    &mut self, w: &mut dyn Writer, bsize: BlockSize, mode: PredictionMode,
+  pub fn write_intra_mode<W: Writer>(
+    &mut self, w: &mut W, bsize: BlockSize, mode: PredictionMode,
   ) {
     let cdf =
       &mut self.fc.y_mode_cdf[size_group_lookup[bsize as usize] as usize];
@@ -680,22 +730,22 @@ impl<'a> ContextWriter<'a> {
   }
 
   #[inline]
-  pub fn write_intra_uv_mode(
-    &mut self, w: &mut dyn Writer, uv_mode: PredictionMode,
-    y_mode: PredictionMode, bs: BlockSize,
+  pub fn write_intra_uv_mode<W: Writer>(
+    &mut self, w: &mut W, uv_mode: PredictionMode, y_mode: PredictionMode,
+    bs: BlockSize,
   ) {
-    let cdf =
-      &mut self.fc.uv_mode_cdf[bs.cfl_allowed() as usize][y_mode as usize];
     if bs.cfl_allowed() {
+      let cdf = &mut self.fc.uv_mode_cfl_cdf[y_mode as usize];
       symbol_with_update!(self, w, uv_mode as u32, cdf);
     } else {
-      symbol_with_update!(self, w, uv_mode as u32, &mut cdf[..UV_INTRA_MODES]);
+      let cdf = &mut self.fc.uv_mode_cdf[y_mode as usize];
+      symbol_with_update!(self, w, uv_mode as u32, cdf);
     }
   }
 
   #[inline]
-  pub fn write_angle_delta(
-    &mut self, w: &mut dyn Writer, angle: i8, mode: PredictionMode,
+  pub fn write_angle_delta<W: Writer>(
+    &mut self, w: &mut W, angle: i8, mode: PredictionMode,
   ) {
     symbol_with_update!(
       self,
@@ -706,21 +756,17 @@ impl<'a> ContextWriter<'a> {
     );
   }
 
-  pub fn write_use_filter_intra(
-    &mut self, w: &mut dyn Writer, enable: bool, block_size: BlockSize,
+  pub fn write_use_filter_intra<W: Writer>(
+    &mut self, w: &mut W, enable: bool, block_size: BlockSize,
   ) {
-    symbol_with_update!(
-      self,
-      w,
-      enable as u32,
-      &mut self.fc.filter_intra_cdfs[block_size as usize]
-    );
+    let cdf = &mut self.fc.filter_intra_cdfs[block_size as usize];
+    symbol_with_update!(self, w, enable as u32, cdf, 2);
   }
 
-  pub fn write_use_palette_mode(
-    &mut self, w: &mut dyn Writer, enable: bool, bsize: BlockSize,
-    bo: TileBlockOffset, luma_mode: PredictionMode,
-    chroma_mode: PredictionMode, xdec: usize, ydec: usize, cs: ChromaSampling,
+  pub fn write_use_palette_mode<W: Writer>(
+    &mut self, w: &mut W, enable: bool, bsize: BlockSize, bo: TileBlockOffset,
+    luma_mode: PredictionMode, chroma_mode: PredictionMode, xdec: usize,
+    ydec: usize, cs: ChromaSampling,
   ) {
     if enable {
       unimplemented!(); // TODO
@@ -730,23 +776,15 @@ impl<'a> ContextWriter<'a> {
 
     if luma_mode == PredictionMode::DC_PRED {
       let bsize_ctx = bsize.width_mi_log2() + bsize.height_mi_log2() - 2;
-      symbol_with_update!(
-        self,
-        w,
-        enable as u32,
-        &mut self.fc.palette_y_mode_cdfs[bsize_ctx][ctx_luma]
-      );
+      let cdf = &mut self.fc.palette_y_mode_cdfs[bsize_ctx][ctx_luma];
+      symbol_with_update!(self, w, enable as u32, cdf, 2);
     }
 
     if has_chroma(bo, bsize, xdec, ydec, cs)
       && chroma_mode == PredictionMode::DC_PRED
     {
-      symbol_with_update!(
-        self,
-        w,
-        enable as u32,
-        &mut self.fc.palette_uv_mode_cdfs[ctx_chroma]
-      );
+      let cdf = &mut self.fc.palette_uv_mode_cdfs[ctx_chroma];
+      symbol_with_update!(self, w, enable as u32, cdf, 2);
     }
   }
 
@@ -769,7 +807,7 @@ impl<'a> ContextWriter<'a> {
   }
 
   fn find_matching_mv(
-    mv: MotionVector, mv_stack: &mut ArrayVec<[CandidateMV; 9]>,
+    mv: MotionVector, mv_stack: &mut ArrayVec<CandidateMV, 9>,
   ) -> bool {
     for mv_cand in mv_stack {
       if mv.row == mv_cand.this_mv.row && mv.col == mv_cand.this_mv.col {
@@ -780,7 +818,7 @@ impl<'a> ContextWriter<'a> {
   }
 
   fn find_matching_mv_and_update_weight(
-    mv: MotionVector, mv_stack: &mut ArrayVec<[CandidateMV; 9]>, weight: u32,
+    mv: MotionVector, mv_stack: &mut ArrayVec<CandidateMV, 9>, weight: u32,
   ) -> bool {
     for mut mv_cand in mv_stack {
       if mv.row == mv_cand.this_mv.row && mv.col == mv_cand.this_mv.col {
@@ -792,7 +830,7 @@ impl<'a> ContextWriter<'a> {
   }
 
   fn find_matching_comp_mv_and_update_weight(
-    mvs: [MotionVector; 2], mv_stack: &mut ArrayVec<[CandidateMV; 9]>,
+    mvs: [MotionVector; 2], mv_stack: &mut ArrayVec<CandidateMV, 9>,
     weight: u32,
   ) -> bool {
     for mv_cand in mv_stack {
@@ -810,7 +848,7 @@ impl<'a> ContextWriter<'a> {
 
   fn add_ref_mv_candidate(
     ref_frames: [RefType; 2], blk: &Block,
-    mv_stack: &mut ArrayVec<[CandidateMV; 9]>, weight: u32,
+    mv_stack: &mut ArrayVec<CandidateMV, 9>, weight: u32,
     newmv_count: &mut usize, is_compound: bool,
   ) -> bool {
     if !blk.is_inter() {
@@ -870,7 +908,7 @@ impl<'a> ContextWriter<'a> {
 
   fn add_extra_mv_candidate<T: Pixel>(
     blk: &Block, ref_frames: [RefType; 2],
-    mv_stack: &mut ArrayVec<[CandidateMV; 9]>, fi: &FrameInvariants<T>,
+    mv_stack: &mut ArrayVec<CandidateMV, 9>, fi: &FrameInvariants<T>,
     is_compound: bool, ref_id_count: &mut [usize; 2],
     ref_id_mvs: &mut [[MotionVector; 2]; 2], ref_diff_count: &mut [usize; 2],
     ref_diff_mvs: &mut [[MotionVector; 2]; 2],
@@ -925,7 +963,7 @@ impl<'a> ContextWriter<'a> {
   fn scan_row_mbmi(
     &self, bo: TileBlockOffset, row_offset: isize, max_row_offs: isize,
     processed_rows: &mut isize, ref_frames: [RefType; 2],
-    mv_stack: &mut ArrayVec<[CandidateMV; 9]>, newmv_count: &mut usize,
+    mv_stack: &mut ArrayVec<CandidateMV, 9>, newmv_count: &mut usize,
     bsize: BlockSize, is_compound: bool,
   ) -> bool {
     let bc = &self.bc;
@@ -963,7 +1001,7 @@ impl<'a> ContextWriter<'a> {
         len = cmp::max(len, n4_w_8);
       }
 
-      let mut weight = 2 as u32;
+      let mut weight: u32 = 2;
       if target_n4_w >= n4_w_8 && target_n4_w <= n4_w {
         let inc = cmp::min(-max_row_offs + row_offset + 1, cand.n4_h as isize);
         assert!(inc >= 0);
@@ -991,7 +1029,7 @@ impl<'a> ContextWriter<'a> {
   fn scan_col_mbmi(
     &self, bo: TileBlockOffset, col_offset: isize, max_col_offs: isize,
     processed_cols: &mut isize, ref_frames: [RefType; 2],
-    mv_stack: &mut ArrayVec<[CandidateMV; 9]>, newmv_count: &mut usize,
+    mv_stack: &mut ArrayVec<CandidateMV, 9>, newmv_count: &mut usize,
     bsize: BlockSize, is_compound: bool,
   ) -> bool {
     let bc = &self.bc;
@@ -1029,7 +1067,7 @@ impl<'a> ContextWriter<'a> {
         len = cmp::max(len, n4_h_8);
       }
 
-      let mut weight = 2 as u32;
+      let mut weight: u32 = 2;
       if target_n4_h >= n4_h_8 && target_n4_h <= n4_h {
         let inc = cmp::min(-max_col_offs + col_offset + 1, cand.n4_w as isize);
         assert!(inc >= 0);
@@ -1056,7 +1094,7 @@ impl<'a> ContextWriter<'a> {
 
   fn scan_blk_mbmi(
     &self, bo: TileBlockOffset, ref_frames: [RefType; 2],
-    mv_stack: &mut ArrayVec<[CandidateMV; 9]>, newmv_count: &mut usize,
+    mv_stack: &mut ArrayVec<CandidateMV, 9>, newmv_count: &mut usize,
     is_compound: bool,
   ) -> bool {
     if bo.0.x >= self.bc.blocks.cols() || bo.0.y >= self.bc.blocks.rows() {
@@ -1075,7 +1113,7 @@ impl<'a> ContextWriter<'a> {
     )
   }
 
-  fn add_offset(mv_stack: &mut ArrayVec<[CandidateMV; 9]>) {
+  fn add_offset(mv_stack: &mut ArrayVec<CandidateMV, 9>) {
     for mut cand_mv in mv_stack {
       cand_mv.weight += REF_CAT_LEVEL;
     }
@@ -1083,7 +1121,7 @@ impl<'a> ContextWriter<'a> {
 
   fn setup_mvref_list<T: Pixel>(
     &self, bo: TileBlockOffset, ref_frames: [RefType; 2],
-    mv_stack: &mut ArrayVec<[CandidateMV; 9]>, bsize: BlockSize,
+    mv_stack: &mut ArrayVec<CandidateMV, 9>, bsize: BlockSize,
     fi: &FrameInvariants<T>, is_compound: bool,
   ) -> usize {
     let (_rf, _rf_num) = (INTRA_FRAME, 1);
@@ -1091,16 +1129,16 @@ impl<'a> ContextWriter<'a> {
     let target_n4_h = bsize.height_mi();
     let target_n4_w = bsize.width_mi();
 
-    let mut max_row_offs = 0 as isize;
+    let mut max_row_offs: isize = 0;
     let row_adj =
       (target_n4_h < BLOCK_8X8.height_mi()) && (bo.0.y & 0x01) != 0x0;
 
-    let mut max_col_offs = 0 as isize;
+    let mut max_col_offs: isize = 0;
     let col_adj =
       (target_n4_w < BLOCK_8X8.width_mi()) && (bo.0.x & 0x01) != 0x0;
 
-    let mut processed_rows = 0 as isize;
-    let mut processed_cols = 0 as isize;
+    let mut processed_rows: isize = 0;
+    let mut processed_cols: isize = 0;
 
     let up_avail = bo.0.y > 0;
     let left_avail = bo.0.x > 0;
@@ -1258,8 +1296,8 @@ impl<'a> ContextWriter<'a> {
       let passes =
         if up_avail { 0 } else { 1 }..if left_avail { 2 } else { 1 };
 
-      let mut ref_id_count = [0 as usize; 2];
-      let mut ref_diff_count = [0 as usize; 2];
+      let mut ref_id_count: [usize; 2] = [0; 2];
+      let mut ref_diff_count: [usize; 2] = [0; 2];
       let mut ref_id_mvs = [[MotionVector::default(); 2]; 2];
       let mut ref_diff_mvs = [[MotionVector::default(); 2]; 2];
 
@@ -1379,7 +1417,7 @@ impl<'a> ContextWriter<'a> {
 
   pub fn find_mvrefs<T: Pixel>(
     &self, bo: TileBlockOffset, ref_frames: [RefType; 2],
-    mv_stack: &mut ArrayVec<[CandidateMV; 9]>, bsize: BlockSize,
+    mv_stack: &mut ArrayVec<CandidateMV, 9>, bsize: BlockSize,
     fi: &FrameInvariants<T>, is_compound: bool,
   ) -> usize {
     assert!(ref_frames[0] != NONE_FRAME);
@@ -1611,8 +1649,8 @@ impl<'a> ContextWriter<'a> {
     }
   }
 
-  pub fn write_compound_mode(
-    &mut self, w: &mut dyn Writer, mode: PredictionMode, ctx: usize,
+  pub fn write_compound_mode<W: Writer>(
+    &mut self, w: &mut W, mode: PredictionMode, ctx: usize,
   ) {
     let newmv_ctx = ctx & NEWMV_CTX_MASK;
     let refmv_ctx = (ctx >> REFMV_OFFSET) & REFMV_CTX_MASK;
@@ -1646,45 +1684,35 @@ impl<'a> ContextWriter<'a> {
     symbol_with_update!(self, w, val, &mut self.fc.compound_mode_cdf[ctx]);
   }
 
-  pub fn write_inter_mode(
-    &mut self, w: &mut dyn Writer, mode: PredictionMode, ctx: usize,
+  pub fn write_inter_mode<W: Writer>(
+    &mut self, w: &mut W, mode: PredictionMode, ctx: usize,
   ) {
+    use PredictionMode::{GLOBALMV, NEARESTMV, NEWMV};
     let newmv_ctx = ctx & NEWMV_CTX_MASK;
-    symbol_with_update!(
-      self,
-      w,
-      (mode != PredictionMode::NEWMV) as u32,
-      &mut self.fc.newmv_cdf[newmv_ctx]
-    );
-    if mode != PredictionMode::NEWMV {
+    let cdf = &mut self.fc.newmv_cdf[newmv_ctx];
+    symbol_with_update!(self, w, (mode != NEWMV) as u32, cdf, 2);
+    if mode != NEWMV {
       let zeromv_ctx = (ctx >> GLOBALMV_OFFSET) & GLOBALMV_CTX_MASK;
-      symbol_with_update!(
-        self,
-        w,
-        (mode != PredictionMode::GLOBALMV) as u32,
-        &mut self.fc.zeromv_cdf[zeromv_ctx]
-      );
-      if mode != PredictionMode::GLOBALMV {
+      let cdf = &mut self.fc.zeromv_cdf[zeromv_ctx];
+      symbol_with_update!(self, w, (mode != GLOBALMV) as u32, cdf, 2);
+      if mode != GLOBALMV {
         let refmv_ctx = (ctx >> REFMV_OFFSET) & REFMV_CTX_MASK;
-        symbol_with_update!(
-          self,
-          w,
-          (mode != PredictionMode::NEARESTMV) as u32,
-          &mut self.fc.refmv_cdf[refmv_ctx]
-        );
+        let cdf = &mut self.fc.refmv_cdf[refmv_ctx];
+        symbol_with_update!(self, w, (mode != NEARESTMV) as u32, cdf, 2);
       }
     }
   }
 
   #[inline]
-  pub fn write_drl_mode(
-    &mut self, w: &mut dyn Writer, drl_mode: bool, ctx: usize,
+  pub fn write_drl_mode<W: Writer>(
+    &mut self, w: &mut W, drl_mode: bool, ctx: usize,
   ) {
-    symbol_with_update!(self, w, drl_mode as u32, &mut self.fc.drl_cdfs[ctx]);
+    let cdf = &mut self.fc.drl_cdfs[ctx];
+    symbol_with_update!(self, w, drl_mode as u32, cdf, 2);
   }
 
-  pub fn write_mv(
-    &mut self, w: &mut dyn Writer, mv: MotionVector, ref_mv: MotionVector,
+  pub fn write_mv<W: Writer>(
+    &mut self, w: &mut W, mv: MotionVector, ref_mv: MotionVector,
     mv_precision: MvSubpelPrecision,
   ) {
     // <https://aomediacodec.github.io/av1-spec/#assign-mv-semantics>
@@ -1694,34 +1722,34 @@ impl<'a> ContextWriter<'a> {
       MotionVector { row: mv.row - ref_mv.row, col: mv.col - ref_mv.col };
     let j: MvJointType = av1_get_mv_joint(diff);
 
-    w.symbol_with_update(j as u32, &mut self.fc.nmv_context.joints_cdf);
+    let cdf = &mut self.fc.nmv_context.joints_cdf;
+    symbol_with_update!(self, w, j as u32, cdf, 4);
 
     if mv_joint_vertical(j) {
-      encode_mv_component(
-        w,
-        diff.row as i32,
-        &mut self.fc.nmv_context.comps[0],
-        mv_precision,
-      );
+      self.encode_mv_component(w, diff.row as i32, 0, mv_precision);
     }
     if mv_joint_horizontal(j) {
-      encode_mv_component(
-        w,
-        diff.col as i32,
-        &mut self.fc.nmv_context.comps[1],
-        mv_precision,
-      );
+      self.encode_mv_component(w, diff.col as i32, 1, mv_precision);
     }
   }
 
-  pub fn write_block_deblock_deltas(
-    &mut self, w: &mut dyn Writer, bo: TileBlockOffset, multi: bool,
-    planes: usize,
+  pub fn write_block_deblock_deltas<W: Writer>(
+    &mut self, w: &mut W, bo: TileBlockOffset, multi: bool, planes: usize,
   ) {
-    fn write_block_delta(w: &mut dyn Writer, cdf: &mut [u16], delta: i8) {
+    let block = &self.bc.blocks[bo];
+    let deltas_count = if multi { FRAME_LF_COUNT + planes - 3 } else { 1 };
+    let deltas = &block.deblock_deltas[..deltas_count];
+    let cdf1 = &mut [self.fc.deblock_delta_cdf];
+    let cdfs = if multi {
+      &mut self.fc.deblock_delta_multi_cdf[..deltas_count]
+    } else {
+      cdf1
+    };
+
+    for (&delta, cdf) in deltas.iter().zip(cdfs.iter_mut()) {
       let abs = delta.abs() as u32;
 
-      w.symbol_with_update(cmp::min(abs, DELTA_LF_SMALL), cdf);
+      symbol_with_update!(self, w, cmp::min(abs, DELTA_LF_SMALL), cdf, 4);
 
       if abs >= DELTA_LF_SMALL {
         let bits = msb(abs as i32 - 1) as u32;
@@ -1732,39 +1760,20 @@ impl<'a> ContextWriter<'a> {
         w.bool(delta < 0, 16384);
       }
     }
-
-    let block = &self.bc.blocks[bo];
-    if multi {
-      let deltas_count = FRAME_LF_COUNT + planes - 3;
-      let deltas = &block.deblock_deltas[..deltas_count];
-      let cdfs = &mut self.fc.deblock_delta_multi_cdf[..deltas_count];
-
-      for (&delta, cdf) in deltas.iter().zip(cdfs.iter_mut()) {
-        write_block_delta(w, cdf, delta);
-      }
-    } else {
-      let delta = block.deblock_deltas[0];
-      let cdf = &mut self.fc.deblock_delta_cdf;
-      write_block_delta(w, cdf, delta);
-    }
   }
 
-  pub fn write_is_inter(
-    &mut self, w: &mut dyn Writer, bo: TileBlockOffset, is_inter: bool,
+  pub fn write_is_inter<W: Writer>(
+    &mut self, w: &mut W, bo: TileBlockOffset, is_inter: bool,
   ) {
     let ctx = self.bc.intra_inter_context(bo);
-    symbol_with_update!(
-      self,
-      w,
-      is_inter as u32,
-      &mut self.fc.intra_inter_cdfs[ctx]
-    );
+    let cdf = &mut self.fc.intra_inter_cdfs[ctx];
+    symbol_with_update!(self, w, is_inter as u32, cdf, 2);
   }
 
-  pub fn write_coeffs_lv_map<T: Coefficient>(
-    &mut self, w: &mut dyn Writer, plane: usize, bo: TileBlockOffset,
-    coeffs_in: &[T], eob: usize, pred_mode: PredictionMode, tx_size: TxSize,
-    tx_type: TxType, plane_bsize: BlockSize, xdec: usize, ydec: usize,
+  pub fn write_coeffs_lv_map<T: Coefficient, W: Writer>(
+    &mut self, w: &mut W, plane: usize, bo: TileBlockOffset, coeffs_in: &[T],
+    eob: usize, pred_mode: PredictionMode, tx_size: TxSize, tx_type: TxType,
+    plane_bsize: BlockSize, xdec: usize, ydec: usize,
     use_reduced_tx_set: bool, frame_clipped_txw: usize,
     frame_clipped_txh: usize,
   ) -> bool {
@@ -1779,7 +1788,7 @@ impl<'a> ContextWriter<'a> {
     let height = av1_get_coded_tx_size(tx_size).height();
 
     // Create a slice with coeffs in scan order
-    let mut coeffs_storage: Aligned<ArrayVec<[T; 32 * 32]>> =
+    let mut coeffs_storage: Aligned<ArrayVec<T, { 32 * 32 }>> =
       Aligned::new(ArrayVec::new());
     let coeffs = &mut coeffs_storage.data;
     coeffs.extend(scan.iter().map(|&scan_idx| coeffs_in[scan_idx as usize]));
@@ -1800,7 +1809,7 @@ impl<'a> ContextWriter<'a> {
 
     {
       let cdf = &mut self.fc.txb_skip_cdf[txs_ctx][txb_ctx.txb_skip_ctx];
-      symbol_with_update!(self, w, (eob == 0) as u32, cdf);
+      symbol_with_update!(self, w, (eob == 0) as u32, cdf, 2);
     }
 
     if eob == 0 {
@@ -1830,25 +1839,41 @@ impl<'a> ContextWriter<'a> {
     }
 
     // Encode EOB
-    let mut eob_extra = 0 as u32;
+    let mut eob_extra: u32 = 0;
     let eob_pt = Self::get_eob_pos_token(eob, &mut eob_extra);
     let eob_multi_size: usize = tx_size.area_log2() - 4;
     let eob_multi_ctx: usize = if tx_class == TX_CLASS_2D { 0 } else { 1 };
 
-    symbol_with_update!(
-      self,
-      w,
-      eob_pt - 1,
-      match eob_multi_size {
-        0 => &mut self.fc.eob_flag_cdf16[plane_type][eob_multi_ctx],
-        1 => &mut self.fc.eob_flag_cdf32[plane_type][eob_multi_ctx],
-        2 => &mut self.fc.eob_flag_cdf64[plane_type][eob_multi_ctx],
-        3 => &mut self.fc.eob_flag_cdf128[plane_type][eob_multi_ctx],
-        4 => &mut self.fc.eob_flag_cdf256[plane_type][eob_multi_ctx],
-        5 => &mut self.fc.eob_flag_cdf512[plane_type][eob_multi_ctx],
-        _ => &mut self.fc.eob_flag_cdf1024[plane_type][eob_multi_ctx],
+    match eob_multi_size {
+      0 => {
+        let cdf = &mut self.fc.eob_flag_cdf16[plane_type][eob_multi_ctx];
+        symbol_with_update!(self, w, eob_pt - 1, cdf);
       }
-    );
+      1 => {
+        let cdf = &mut self.fc.eob_flag_cdf32[plane_type][eob_multi_ctx];
+        symbol_with_update!(self, w, eob_pt - 1, cdf);
+      }
+      2 => {
+        let cdf = &mut self.fc.eob_flag_cdf64[plane_type][eob_multi_ctx];
+        symbol_with_update!(self, w, eob_pt - 1, cdf);
+      }
+      3 => {
+        let cdf = &mut self.fc.eob_flag_cdf128[plane_type][eob_multi_ctx];
+        symbol_with_update!(self, w, eob_pt - 1, cdf);
+      }
+      4 => {
+        let cdf = &mut self.fc.eob_flag_cdf256[plane_type][eob_multi_ctx];
+        symbol_with_update!(self, w, eob_pt - 1, cdf);
+      }
+      5 => {
+        let cdf = &mut self.fc.eob_flag_cdf512[plane_type][eob_multi_ctx];
+        symbol_with_update!(self, w, eob_pt - 1, cdf);
+      }
+      _ => {
+        let cdf = &mut self.fc.eob_flag_cdf1024[plane_type][eob_multi_ctx];
+        symbol_with_update!(self, w, eob_pt - 1, cdf);
+      }
+    }
 
     let eob_offset_bits = k_eob_offset_bits[eob_pt as usize];
 
@@ -1856,12 +1881,9 @@ impl<'a> ContextWriter<'a> {
       let mut eob_shift = eob_offset_bits - 1;
       let mut bit: u32 =
         if (eob_extra & (1 << eob_shift)) != 0 { 1 } else { 0 };
-      symbol_with_update!(
-        self,
-        w,
-        bit,
-        &mut self.fc.eob_extra_cdf[txs_ctx][plane_type][(eob_pt - 3) as usize]
-      );
+      let cdf =
+        &mut self.fc.eob_extra_cdf[txs_ctx][plane_type][(eob_pt - 3) as usize];
+      symbol_with_update!(self, w, bit, cdf, 2);
       for i in 1..eob_offset_bits {
         eob_shift = eob_offset_bits as u16 - 1 - i as u16;
         bit = if (eob_extra & (1 << eob_shift)) != 0 { 1 } else { 0 };
@@ -1894,14 +1916,16 @@ impl<'a> ContextWriter<'a> {
           w,
           (cmp::min(u32::cast_from(level), 3) - 1) as u32,
           &mut self.fc.coeff_base_eob_cdf[txs_ctx][plane_type]
-            [coeff_ctx as usize]
+            [coeff_ctx as usize],
+          3
         );
       } else {
         symbol_with_update!(
           self,
           w,
           (cmp::min(u32::cast_from(level), 3)) as u32,
-          &mut self.fc.coeff_base_cdf[txs_ctx][plane_type][coeff_ctx as usize]
+          &mut self.fc.coeff_base_cdf[txs_ctx][plane_type][coeff_ctx as usize],
+          4
         );
       }
 
@@ -1915,14 +1939,9 @@ impl<'a> ContextWriter<'a> {
             break;
           }
           let k = cmp::min(base_range - idx, T::cast_from(BR_CDF_SIZE - 1));
-          symbol_with_update!(
-            self,
-            w,
-            u32::cast_from(k),
-            &mut self.fc.coeff_br_cdf
-              [cmp::min(txs_ctx, TxSize::TX_32X32 as usize)][plane_type]
-              [br_ctx]
-          );
+          let cdf = &mut self.fc.coeff_br_cdf
+            [txs_ctx.min(TxSize::TX_32X32 as usize)][plane_type][br_ctx];
+          symbol_with_update!(self, w, u32::cast_from(k), cdf, 4);
           if k < T::cast_from(BR_CDF_SIZE - 1) {
             break;
           }
@@ -1941,12 +1960,8 @@ impl<'a> ContextWriter<'a> {
       let level = v.abs();
       let sign = if v < T::cast_from(0) { 1 } else { 0 };
       if c == 0 {
-        symbol_with_update!(
-          self,
-          w,
-          sign,
-          &mut self.fc.dc_sign_cdf[plane_type][txb_ctx.dc_sign_ctx]
-        );
+        let cdf = &mut self.fc.dc_sign_cdf[plane_type][txb_ctx.dc_sign_ctx];
+        symbol_with_update!(self, w, sign, cdf, 2);
       } else {
         w.bit(sign as u16);
       }

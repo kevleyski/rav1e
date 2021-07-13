@@ -41,6 +41,7 @@ mod stats;
 use crate::common::*;
 use crate::error::*;
 use crate::stats::*;
+use rav1e::config::CpuFeatureLevel;
 use rav1e::prelude::*;
 
 use crate::decoder::{Decoder, FrameBuilder, VideoDetails};
@@ -67,29 +68,20 @@ impl<D: Decoder> Source<D> {
   cfg_if::cfg_if! {
     if #[cfg(all(unix, feature = "signal-hook"))] {
       fn new(limit: usize, input: D) -> Self {
-        let exit_requested = {
-          use std::sync::atomic::*;
-          let e = Arc::new(AtomicBool::from(false));
+        use signal_hook::{flag, consts};
 
-          fn setup_signal(sig: i32, e: Arc<AtomicBool>) {
-            unsafe {
-              signal_hook::register(sig, move || {
-                if e.load(Ordering::SeqCst) {
-                  std::process::exit(128 + sig);
-                }
-                e.store(true, Ordering::SeqCst);
-                info!("Exit requested, flushing.");
-              })
-              .expect("Cannot register the signal hooks");
-            }
-          }
+        // Make sure double CTRL+C and similar kills
+        let exit_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        for sig in consts::TERM_SIGNALS {
+            // When terminated by a second term signal, exit with exit code 1.
+            // This will do nothing the first time (because term_now is false).
+            flag::register_conditional_shutdown(*sig, 1, Arc::clone(&exit_requested)).unwrap();
+            // But this will "arm" the above for the second time, by setting it to true.
+            // The order of registering these is important, if you put this one first, it will
+            // first arm and then terminate ‒ all in the first round.
+            flag::register(*sig, Arc::clone(&exit_requested)).unwrap();
+        }
 
-          setup_signal(signal_hook::SIGTERM, e.clone());
-          setup_signal(signal_hook::SIGQUIT, e.clone());
-          setup_signal(signal_hook::SIGINT, e.clone());
-
-          e
-        };
         Self { limit, input, count: 0, exit_requested, }
       }
     } else {
@@ -406,26 +398,23 @@ fn run() -> Result<(), error::CliError> {
     Ok(d) => d,
   };
   let video_info = y4m_dec.get_video_details();
-  let y4m_enc = match cli.io.rec {
-    Some(rec) => Some(
-      y4m::encode(
-        video_info.width,
-        video_info.height,
-        y4m::Ratio::new(
-          video_info.time_base.den as usize,
-          video_info.time_base.num as usize,
-        ),
-      )
-      .with_colorspace(y4m_dec.get_colorspace())
-      .with_pixel_aspect(y4m::Ratio {
-        num: video_info.sample_aspect_ratio.num as usize,
-        den: video_info.sample_aspect_ratio.den as usize,
-      })
-      .write_header(rec)
-      .unwrap(),
-    ),
-    None => None,
-  };
+  let y4m_enc = cli.io.rec.map(|rec| {
+    y4m::encode(
+      video_info.width,
+      video_info.height,
+      y4m::Ratio::new(
+        video_info.time_base.den as usize,
+        video_info.time_base.num as usize,
+      ),
+    )
+    .with_colorspace(y4m_dec.get_colorspace())
+    .with_pixel_aspect(y4m::Ratio {
+      num: video_info.sample_aspect_ratio.num as usize,
+      den: video_info.sample_aspect_ratio.den as usize,
+    })
+    .write_header(rec)
+    .unwrap()
+  });
 
   cli.enc.width = video_info.width;
   cli.enc.height = video_info.height;
@@ -503,6 +492,8 @@ fn run() -> Result<(), error::CliError> {
     cli.enc.time_base.num as usize,
   );
 
+  info!("CPU Feature Level: {}", CpuFeatureLevel::default());
+
   info!(
     "Using y4m decoder: {}x{}p @ {}/{} fps, {}, {}-bit",
     video_info.width,
@@ -513,6 +504,19 @@ fn run() -> Result<(), error::CliError> {
     video_info.bit_depth
   );
   info!("Encoding settings: {}", cli.enc);
+
+  let tiling =
+    cfg.tiling_info().map_err(|e| e.context("Invalid configuration"))?;
+  if tiling.tile_count() == 1 {
+    info!("Using 1 tile");
+  } else {
+    info!(
+      "Using {} tiles ({}x{})",
+      tiling.tile_count(),
+      tiling.cols,
+      tiling.rows
+    );
+  }
 
   let progress = ProgressInfo::new(
     Rational { num: video_info.time_base.den, den: video_info.time_base.num },

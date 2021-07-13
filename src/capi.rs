@@ -67,6 +67,7 @@ struct FrameOpaque {
 }
 
 unsafe impl Send for FrameOpaque {}
+unsafe impl Sync for FrameOpaque {}
 
 impl Default for FrameOpaque {
   fn default() -> Self {
@@ -180,7 +181,7 @@ impl EncContext {
   }
   fn send_frame(
     &mut self, frame: Option<FrameInternal>, frame_type: FrameTypeOverride,
-    opaque: Option<Box<dyn std::any::Any + Send>>,
+    opaque: Option<rav1e::Opaque>,
   ) -> Result<(), rav1e::EncoderStatus> {
     let info =
       rav1e::FrameParameters { frame_type_override: frame_type, opaque };
@@ -601,40 +602,6 @@ pub unsafe extern fn rav1e_config_unref(cfg: *mut Config) {
   }
 }
 
-fn tile_log2(blk_size: usize, target: usize) -> usize {
-  let mut k = 0;
-  while (blk_size << k) < target {
-    k += 1;
-  }
-  k
-}
-
-fn check_tile_log2(n: Result<usize, ()>) -> Result<usize, ()> {
-  match n {
-    Ok(n) => {
-      if ((1 << tile_log2(1, n)) - n) == 0 || n == 0 {
-        Ok(n)
-      } else {
-        Err(())
-      }
-    }
-    Err(e) => Err(e),
-  }
-}
-
-fn check_frame_size(n: Result<usize, ()>) -> Result<usize, ()> {
-  match n {
-    Ok(n) => {
-      if n >= 16 && n < u16::max_value().into() {
-        Ok(n)
-      } else {
-        Err(())
-      }
-    }
-    Err(e) => Err(e),
-  }
-}
-
 unsafe fn option_match(
   cfg: *mut Config, key: *const c_char, value: *const c_char,
 ) -> Result<(), ()> {
@@ -643,8 +610,8 @@ unsafe fn option_match(
   let enc = &mut (*cfg).cfg.enc;
 
   match key {
-    "width" => enc.width = check_frame_size(value.parse().map_err(|_| ()))?,
-    "height" => enc.height = check_frame_size(value.parse().map_err(|_| ()))?,
+    "width" => enc.width = value.parse().map_err(|_| ())?,
+    "height" => enc.height = value.parse().map_err(|_| ())?,
     "speed" => {
       enc.speed_settings =
         rav1e::SpeedSettings::from_preset(value.parse().map_err(|_| ())?)
@@ -653,12 +620,8 @@ unsafe fn option_match(
     "threads" => (*cfg).cfg.threads = value.parse().map_err(|_| ())?,
 
     "tiles" => enc.tiles = value.parse().map_err(|_| ())?,
-    "tile_rows" => {
-      enc.tile_rows = check_tile_log2(value.parse().map_err(|_| ()))?
-    }
-    "tile_cols" => {
-      enc.tile_cols = check_tile_log2(value.parse().map_err(|_| ()))?
-    }
+    "tile_rows" => enc.tile_rows = value.parse().map_err(|_| ())?,
+    "tile_cols" => enc.tile_cols = value.parse().map_err(|_| ())?,
 
     "tune" => enc.tune = value.parse().map_err(|_| ())?,
     "quantizer" => enc.quantizer = value.parse().map_err(|_| ())?,
@@ -1062,10 +1025,7 @@ pub unsafe extern fn rav1e_send_frame(
   let maybe_opaque = if frame.is_null() {
     None
   } else {
-    (*frame)
-      .opaque
-      .take()
-      .map(|o| Box::new(o) as Box<dyn std::any::Any + Send>)
+    (*frame).opaque.take().map(|o| rav1e::Opaque::new(o))
   };
 
   let ret = (*ctx)
@@ -1156,7 +1116,7 @@ fn rav1e_frame_fill_plane_internal<T: rav1e::Pixel>(
   f: &mut Arc<rav1e::Frame<T>>, plane: c_int, data_slice: &[u8],
   stride: ptrdiff_t, bytewidth: c_int,
 ) {
-  let input = Arc::make_mut(f);
+  let input = Arc::get_mut(f).unwrap();
   input.planes[plane as usize].copy_from_raw_u8(
     data_slice,
     stride as usize,

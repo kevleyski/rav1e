@@ -10,24 +10,24 @@
 
 use crate::activity::ActivityMask;
 use crate::api::lookahead::*;
-use crate::api::{EncoderConfig, EncoderStatus, FrameType, Packet};
+use crate::api::{EncoderConfig, EncoderStatus, FrameType, Opaque, Packet};
 use crate::color::ChromaSampling::Cs400;
 use crate::cpu_features::CpuFeatureLevel;
 use crate::dist::get_satd;
 use crate::encoder::*;
 use crate::frame::*;
-use crate::hawktracer::*;
 use crate::partition::*;
 use crate::rate::{
   RCState, FRAME_NSUBTYPES, FRAME_SUBTYPE_I, FRAME_SUBTYPE_P,
   FRAME_SUBTYPE_SEF,
 };
+use crate::rayon::prelude::*;
 use crate::scenechange::SceneChangeDetector;
 use crate::stats::EncoderStats;
 use crate::tiling::Area;
 use crate::util::Pixel;
 use arrayvec::ArrayVec;
-use log::Level::Info;
+use rust_hawktracer::*;
 use std::cmp;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -219,6 +219,9 @@ impl<T: Pixel> FrameData<T> {
   }
 }
 
+type FrameQueue<T> = BTreeMap<u64, Option<Arc<Frame<T>>>>;
+type FrameDataQueue<T> = BTreeMap<u64, FrameData<T>>;
+
 // the fields pub(super) are accessed only by the tests
 pub(crate) struct ContextInner<T: Pixel> {
   pub(crate) frame_count: u64,
@@ -227,9 +230,9 @@ pub(crate) struct ContextInner<T: Pixel> {
   pub(super) inter_cfg: InterConfig,
   pub(super) frames_processed: u64,
   /// Maps *input_frameno* to frames
-  pub(super) frame_q: BTreeMap<u64, Option<Arc<Frame<T>>>>, //    packet_q: VecDeque<Packet>
+  pub(super) frame_q: FrameQueue<T>,
   /// Maps *output_frameno* to frame data
-  pub(super) frame_data: BTreeMap<u64, FrameData<T>>,
+  pub(super) frame_data: FrameDataQueue<T>,
   /// A list of the input_frameno for keyframes in this encode.
   /// Needed so that we don't need to keep all of the frame_invariants in
   ///  memory for the whole life of the encode.
@@ -244,8 +247,8 @@ pub(crate) struct ContextInner<T: Pixel> {
   /// Maps `output_frameno` to `gop_input_frameno_start`.
   pub(crate) gop_input_frameno_start: BTreeMap<u64, u64>,
   keyframe_detector: SceneChangeDetector,
-  pub(crate) config: EncoderConfig,
-  seq: Sequence,
+  pub(crate) config: Arc<EncoderConfig>,
+  seq: Arc<Sequence>,
   pub(crate) rc_state: RCState,
   maybe_prev_log_base_q: Option<i64>,
   /// The next `input_frameno` to be processed by lookahead.
@@ -253,39 +256,44 @@ pub(crate) struct ContextInner<T: Pixel> {
   /// The next `output_frameno` to be computed by lookahead.
   next_lookahead_output_frameno: u64,
   /// Optional opaque to be sent back to the user
-  opaque_q: BTreeMap<u64, Box<dyn std::any::Any + Send>>,
+  opaque_q: BTreeMap<u64, Opaque>,
 }
 
 impl<T: Pixel> ContextInner<T> {
   pub fn new(enc: &EncoderConfig) -> Self {
     // initialize with temporal delimiter
     let packet_data = TEMPORAL_DELIMITER.to_vec();
+    let mut keyframes = BTreeSet::new();
+    keyframes.insert(0);
 
     let maybe_ac_qi_max =
       if enc.quantizer < 255 { Some(enc.quantizer as u8) } else { None };
 
-    let seq = Sequence::new(enc);
+    let seq = Arc::new(Sequence::new(enc));
+    let inter_cfg = InterConfig::new(enc);
+    let lookahead_distance = inter_cfg.keyframe_lookahead_distance() as usize;
+
     ContextInner {
       frame_count: 0,
       limit: None,
-      inter_cfg: InterConfig::new(enc),
+      inter_cfg,
       output_frameno: 0,
       frames_processed: 0,
       frame_q: BTreeMap::new(),
       frame_data: BTreeMap::new(),
-      keyframes: BTreeSet::new(),
+      keyframes,
       keyframes_forced: BTreeSet::new(),
       packet_data,
       gop_output_frameno_start: BTreeMap::new(),
       gop_input_frameno_start: BTreeMap::new(),
       keyframe_detector: SceneChangeDetector::new(
-        enc.bit_depth,
-        enc.speed_settings.fast_scene_detection || enc.low_latency,
-        CpuFeatureLevel::default(),
         *enc,
-        seq,
+        CpuFeatureLevel::default(),
+        lookahead_distance,
+        seq.clone(),
+        true,
       ),
-      config: *enc,
+      config: Arc::new(*enc),
       seq,
       rc_state: RCState::new(
         enc.width as i32,
@@ -299,7 +307,7 @@ impl<T: Pixel> ContextInner<T> {
         enc.reservoir_frame_delay,
       ),
       maybe_prev_log_base_q: None,
-      next_lookahead_frame: 0,
+      next_lookahead_frame: 1,
       next_lookahead_output_frameno: 0,
       opaque_q: BTreeMap::new(),
     }
@@ -325,10 +333,7 @@ impl<T: Pixel> ContextInner<T> {
       }
     }
 
-    if self.config.still_picture || self.next_lookahead_frame == 0 {
-      self.keyframes.insert(input_frameno);
-      self.next_lookahead_frame += 1;
-    } else if !self.needs_more_frame_q_lookahead(self.next_lookahead_frame) {
+    if !self.needs_more_frame_q_lookahead(self.next_lookahead_frame) {
       let lookahead_frames = self
         .frame_q
         .range(self.next_lookahead_frame - 1..)
@@ -416,19 +421,6 @@ impl<T: Pixel> ContextInner<T> {
   ) -> Result<(), EncoderStatus> {
     let fi = self.build_frame_properties(output_frameno)?;
 
-    if output_frameno == 0 && log_enabled!(Info) {
-      if fi.tiling.tile_count() == 1 {
-        info!("Using 1 tile");
-      } else {
-        info!(
-          "Using {} tiles ({}x{})",
-          fi.tiling.tile_count(),
-          fi.tiling.cols,
-          fi.tiling.rows
-        );
-      }
-    }
-
     let frame =
       self.frame_q.get(&fi.input_frameno).as_ref().unwrap().as_ref().unwrap();
     self.frame_data.insert(output_frameno, FrameData::new(fi, frame.clone()));
@@ -441,14 +433,12 @@ impl<T: Pixel> ContextInner<T> {
     let mut data_location = PathBuf::new();
     if env::var_os("RAV1E_DATA_PATH").is_some() {
       data_location.push(&env::var_os("RAV1E_DATA_PATH").unwrap());
-      fs::create_dir_all(data_location.clone()).unwrap();
-      data_location
     } else {
       data_location.push(&env::current_dir().unwrap());
       data_location.push(".lookahead_data");
-      fs::create_dir_all(data_location.clone()).unwrap();
-      data_location
     }
+    fs::create_dir_all(&data_location).unwrap();
+    data_location
   }
 
   fn build_frame_properties(
@@ -548,8 +538,8 @@ impl<T: Pixel> ContextInner<T> {
       output_frameno - self.gop_output_frameno_start[&output_frameno];
     if output_frameno_in_gop == 0 {
       let fi = FrameInvariants::new_key_frame(
-        self.config,
-        self.seq,
+        self.config.clone(),
+        self.seq.clone(),
         self.gop_input_frameno_start[&output_frameno],
       );
       assert!(!fi.invalid);
@@ -758,7 +748,7 @@ impl<T: Pixel> ContextInner<T> {
       .fi
       .lookahead_intra_costs = estimate_intra_costs(
       &*self.frame_q[&fi.input_frameno].as_ref().unwrap(),
-      fi.config.bit_depth,
+      fi.sequence.bit_depth,
       fi.cpu_feature_level,
     );
   }
@@ -772,8 +762,6 @@ impl<T: Pixel> ContextInner<T> {
         lookahead_frames,
         self.next_lookahead_frame,
         *self.keyframes.iter().last().unwrap(),
-        &self.config,
-        &self.inter_cfg,
       )
     {
       self.keyframes.insert(self.next_lookahead_frame);
@@ -793,6 +781,164 @@ impl<T: Pixel> ContextInner<T> {
       }
       self.next_lookahead_output_frameno += 1;
     }
+  }
+
+  #[hawktracer(update_block_importances)]
+  fn update_block_importances(
+    fi: &FrameInvariants<T>, me_stats: &crate::me::FrameMEStats,
+    frame: &Frame<T>, reference_frame: &Frame<T>, bit_depth: usize,
+    bsize: BlockSize, len: usize,
+    reference_frame_block_importances: &mut [f32],
+  ) {
+    let plane_org = &frame.planes[0];
+    let plane_ref = &reference_frame.planes[0];
+    let lookahead_intra_costs_lines =
+      fi.lookahead_intra_costs.par_chunks_exact(fi.w_in_imp_b);
+    let block_importances_lines =
+      fi.block_importances.par_chunks_exact(fi.w_in_imp_b);
+
+    let costs: Vec<_> = lookahead_intra_costs_lines
+      .zip(block_importances_lines)
+      .enumerate()
+      .flat_map_iter(|(y, (lookahead_intra_costs, block_importances))| {
+        lookahead_intra_costs
+          .iter()
+          .zip(block_importances.iter())
+          .enumerate()
+          .map(move |(x, (&intra_cost, &future_importance))| {
+            let mv = me_stats[y * 2][x * 2].mv;
+
+            // Coordinates of the top-left corner of the reference block, in MV
+            // units.
+            let reference_x =
+              x as i64 * IMP_BLOCK_SIZE_IN_MV_UNITS + mv.col as i64;
+            let reference_y =
+              y as i64 * IMP_BLOCK_SIZE_IN_MV_UNITS + mv.row as i64;
+
+            let region_org = plane_org.region(Area::Rect {
+              x: (x * IMPORTANCE_BLOCK_SIZE) as isize,
+              y: (y * IMPORTANCE_BLOCK_SIZE) as isize,
+              width: IMPORTANCE_BLOCK_SIZE,
+              height: IMPORTANCE_BLOCK_SIZE,
+            });
+
+            let region_ref = plane_ref.region(Area::Rect {
+              x: reference_x as isize / IMP_BLOCK_MV_UNITS_PER_PIXEL as isize,
+              y: reference_y as isize / IMP_BLOCK_MV_UNITS_PER_PIXEL as isize,
+              width: IMPORTANCE_BLOCK_SIZE,
+              height: IMPORTANCE_BLOCK_SIZE,
+            });
+
+            let inter_cost = get_satd(
+              &region_org,
+              &region_ref,
+              bsize,
+              bit_depth,
+              fi.cpu_feature_level,
+            ) as f32;
+
+            let intra_cost = intra_cost as f32;
+            //          let intra_cost = lookahead_intra_costs[x] as f32;
+            //          let future_importance = block_importances[x];
+
+            let propagate_fraction = if intra_cost <= inter_cost {
+              0.
+            } else {
+              1. - inter_cost / intra_cost
+            };
+
+            let propagate_amount = (intra_cost + future_importance)
+              * propagate_fraction
+              / len as f32;
+            (propagate_amount, reference_x, reference_y)
+          })
+      })
+      .collect();
+
+    costs.into_iter().for_each(
+      |(propagate_amount, reference_x, reference_y)| {
+        let mut propagate =
+          |block_x_in_mv_units, block_y_in_mv_units, fraction| {
+            let x = block_x_in_mv_units / IMP_BLOCK_SIZE_IN_MV_UNITS;
+            let y = block_y_in_mv_units / IMP_BLOCK_SIZE_IN_MV_UNITS;
+
+            // TODO: propagate partially if the block is partially off-frame
+            // (possible on right and bottom edges)?
+            if x >= 0
+              && y >= 0
+              && (x as usize) < fi.w_in_imp_b
+              && (y as usize) < fi.h_in_imp_b
+            {
+              reference_frame_block_importances
+                [y as usize * fi.w_in_imp_b + x as usize] +=
+                propagate_amount * fraction;
+            }
+          };
+
+        // Coordinates of the top-left corner of the block intersecting the
+        // reference block from the top-left.
+        let top_left_block_x = (reference_x
+          - if reference_x < 0 { IMP_BLOCK_SIZE_IN_MV_UNITS - 1 } else { 0 })
+          / IMP_BLOCK_SIZE_IN_MV_UNITS
+          * IMP_BLOCK_SIZE_IN_MV_UNITS;
+        let top_left_block_y = (reference_y
+          - if reference_y < 0 { IMP_BLOCK_SIZE_IN_MV_UNITS - 1 } else { 0 })
+          / IMP_BLOCK_SIZE_IN_MV_UNITS
+          * IMP_BLOCK_SIZE_IN_MV_UNITS;
+
+        debug_assert!(reference_x >= top_left_block_x);
+        debug_assert!(reference_y >= top_left_block_y);
+
+        let top_right_block_x = top_left_block_x + IMP_BLOCK_SIZE_IN_MV_UNITS;
+        let top_right_block_y = top_left_block_y;
+        let bottom_left_block_x = top_left_block_x;
+        let bottom_left_block_y =
+          top_left_block_y + IMP_BLOCK_SIZE_IN_MV_UNITS;
+        let bottom_right_block_x = top_right_block_x;
+        let bottom_right_block_y = bottom_left_block_y;
+
+        let top_left_block_fraction = ((top_right_block_x - reference_x)
+          * (bottom_left_block_y - reference_y))
+          as f32
+          / IMP_BLOCK_AREA_IN_MV_UNITS as f32;
+
+        propagate(top_left_block_x, top_left_block_y, top_left_block_fraction);
+
+        let top_right_block_fraction =
+          ((reference_x + IMP_BLOCK_SIZE_IN_MV_UNITS - top_right_block_x)
+            * (bottom_left_block_y - reference_y)) as f32
+            / IMP_BLOCK_AREA_IN_MV_UNITS as f32;
+
+        propagate(
+          top_right_block_x,
+          top_right_block_y,
+          top_right_block_fraction,
+        );
+
+        let bottom_left_block_fraction = ((top_right_block_x - reference_x)
+          * (reference_y + IMP_BLOCK_SIZE_IN_MV_UNITS - bottom_left_block_y))
+          as f32
+          / IMP_BLOCK_AREA_IN_MV_UNITS as f32;
+
+        propagate(
+          bottom_left_block_x,
+          bottom_left_block_y,
+          bottom_left_block_fraction,
+        );
+
+        let bottom_right_block_fraction =
+          ((reference_x + IMP_BLOCK_SIZE_IN_MV_UNITS - top_right_block_x)
+            * (reference_y + IMP_BLOCK_SIZE_IN_MV_UNITS - bottom_left_block_y))
+            as f32
+            / IMP_BLOCK_AREA_IN_MV_UNITS as f32;
+
+        propagate(
+          bottom_right_block_x,
+          bottom_right_block_y,
+          bottom_right_block_fraction,
+        );
+      },
+    );
   }
 
   /// Computes the block importances for the current output frame.
@@ -850,10 +996,10 @@ impl<T: Pixel> ContextInner<T> {
       let frame = self.frame_q[&fi.input_frameno].as_ref().unwrap();
 
       // There can be at most 3 of these.
-      let mut unique_indices = ArrayVec::<[_; 3]>::new();
+      let mut unique_indices = ArrayVec::<_, 3>::new();
 
       for (mv_index, &rec_index) in fi.ref_frames.iter().enumerate() {
-        if unique_indices.iter().find(|&&(_, r)| r == rec_index).is_none() {
+        if !unique_indices.iter().any(|&(_, r)| r == rec_index) {
           unique_indices.push((mv_index, rec_index));
         }
       }
@@ -883,7 +1029,7 @@ impl<T: Pixel> ContextInner<T> {
           .get_mut(&reference_output_frameno)
           .map(|data| &mut data.fi.block_importances)
         {
-          update_block_importances(
+          Self::update_block_importances(
             fi,
             me_stats,
             frame,
@@ -893,169 +1039,6 @@ impl<T: Pixel> ContextInner<T> {
             len,
             reference_frame_block_importances,
           );
-
-          #[hawktracer(update_block_importances)]
-          fn update_block_importances<T: Pixel>(
-            fi: &FrameInvariants<T>, me_stats: &crate::me::FrameMEStats,
-            frame: &Frame<T>, reference_frame: &Frame<T>, bit_depth: usize,
-            bsize: BlockSize, len: usize,
-            reference_frame_block_importances: &mut [f32],
-          ) {
-            let plane_org = &frame.planes[0];
-            let plane_ref = &reference_frame.planes[0];
-
-            (0..fi.h_in_imp_b)
-              .zip(fi.lookahead_intra_costs.chunks_exact(fi.w_in_imp_b))
-              .zip(fi.block_importances.chunks_exact(fi.w_in_imp_b))
-              .for_each(|((y, lookahead_intra_costs), block_importances)| {
-                (0..fi.w_in_imp_b).for_each(|x| {
-                  let mv = me_stats[y * 2][x * 2].mv;
-
-                  // Coordinates of the top-left corner of the reference block, in MV
-                  // units.
-                  let reference_x =
-                    x as i64 * IMP_BLOCK_SIZE_IN_MV_UNITS + mv.col as i64;
-                  let reference_y =
-                    y as i64 * IMP_BLOCK_SIZE_IN_MV_UNITS + mv.row as i64;
-
-                  let region_org = plane_org.region(Area::Rect {
-                    x: (x * IMPORTANCE_BLOCK_SIZE) as isize,
-                    y: (y * IMPORTANCE_BLOCK_SIZE) as isize,
-                    width: IMPORTANCE_BLOCK_SIZE,
-                    height: IMPORTANCE_BLOCK_SIZE,
-                  });
-
-                  let region_ref = plane_ref.region(Area::Rect {
-                    x: reference_x as isize
-                      / IMP_BLOCK_MV_UNITS_PER_PIXEL as isize,
-                    y: reference_y as isize
-                      / IMP_BLOCK_MV_UNITS_PER_PIXEL as isize,
-                    width: IMPORTANCE_BLOCK_SIZE,
-                    height: IMPORTANCE_BLOCK_SIZE,
-                  });
-
-                  let inter_cost = get_satd(
-                    &region_org,
-                    &region_ref,
-                    bsize,
-                    bit_depth,
-                    fi.cpu_feature_level,
-                  ) as f32;
-
-                  let intra_cost = lookahead_intra_costs[x] as f32;
-                  let future_importance = block_importances[x];
-
-                  let propagate_fraction = if intra_cost <= inter_cost {
-                    0.
-                  } else {
-                    1. - inter_cost / intra_cost
-                  };
-
-                  let propagate_amount = (intra_cost + future_importance)
-                    * propagate_fraction
-                    / len as f32;
-
-                  let mut propagate =
-                    |block_x_in_mv_units, block_y_in_mv_units, fraction| {
-                      let x = block_x_in_mv_units / IMP_BLOCK_SIZE_IN_MV_UNITS;
-                      let y = block_y_in_mv_units / IMP_BLOCK_SIZE_IN_MV_UNITS;
-
-                      // TODO: propagate partially if the block is partially off-frame
-                      // (possible on right and bottom edges)?
-                      if x >= 0
-                        && y >= 0
-                        && (x as usize) < fi.w_in_imp_b
-                        && (y as usize) < fi.h_in_imp_b
-                      {
-                        reference_frame_block_importances
-                          [y as usize * fi.w_in_imp_b + x as usize] +=
-                          propagate_amount * fraction;
-                      }
-                    };
-
-                  // Coordinates of the top-left corner of the block intersecting the
-                  // reference block from the top-left.
-                  let top_left_block_x = (reference_x
-                    - if reference_x < 0 {
-                      IMP_BLOCK_SIZE_IN_MV_UNITS - 1
-                    } else {
-                      0
-                    })
-                    / IMP_BLOCK_SIZE_IN_MV_UNITS
-                    * IMP_BLOCK_SIZE_IN_MV_UNITS;
-                  let top_left_block_y = (reference_y
-                    - if reference_y < 0 {
-                      IMP_BLOCK_SIZE_IN_MV_UNITS - 1
-                    } else {
-                      0
-                    })
-                    / IMP_BLOCK_SIZE_IN_MV_UNITS
-                    * IMP_BLOCK_SIZE_IN_MV_UNITS;
-
-                  debug_assert!(reference_x >= top_left_block_x);
-                  debug_assert!(reference_y >= top_left_block_y);
-
-                  let top_right_block_x =
-                    top_left_block_x + IMP_BLOCK_SIZE_IN_MV_UNITS;
-                  let top_right_block_y = top_left_block_y;
-                  let bottom_left_block_x = top_left_block_x;
-                  let bottom_left_block_y =
-                    top_left_block_y + IMP_BLOCK_SIZE_IN_MV_UNITS;
-                  let bottom_right_block_x = top_right_block_x;
-                  let bottom_right_block_y = bottom_left_block_y;
-
-                  let top_left_block_fraction = ((top_right_block_x
-                    - reference_x)
-                    * (bottom_left_block_y - reference_y))
-                    as f32
-                    / IMP_BLOCK_AREA_IN_MV_UNITS as f32;
-
-                  propagate(
-                    top_left_block_x,
-                    top_left_block_y,
-                    top_left_block_fraction,
-                  );
-
-                  let top_right_block_fraction = ((reference_x
-                    + IMP_BLOCK_SIZE_IN_MV_UNITS
-                    - top_right_block_x)
-                    * (bottom_left_block_y - reference_y))
-                    as f32
-                    / IMP_BLOCK_AREA_IN_MV_UNITS as f32;
-
-                  propagate(
-                    top_right_block_x,
-                    top_right_block_y,
-                    top_right_block_fraction,
-                  );
-
-                  let bottom_left_block_fraction =
-                    ((top_right_block_x - reference_x)
-                      * (reference_y + IMP_BLOCK_SIZE_IN_MV_UNITS
-                        - bottom_left_block_y)) as f32
-                      / IMP_BLOCK_AREA_IN_MV_UNITS as f32;
-
-                  propagate(
-                    bottom_left_block_x,
-                    bottom_left_block_y,
-                    bottom_left_block_fraction,
-                  );
-
-                  let bottom_right_block_fraction =
-                    ((reference_x + IMP_BLOCK_SIZE_IN_MV_UNITS
-                      - top_right_block_x)
-                      * (reference_y + IMP_BLOCK_SIZE_IN_MV_UNITS
-                        - bottom_left_block_y)) as f32
-                      / IMP_BLOCK_AREA_IN_MV_UNITS as f32;
-
-                  propagate(
-                    bottom_right_block_x,
-                    bottom_right_block_y,
-                    bottom_right_block_fraction,
-                  );
-                });
-              });
-          }
         }
       });
 
@@ -1102,7 +1085,7 @@ impl<T: Pixel> ContextInner<T> {
     }
   }
 
-  fn encode_packet(
+  pub(crate) fn encode_packet(
     &mut self, cur_output_frameno: u64,
   ) -> Result<Packet<T>, EncoderStatus> {
     if self.frame_data.get(&cur_output_frameno).unwrap().fi.show_existing_frame
@@ -1155,7 +1138,7 @@ impl<T: Pixel> ContextInner<T> {
         return Err(EncoderStatus::NotReady);
       }
       let mut frame_data =
-        self.frame_data.get(&cur_output_frameno).cloned().unwrap();
+        self.frame_data.remove(&cur_output_frameno).unwrap();
       let fti = frame_data.fi.get_frame_subtype();
       let qps = self.rc_state.select_qi(
         self,
@@ -1164,6 +1147,19 @@ impl<T: Pixel> ContextInner<T> {
         self.maybe_prev_log_base_q,
       );
       frame_data.fi.set_quantizers(&qps);
+
+      if self.config.tune == Tune::Psychovisual {
+        let frame =
+          self.frame_q[&frame_data.fi.input_frameno].as_ref().unwrap();
+        frame_data.fi.activity_mask =
+          ActivityMask::from_plane(&frame.planes[0]);
+        frame_data.fi.activity_mask.fill_scales(
+          frame_data.fi.sequence.bit_depth,
+          &mut frame_data.fi.activity_scales,
+        );
+      } else {
+        frame_data.fi.activity_mask = ActivityMask::default();
+      }
 
       if self.rc_state.needs_trial_encode(fti) {
         let mut trial_fs = frame_data.fs.clone();
@@ -1186,10 +1182,6 @@ impl<T: Pixel> ContextInner<T> {
         frame_data.fi.set_quantizers(&qps);
       }
 
-      // TODO: replace with ActivityMask::from_plane() when
-      // the activity mask is actually used.
-      frame_data.fi.activity_mask = ActivityMask::default();
-
       let data =
         encode_frame(&frame_data.fi, &mut frame_data.fs, &self.inter_cfg);
       let enc_stats = frame_data.fs.enc_stats.clone();
@@ -1208,13 +1200,12 @@ impl<T: Pixel> ContextInner<T> {
       let planes =
         if frame_data.fi.sequence.chroma_sampling == Cs400 { 1 } else { 3 };
 
-      Arc::make_mut(&mut frame_data.fs.rec).pad(
+      Arc::get_mut(&mut frame_data.fs.rec).unwrap().pad(
         frame_data.fi.width,
         frame_data.fi.height,
         planes,
       );
 
-      // TODO avoid the clone by having rec Arc.
       let (rec, source) = if frame_data.fi.show_frame {
         (Some(frame_data.fs.rec.clone()), Some(frame_data.fs.input.clone()))
       } else {

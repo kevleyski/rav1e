@@ -47,6 +47,7 @@ pub struct CliOptions {
   pub pass1file_name: Option<String>,
   pub pass2file_name: Option<String>,
   pub save_config: Option<String>,
+  pub slots: usize,
 }
 
 #[cfg(feature = "serialize")]
@@ -89,6 +90,7 @@ pub fn parse_cli() -> Result<CliOptions, CliError> {
     .about("AV1 video encoder")
     .setting(AppSettings::DeriveDisplayOrder)
     .setting(AppSettings::SubcommandsNegateReqs)
+    .setting(AppSettings::ColoredHelp)
     .arg(Arg::with_name("FULLHELP")
       .help("Prints more detailed help information")
       .long("fullhelp"))
@@ -213,8 +215,16 @@ pub fn parse_cli() -> Result<CliOptions, CliError> {
         .alias("low_latency")
     )
     .arg(
+      Arg::with_name("NO_SCENE_DETECTION")
+        .help("Disables scene detection entirely\n\
+            Has a significant speed-to-quality trade-off in full encodes. Experimental for rav1e-by-gop")
+        .long("no-scene-detection")
+        .alias("no_scene_detection")
+    )
+    .arg(
       Arg::with_name("RDO_LOOKAHEAD_FRAMES")
-        .help("Number of frames encoder should lookahead for RDO purposes [default: 40]\n")
+        .help("Number of frames encoder should lookahead for RDO purposes\n\
+        [default value for speed levels: 10,9 - 10; 8,7,6 - 20; 5,4,3 - 30; 2,1,0 - 40]\n")
         .long("rdo-lookahead-frames")
         .takes_value(true)
     )
@@ -345,7 +355,7 @@ pub fn parse_cli() -> Result<CliOptions, CliError> {
     )
     .arg(
       Arg::with_name("METRICS")
-        .help("Calulate and display several metrics including PSNR, SSIM, CIEDE2000 etc")
+        .help("Calculate and display several metrics including PSNR, SSIM, CIEDE2000 etc")
         .long("metrics")
     )
     .arg(
@@ -383,6 +393,17 @@ pub fn parse_cli() -> Result<CliOptions, CliError> {
                      .takes_value(true)
                 )
     );
+
+  if cfg!(feature = "unstable") {
+    app = app.arg(
+      Arg::with_name("SLOTS")
+        .help("Maximum number of GOPs that can be encoded in parallel")
+        .long("parallel_gops")
+        .long("slots")
+        .takes_value(true)
+        .default_value("0"),
+    );
+  }
 
   let matches = app.clone().get_matches();
 
@@ -477,6 +498,12 @@ pub fn parse_cli() -> Result<CliOptions, CliError> {
     panic!("A limit cannot be set above 1 in still picture mode");
   }
 
+  let slots = if cfg!(feature = "unstable") {
+    matches.value_of("SLOTS").unwrap().parse().unwrap()
+  } else {
+    0
+  };
+
   Ok(CliOptions {
     io,
     enc,
@@ -493,6 +520,7 @@ pub fn parse_cli() -> Result<CliOptions, CliError> {
     pass1file_name: matches.value_of("FIRST_PASS").map(|s| s.to_owned()),
     pass2file_name: matches.value_of("SECOND_PASS").map(|s| s.to_owned()),
     save_config,
+    slots,
   })
 }
 
@@ -604,6 +632,26 @@ fn parse_config(matches: &ArgMatches<'_>) -> Result<EncoderConfig, CliError> {
         f64
       )
       .expect("Cannot parse the mastering display option");
+
+    /* AV1 spec sec. 6.7.4 "Metadata high dynamic range mastering display color volume semantics"
+     * specifies chromaticity coords as 0.16 fixed-point numbers, which have a max float value
+     * of 0.9999847412109375 (rounding to 1).
+     */
+    let chromaticity_range = 0.0..=1.0;
+    if !chromaticity_range.contains(&g_x)
+      || !chromaticity_range.contains(&g_y)
+      || !chromaticity_range.contains(&b_x)
+      || !chromaticity_range.contains(&b_y)
+      || !chromaticity_range.contains(&r_x)
+      || !chromaticity_range.contains(&r_y)
+      || !chromaticity_range.contains(&wp_x)
+      || !chromaticity_range.contains(&wp_y)
+    {
+      warn!(
+        "Chromaticity coordinates will be trimmed to the range 0.0 to 1.0 (see AV1 spec sec. 6.7.4)."
+      );
+    }
+
     Some(MasteringDisplay {
       primaries: [
         ChromaticityPoint {
@@ -649,8 +697,16 @@ fn parse_config(matches: &ArgMatches<'_>) -> Result<EncoderConfig, CliError> {
   cfg.reservoir_frame_delay = matches
     .value_of("RESERVOIR_FRAME_DELAY")
     .map(|reservior_frame_delay| reservior_frame_delay.parse().unwrap());
-  cfg.rdo_lookahead_frames =
-    matches.value_of("RDO_LOOKAHEAD_FRAMES").unwrap_or("40").parse().unwrap();
+
+  // rdo-lookahead-frames
+  let maybe_rdo = matches.value_of("RDO_LOOKAHEAD_FRAMES");
+  if maybe_rdo.is_some() {
+    cfg.rdo_lookahead_frames =
+      matches.value_of("RDO_LOOKAHEAD_FRAMES").unwrap().parse().unwrap();
+  } else {
+    cfg.rdo_lookahead_frames = SpeedSettings::rdo_lookahead_frames(speed)
+  }
+
   cfg.tune = matches.value_of("TUNE").unwrap().parse().unwrap();
 
   if cfg.tune == Tune::Psychovisual {
@@ -674,6 +730,10 @@ fn parse_config(matches: &ArgMatches<'_>) -> Result<EncoderConfig, CliError> {
   }
 
   cfg.low_latency = matches.is_present("LOW_LATENCY");
+  // Disables scene_detection
+  if matches.is_present("NO_SCENE_DETECTION") {
+    cfg.speed_settings.no_scene_detection = true;
+  }
 
   Ok(cfg)
 }

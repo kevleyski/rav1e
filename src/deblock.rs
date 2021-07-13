@@ -11,13 +11,13 @@ use crate::api::FrameType;
 use crate::color::ChromaSampling::Cs400;
 use crate::context::*;
 use crate::encoder::FrameInvariants;
-use crate::hawktracer::*;
 use crate::partition::RefType::*;
 use crate::predict::PredictionMode::*;
 use crate::quantize::*;
 use crate::tiling::*;
 use crate::util::{clamp, ILog, Pixel};
 use crate::DeblockState;
+use rust_hawktracer::*;
 use std::cmp;
 
 use crate::rayon::iter::*;
@@ -1355,7 +1355,7 @@ pub fn deblock_plane<T: Pixel>(
     >> ydec
     << ydec; // Clippy can go suck an egg
 
-  // vertical edge filtering leads horizonal by one full MI-sized
+  // vertical edge filtering leads horizontal by one full MI-sized
   // row (and horizontal filtering doesn't happen along the upper
   // edge).  Unroll to avoid corner-cases.
   if rows > 0 {

@@ -523,8 +523,8 @@ pub struct TXB_CTX {
 }
 
 impl<'a> ContextWriter<'a> {
-  pub fn write_tx_type(
-    &mut self, w: &mut dyn Writer, tx_size: TxSize, tx_type: TxType,
+  pub fn write_tx_type<W: Writer>(
+    &mut self, w: &mut W, tx_size: TxSize, tx_type: TxType,
     y_mode: PredictionMode, is_inter: bool, use_reduced_tx_set: bool,
   ) {
     let square_tx_size = tx_size.sqr();
@@ -538,27 +538,33 @@ impl<'a> ContextWriter<'a> {
       assert!(av1_tx_used[tx_set as usize][tx_type as usize] != 0);
 
       if is_inter {
-        symbol_with_update!(
-          self,
-          w,
-          av1_tx_ind[tx_set as usize][tx_type as usize] as u32,
-          &mut self.fc.inter_tx_cdf[tx_set_index as usize]
-            [square_tx_size as usize][..=num_tx_set[tx_set as usize]]
-        );
+        let s = av1_tx_ind[tx_set as usize][tx_type as usize] as u32;
+        if tx_set_index == 1 {
+          let cdf = &mut self.fc.inter_tx_1_cdf[square_tx_size as usize];
+          symbol_with_update!(self, w, s, cdf);
+        } else if tx_set_index == 2 {
+          let cdf = &mut self.fc.inter_tx_2_cdf[square_tx_size as usize];
+          symbol_with_update!(self, w, s, cdf);
+        } else {
+          let cdf = &mut self.fc.inter_tx_3_cdf[square_tx_size as usize];
+          symbol_with_update!(self, w, s, cdf, 2);
+        }
       } else {
         let intra_dir = y_mode;
         // TODO: Once use_filter_intra is enabled,
         // intra_dir =
         // fimode_to_intradir[mbmi->filter_intra_mode_info.filter_intra_mode];
 
-        symbol_with_update!(
-          self,
-          w,
-          av1_tx_ind[tx_set as usize][tx_type as usize] as u32,
-          &mut self.fc.intra_tx_cdf[tx_set_index as usize]
-            [square_tx_size as usize][intra_dir as usize]
-            [..=num_tx_set[tx_set as usize]]
-        );
+        let s = av1_tx_ind[tx_set as usize][tx_type as usize] as u32;
+        if tx_set_index == 1 {
+          let cdf = &mut self.fc.intra_tx_1_cdf[square_tx_size as usize]
+            [intra_dir as usize];
+          symbol_with_update!(self, w, s, cdf);
+        } else {
+          let cdf = &mut self.fc.intra_tx_2_cdf[square_tx_size as usize]
+            [intra_dir as usize];
+          symbol_with_update!(self, w, s, cdf);
+        }
       }
     }
   }
@@ -598,8 +604,8 @@ impl<'a> ContextWriter<'a> {
     0
   }
 
-  pub fn write_tx_size_intra(
-    &mut self, w: &mut dyn Writer, bo: TileBlockOffset, bsize: BlockSize,
+  pub fn write_tx_size_intra<W: Writer>(
+    &mut self, w: &mut W, bo: TileBlockOffset, bsize: BlockSize,
     tx_size: TxSize,
   ) {
     fn tx_size_to_depth(tx_size: TxSize, bsize: BlockSize) -> usize {
@@ -647,12 +653,13 @@ impl<'a> ContextWriter<'a> {
     debug_assert!(depth <= max_depths);
     debug_assert!(!tx_size.is_rect() || bsize.is_rect_tx_allowed());
 
-    symbol_with_update!(
-      self,
-      w,
-      depth as u32,
-      &mut self.fc.tx_size_cdf[tx_size_cat][tx_size_ctx][..=max_depths + 1]
-    );
+    if tx_size_cat > 0 {
+      let cdf = &mut self.fc.tx_size_cdf[tx_size_cat - 1][tx_size_ctx];
+      symbol_with_update!(self, w, depth as u32, cdf, 3);
+    } else {
+      let cdf = &mut self.fc.tx_size_8x8_cdf[tx_size_ctx];
+      symbol_with_update!(self, w, depth as u32, cdf, 2);
+    }
   }
 
   // Based on https://aomediacodec.github.io/av1-spec/#cdf-selection-process
@@ -713,8 +720,8 @@ impl<'a> ContextWriter<'a> {
     category * 3 + above + left
   }
 
-  pub fn write_tx_size_inter(
-    &mut self, w: &mut dyn Writer, bo: TileBlockOffset, bsize: BlockSize,
+  pub fn write_tx_size_inter<W: Writer>(
+    &mut self, w: &mut W, bo: TileBlockOffset, bsize: BlockSize,
     tx_size: TxSize, txfm_split: bool, tbx: usize, tby: usize, depth: usize,
   ) {
     if bo.0.x >= self.bc.blocks.cols() || bo.0.y >= self.bc.blocks.rows() {
@@ -726,13 +733,8 @@ impl<'a> ContextWriter<'a> {
 
     if tx_size != TX_4X4 && depth < MAX_VARTX_DEPTH {
       let ctx = self.txfm_partition_context(bo, bsize, tx_size, tbx, tby);
-
-      symbol_with_update!(
-        self,
-        w,
-        txfm_split as u32,
-        &mut self.fc.txfm_partition_cdf[ctx]
-      );
+      let cdf = &mut self.fc.txfm_partition_cdf[ctx];
+      symbol_with_update!(self, w, txfm_split as u32, cdf, 2);
     } else {
       debug_assert!(!txfm_split);
     }

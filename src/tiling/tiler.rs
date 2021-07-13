@@ -253,6 +253,7 @@ pub mod test {
   use crate::lrf::*;
   use crate::mc::MotionVector;
   use crate::predict::PredictionMode;
+  use std::sync::Arc;
 
   #[test]
   fn test_tiling_info_from_tile_count() {
@@ -332,32 +333,36 @@ pub mod test {
     assert_eq!(16, ti.tile_height_sb);
   }
 
-  fn create_frame_invariants(
-    width: usize, height: usize, chroma_sampling: ChromaSampling,
-  ) -> FrameInvariants<u16> {
+  fn setup(
+    width: usize, height: usize,
+  ) -> (FrameInvariants<u16>, FrameState<u16>, FrameBlocks, f64) {
     // FrameInvariants aligns to the next multiple of 8, so using other values could make tests confusing
     assert!(width & 7 == 0);
     assert!(height & 7 == 0);
-    let config = EncoderConfig {
+    // We test only for 420 for now
+    let chroma_sampling = ChromaSampling::Cs420;
+    let config = Arc::new(EncoderConfig {
       width,
       height,
       bit_depth: 8,
       chroma_sampling,
       ..Default::default()
-    };
+    });
     let mut sequence = Sequence::new(&config);
     // These tests are all assuming SB-sized LRUs, so set that.
     sequence.enable_large_lru = false;
-    FrameInvariants::new(config, sequence)
+    let frame_rate = config.frame_rate();
+    let fi = FrameInvariants::new(config, Arc::new(sequence));
+    let fs = FrameState::new(&fi);
+    let fb = FrameBlocks::new(fi.w_in_b, fi.h_in_b);
+
+    (fi, fs, fb, frame_rate)
   }
 
   #[test]
   fn test_tile_iter_len() {
-    let fi = create_frame_invariants(160, 144, ChromaSampling::Cs420);
-    let mut fs = FrameState::new(&fi);
     // frame size 160x144, 40x36 in 4x4-blocks
-    let mut fb = FrameBlocks::new(fi.w_in_b, fi.h_in_b);
-    let frame_rate = fi.config.frame_rate();
+    let (fi, mut fs, mut fb, frame_rate) = setup(160, 144);
 
     {
       // 2x2 tiles
@@ -428,16 +433,14 @@ pub mod test {
 
   #[test]
   fn test_tile_area() {
-    let fi = create_frame_invariants(160, 144, ChromaSampling::Cs420);
-    let mut fs = FrameState::new(&fi);
-    let mut fb = FrameBlocks::new(fi.w_in_b, fi.h_in_b);
+    let (fi, mut fs, mut fb, frame_rate) = setup(160, 144);
 
     // 4x4 tiles requested, will actually get 3x3 tiles
     let ti = TilingInfo::from_target_tiles(
       fi.sb_size_log2(),
       fi.width,
       fi.height,
-      fi.config.frame_rate(),
+      frame_rate,
       2,
       2,
       false,
@@ -507,16 +510,14 @@ pub mod test {
 
   #[test]
   fn test_tile_blocks_area() {
-    let fi = create_frame_invariants(160, 144, ChromaSampling::Cs420);
-    let mut fs = FrameState::new(&fi);
-    let mut fb = FrameBlocks::new(fi.w_in_b, fi.h_in_b);
+    let (fi, mut fs, mut fb, frame_rate) = setup(160, 144);
 
     // 4x4 tiles requested, will actually get 3x3 tiles
     let ti = TilingInfo::from_target_tiles(
       fi.sb_size_log2(),
       fi.width,
       fi.height,
-      fi.config.frame_rate(),
+      frame_rate,
       2,
       2,
       false,
@@ -547,9 +548,7 @@ pub mod test {
 
   #[test]
   fn test_tile_write() {
-    let fi = create_frame_invariants(160, 144, ChromaSampling::Cs420);
-    let mut fs = FrameState::new(&fi);
-    let mut fb = FrameBlocks::new(fi.w_in_b, fi.h_in_b);
+    let (fi, mut fs, mut fb, frame_rate) = setup(160, 144);
 
     {
       // 4x4 tiles requested, will actually get 3x3 tiles
@@ -557,7 +556,7 @@ pub mod test {
         fi.sb_size_log2(),
         fi.width,
         fi.height,
-        fi.config.frame_rate(),
+        frame_rate,
         2,
         2,
         false,
@@ -615,14 +614,13 @@ pub mod test {
 
   #[test]
   fn test_tile_restoration_edges() {
-    let fi = create_frame_invariants(64, 80, ChromaSampling::Cs420);
-    let mut fs = FrameState::new(&fi);
-    let mut fb = FrameBlocks::new(fi.w_in_b, fi.h_in_b);
+    let (fi, mut fs, mut fb, frame_rate) = setup(64, 80);
+
     let ti = TilingInfo::from_target_tiles(
       fi.sb_size_log2(),
       fi.width,
       fi.height,
-      fi.config.frame_rate(),
+      frame_rate,
       2,
       2,
       false,
@@ -653,9 +651,7 @@ pub mod test {
 
   #[test]
   fn test_tile_restoration_write() {
-    let fi = create_frame_invariants(256, 256, ChromaSampling::Cs420);
-    let mut fs = FrameState::new(&fi);
-    let mut fb = FrameBlocks::new(fi.w_in_b, fi.h_in_b);
+    let (fi, mut fs, mut fb, frame_rate) = setup(256, 256);
 
     {
       // 2x2 tiles, each one containing 2×2 restoration units (1 super-block per restoration unit)
@@ -663,7 +659,7 @@ pub mod test {
         fi.sb_size_log2(),
         fi.width,
         fi.height,
-        fi.config.frame_rate(),
+        frame_rate,
         1,
         1,
         false,
@@ -716,9 +712,7 @@ pub mod test {
 
   #[test]
   fn test_tile_motion_vectors_write() {
-    let fi = create_frame_invariants(160, 144, ChromaSampling::Cs420);
-    let mut fs = FrameState::new(&fi);
-    let mut fb = FrameBlocks::new(fi.w_in_b, fi.h_in_b);
+    let (fi, mut fs, mut fb, frame_rate) = setup(160, 144);
 
     {
       // 4x4 tiles requested, will actually get 3x3 tiles
@@ -726,7 +720,7 @@ pub mod test {
         fi.sb_size_log2(),
         fi.width,
         fi.height,
-        fi.config.frame_rate(),
+        frame_rate,
         2,
         2,
         false,
@@ -761,9 +755,7 @@ pub mod test {
 
   #[test]
   fn test_tile_blocks_write() {
-    let fi = create_frame_invariants(160, 144, ChromaSampling::Cs420);
-    let mut fs = FrameState::new(&fi);
-    let mut fb = FrameBlocks::new(fi.w_in_b, fi.h_in_b);
+    let (fi, mut fs, mut fb, frame_rate) = setup(160, 144);
 
     {
       // 4x4 tiles requested, will actually get 3x3 tiles
@@ -771,7 +763,7 @@ pub mod test {
         fi.sb_size_log2(),
         fi.width,
         fi.height,
-        fi.config.frame_rate(),
+        frame_rate,
         2,
         2,
         false,

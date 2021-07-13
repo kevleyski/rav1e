@@ -12,6 +12,7 @@ use crate::api::ContextInner;
 use crate::encoder::TEMPORAL_DELIMITER;
 use crate::quantize::{ac_q, dc_q, select_ac_qi, select_dc_qi};
 use crate::util::{clamp, ILog, Pixel};
+use std::cmp;
 
 // The number of frame sub-types for which we track distinct parameters.
 // This does not include FRAME_SUBTYPE_SEF, because we don't need to do any
@@ -387,7 +388,7 @@ impl IIRBessel2 {
   // This does not alter the x/y state, but changes the reaction time of the
   //  filter.
   // Altering the time constant of a reactive filter without altering internal
-  //  state is something that has to be done carefuly, but our design operates
+  //  state is something that has to be done carefully, but our design operates
   //  at high enough delays and with small enough time constant changes to make
   //  it safe.
   pub fn reinit(&mut self, delay: i32) {
@@ -527,9 +528,9 @@ impl RCDeserialize {
     if self.unbuffer_val(4) != TWOPASS_VERSION as i64 {
       return Err("Version number mismatch".to_string());
     }
-    let mut s = RCSummary::default();
+    let mut s =
+      RCSummary { ntus: self.unbuffer_val(4) as i32, ..Default::default() };
 
-    s.ntus = self.unbuffer_val(4) as i32;
     // Make sure the file claims to have at least one TU.
     // Otherwise we probably got the placeholder data from an aborted
     //  pass 1.
@@ -822,7 +823,7 @@ impl RCState {
     // Insane framerates or frame sizes mean insane bitrates.
     // Let's not get carried away.
     // We also subtract 16 bits from each temporal unit to account for the
-    //  temporal delimeter, whose bits are not included in the frame sizes
+    //  temporal delimiter, whose bits are not included in the frame sizes
     //  reported to update_state().
     // TODO: Support constraints imposed by levels.
     let bits_per_tu = clamp(
@@ -946,26 +947,10 @@ impl RCState {
     if self.target_bitrate <= 0 {
       // Rate control is not active.
       // Derive quantizer directly from frame type.
-      // TODO: Rename "quantizer" something that indicates it is a quantizer
-      //  index, and move it somewhere more sensible (or choose a better way to
-      //  parameterize a "quality" configuration parameter).
-      let base_qi = ctx.config.quantizer;
       let bit_depth = ctx.config.bit_depth;
       let chroma_sampling = ctx.config.chroma_sampling;
-      // We use the AC quantizer as the source quantizer since its quantizer
-      //  tables have unique entries, while the DC tables do not.
-      let ac_quantizer = ac_q(base_qi as u8, 0, bit_depth) as i64;
-      // Pick the nearest DC entry since an exact match may be unavailable.
-      let dc_qi = select_dc_qi(ac_quantizer, bit_depth);
-      let dc_quantizer = dc_q(dc_qi as u8, 0, bit_depth) as i64;
-      // Get the log quantizers as Q57.
-      let log_ac_q = blog64(ac_quantizer) - q57(QSCALE + bit_depth as i32 - 8);
-      let log_dc_q = blog64(dc_quantizer) - q57(QSCALE + bit_depth as i32 - 8);
-      // Target the midpoint of the chosen entries.
-      let log_base_q = (log_ac_q + log_dc_q + 1) >> 1;
-      // Adjust the quantizer for the frame type, result is Q57:
-      let log_q = ((log_base_q + (1i64 << 11)) >> 12) * (MQP_Q12[fti] as i64)
-        + DQP_Q57[fti];
+      let (log_base_q, log_q) =
+        Self::calc_flat_quantizer(ctx.config.quantizer as u8, bit_depth, fti);
       QuantizerParameters::new_from_log_q(
         log_base_q,
         log_q,
@@ -1251,6 +1236,19 @@ impl RCState {
           // If that target is unreasonable, oh well; we'll have to drop.
         }
       }
+
+      if let Some(qi_max) = self.maybe_ac_qi_max {
+        let (max_log_base_q, max_log_q) =
+          Self::calc_flat_quantizer(qi_max, ctx.config.bit_depth, fti);
+        log_base_q = cmp::min(log_base_q, max_log_base_q);
+        log_q = cmp::min(log_q, max_log_q);
+      }
+      if self.ac_qi_min > 0 {
+        let (min_log_base_q, min_log_q) =
+          Self::calc_flat_quantizer(self.ac_qi_min, ctx.config.bit_depth, fti);
+        log_base_q = cmp::max(log_base_q, min_log_base_q);
+        log_q = cmp::max(log_q, min_log_q);
+      }
       QuantizerParameters::new_from_log_q(
         log_base_q,
         log_q,
@@ -1259,6 +1257,32 @@ impl RCState {
         fti == 0,
       )
     }
+  }
+
+  // Computes a quantizer directly from the frame type and base quantizer index,
+  // without consideration for rate control.
+  fn calc_flat_quantizer(
+    base_qi: u8, bit_depth: usize, fti: usize,
+  ) -> (i64, i64) {
+    // TODO: Rename "quantizer" something that indicates it is a quantizer
+    //  index, and move it somewhere more sensible (or choose a better way to
+    //  parameterize a "quality" configuration parameter).
+
+    // We use the AC quantizer as the source quantizer since its quantizer
+    //  tables have unique entries, while the DC tables do not.
+    let ac_quantizer = ac_q(base_qi as u8, 0, bit_depth) as i64;
+    // Pick the nearest DC entry since an exact match may be unavailable.
+    let dc_qi = select_dc_qi(ac_quantizer, bit_depth);
+    let dc_quantizer = dc_q(dc_qi as u8, 0, bit_depth) as i64;
+    // Get the log quantizers as Q57.
+    let log_ac_q = blog64(ac_quantizer) - q57(QSCALE + bit_depth as i32 - 8);
+    let log_dc_q = blog64(dc_quantizer) - q57(QSCALE + bit_depth as i32 - 8);
+    // Target the midpoint of the chosen entries.
+    let log_base_q = (log_ac_q + log_dc_q + 1) >> 1;
+    // Adjust the quantizer for the frame type, result is Q57:
+    let log_q = ((log_base_q + (1i64 << 11)) >> 12) * (MQP_Q12[fti] as i64)
+      + DQP_Q57[fti];
+    (log_base_q, log_q)
   }
 
   pub fn update_state(
@@ -1403,7 +1427,7 @@ impl RCState {
         self.reservoir_fullness -= bits;
         if show_frame {
           self.reservoir_fullness += self.bits_per_tu;
-          // TODO: Properly account for temporal delimeter bits.
+          // TODO: Properly account for temporal delimiter bits.
         }
         // If we're too quick filling the buffer and overflow is capped, that
         //  rate is lost forever.

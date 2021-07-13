@@ -280,9 +280,9 @@ impl PredictionMode {
   // Used by inter prediction to extract the fractional component of a mv and
   // obtain the correct PlaneSlice to operate on.
   #[inline]
-  fn get_mv_params<'a, T: Pixel>(
-    rec_plane: &'a Plane<T>, po: PlaneOffset, mv: MotionVector,
-  ) -> (i32, i32, PlaneSlice<'a, T>) {
+  fn get_mv_params<T: Pixel>(
+    rec_plane: &Plane<T>, po: PlaneOffset, mv: MotionVector,
+  ) -> (i32, i32, PlaneSlice<T>) {
     let &PlaneConfig { xdec, ydec, .. } = &rec_plane.cfg;
     let row_offset = mv.row as i32 >> (3 + ydec);
     let col_offset = mv.col as i32 >> (3 + xdec);
@@ -561,14 +561,8 @@ impl IntraEdgeFilterParameters {
         .into(),
         None => None,
       },
-      above_ref_frame_types: match above_ctx {
-        Some(bi) => Some(bi.reference_types),
-        None => None,
-      },
-      left_ref_frame_types: match left_ctx {
-        Some(bi) => Some(bi.reference_types),
-        None => None,
-      },
+      above_ref_frame_types: above_ctx.map(|bi| bi.reference_types),
+      left_ref_frame_types: left_ctx.map(|bi| bi.reference_types),
     }
   }
 
@@ -1031,6 +1025,7 @@ pub(crate) mod rust {
     bit_depth: usize, ief_params: Option<IntraEdgeFilterParameters>,
   ) {
     #[allow(clippy::collapsible_if)]
+    #[allow(clippy::collapsible_else_if)]
     #[allow(clippy::needless_return)]
     fn select_ief_strength(
       width: usize, height: usize, smooth_filter: bool, angle_delta: isize,

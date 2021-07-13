@@ -81,7 +81,7 @@ impl RDOType {
 pub struct PartitionGroupParameters {
   pub rd_cost: f64,
   pub part_type: PartitionType,
-  pub part_modes: ArrayVec<[PartitionParameters; 4]>,
+  pub part_modes: ArrayVec<PartitionParameters, 4>,
 }
 
 #[derive(Clone, Debug)]
@@ -147,14 +147,16 @@ fn cdef_dist_wxh_8x8<T: Pixel>(
   debug_assert!(src2.plane_cfg.xdec == 0);
   debug_assert!(src2.plane_cfg.ydec == 0);
 
-  let coeff_shift = bit_depth - 8;
-
   // Sum into columns to improve auto-vectorization
   let mut sum_s_cols: [u16; 8] = [0; 8];
   let mut sum_d_cols: [u16; 8] = [0; 8];
   let mut sum_s2_cols: [u32; 8] = [0; 8];
   let mut sum_d2_cols: [u32; 8] = [0; 8];
   let mut sum_sd_cols: [u32; 8] = [0; 8];
+
+  // Check upfront that 8 rows are available.
+  let _row1 = &src1[7];
+  let _row2 = &src2[7];
 
   for j in 0..8 {
     let row1 = &src1[j][0..8];
@@ -196,12 +198,20 @@ fn cdef_dist_wxh_8x8<T: Pixel>(
   // Use sums to calculate distortion
   let svar = sum_s2 - ((sum_s * sum_s + 32) >> 6);
   let dvar = sum_d2 - ((sum_d * sum_d + 32) >> 6);
-  let sse = (sum_d2 + sum_s2 - 2 * sum_sd) as f64;
+  let sse = (sum_d2 + sum_s2 - 2 * sum_sd) as u64;
+  RawDistortion::new(ssim_boost(svar, dvar, bit_depth).mul_u64(sse))
+}
+
+#[inline(always)]
+pub fn ssim_boost(svar: i64, dvar: i64, bit_depth: usize) -> DistortionScale {
+  let coeff_shift = bit_depth - 8;
+
   //The two constants were tuned for CDEF, but can probably be better tuned for use in general RDO
-  let ssim_boost = (4033_f64 / 16_384_f64)
-    * (svar + dvar + (16_384 << (2 * coeff_shift))) as f64
-    / f64::sqrt(((16_265_089i64 << (4 * coeff_shift)) + svar * dvar) as f64);
-  RawDistortion::new((sse * ssim_boost + 0.5_f64) as u64)
+  DistortionScale::new(
+    (4033_f64 / 16_384_f64)
+      * (svar + dvar + (16_384 << (2 * coeff_shift))) as f64
+      / f64::sqrt(((16_265_089i64 << (4 * coeff_shift)) + svar * dvar) as f64),
+  )
 }
 
 #[allow(unused)]
@@ -374,7 +384,7 @@ fn compute_distortion<T: Pixel>(
 
   if is_chroma_block
     && !luma_only
-    && fi.config.chroma_sampling != ChromaSampling::Cs400
+    && fi.sequence.chroma_sampling != ChromaSampling::Cs400
   {
     let PlaneConfig { xdec, ydec, .. } = ts.input.planes[1].cfg;
     let chroma_w = if bsize.width() >= 8 || xdec == 0 {
@@ -462,7 +472,7 @@ fn compute_tx_distortion<T: Pixel>(
   if is_chroma_block
     && !luma_only
     && skip
-    && fi.config.chroma_sampling != ChromaSampling::Cs400
+    && fi.sequence.chroma_sampling != ChromaSampling::Cs400
   {
     let PlaneConfig { xdec, ydec, .. } = ts.input.planes[1].cfg;
     let chroma_w = if bsize.width() >= 8 || xdec == 0 {
@@ -516,6 +526,31 @@ pub fn distortion_scale<T: Pixel>(
   let y = frame_bo.0.y >> IMPORTANCE_BLOCK_TO_BLOCK_SHIFT;
 
   fi.distortion_scales[y * fi.w_in_imp_b + x]
+}
+
+pub fn spatiotemporal_scale<T: Pixel>(
+  fi: &FrameInvariants<T>, frame_bo: PlaneBlockOffset, bsize: BlockSize,
+) -> DistortionScale {
+  if !fi.config.temporal_rdo() && fi.config.tune != Tune::Psychovisual {
+    return DistortionScale::default();
+  }
+
+  let x0 = frame_bo.0.x >> IMPORTANCE_BLOCK_TO_BLOCK_SHIFT;
+  let y0 = frame_bo.0.y >> IMPORTANCE_BLOCK_TO_BLOCK_SHIFT;
+  let x1 = (x0 + bsize.width_imp_b()).min(fi.w_in_imp_b);
+  let y1 = (y0 + bsize.height_imp_b()).min(fi.h_in_imp_b);
+  let den = (((x1 - x0) * (y1 - y0)) as u64) << DistortionScale::SHIFT;
+
+  let mut sum = 0;
+  for y in y0..y1 {
+    sum += fi.distortion_scales[y * fi.w_in_imp_b..][x0..x1]
+      .iter()
+      .zip(fi.activity_scales[y * fi.w_in_imp_b..][x0..x1].iter())
+      .take(MAX_SB_IN_IMP_B)
+      .map(|(d, a)| d.0 as u64 * a.0 as u64)
+      .sum::<u64>();
+  }
+  DistortionScale(((sum + (den >> 1)) / den) as u32)
 }
 
 pub fn distortion_scale_for(
@@ -599,7 +634,7 @@ impl DistortionScale {
   /// Multiply, round and shift
   /// Internal implementation, so don't use multiply trait.
   #[inline]
-  fn mul_u64(self, dist: u64) -> u64 {
+  pub fn mul_u64(self, dist: u64) -> u64 {
     (self.0 as u64 * dist + (1 << Self::SHIFT >> 1)) >> Self::SHIFT
   }
 }
@@ -778,7 +813,7 @@ fn luma_chroma_mode_rdo<T: Pixel>(
   cw_checkpoint: &ContextWriterCheckpoint, best: &mut PartitionParameters,
   mvs: [MotionVector; 2], ref_frames: [RefType; 2],
   mode_set_chroma: &[PredictionMode], luma_mode_is_intra: bool,
-  mode_context: usize, mv_stack: &ArrayVec<[CandidateMV; 9]>,
+  mode_context: usize, mv_stack: &ArrayVec<CandidateMV, 9>,
   angle_delta: AngleDelta,
 ) {
   let PlaneConfig { xdec, ydec, .. } = ts.input.planes[1].cfg;
@@ -811,21 +846,11 @@ fn luma_chroma_mode_rdo<T: Pixel>(
 
   // Find the best chroma prediction mode for the current luma prediction mode
   let mut chroma_rdo = |skip: bool| -> bool {
+    use crate::segmentation::select_segment;
+
     let mut zero_distortion = false;
 
-    // If skip is true or segmentation is turned off, sidx is not coded.
-    let sidx_range = if skip || !fi.enable_segmentation {
-      0..=0
-    } else if fi.base_q_idx as i16
-      + ts.segmentation.data[2][SegLvl::SEG_LVL_ALT_Q as usize]
-      < 1
-    {
-      0..=1
-    } else {
-      0..=2
-    };
-
-    for sidx in sidx_range {
+    for sidx in select_segment(fi, ts, tile_bo, bsize, skip) {
       cw.bc.blocks.set_segmentation_idx(tile_bo, bsize, sidx);
 
       let (tx_size, tx_type) = rdo_tx_size_type(
@@ -928,7 +953,7 @@ pub fn rdo_mode_decision<T: Pixel>(
   inter_cfg: &InterConfig,
 ) -> PartitionParameters {
   let PlaneConfig { xdec, ydec, .. } = ts.input.planes[1].cfg;
-  let cw_checkpoint = cw.checkpoint();
+  let cw_checkpoint = cw.checkpoint(&tile_bo, fi.sequence.chroma_sampling);
 
   let rdo_type = if fi.use_tx_domain_rate {
     RDOType::TxDistEstRate
@@ -976,15 +1001,15 @@ pub fn rdo_mode_decision<T: Pixel>(
     cw.bc.blocks.set_segmentation_idx(tile_bo, bsize, best.sidx);
 
     let chroma_mode = PredictionMode::UV_CFL_PRED;
-    let cw_checkpoint = cw.checkpoint();
-    let wr: &mut dyn Writer = &mut WriterCounter::new();
+    let cw_checkpoint = cw.checkpoint(&tile_bo, fi.sequence.chroma_sampling);
+    let mut wr = WriterCounter::new();
     let angle_delta = AngleDelta { y: best.angle_delta.y, uv: 0 };
 
     write_tx_blocks(
       fi,
       ts,
       cw,
-      wr,
+      &mut wr,
       best.pred_mode_luma,
       best.pred_mode_luma,
       angle_delta,
@@ -1001,14 +1026,14 @@ pub fn rdo_mode_decision<T: Pixel>(
     cw.rollback(&cw_checkpoint);
     if fi.sequence.chroma_sampling != ChromaSampling::Cs400 {
       if let Some(cfl) = rdo_cfl_alpha(ts, tile_bo, bsize, best.tx_size, fi) {
-        let wr: &mut dyn Writer = &mut WriterCounter::new();
+        let mut wr = WriterCounter::new();
         let tell = wr.tell_frac();
 
         encode_block_pre_cdef(
           &fi.sequence,
           ts,
           cw,
-          wr,
+          &mut wr,
           bsize,
           tile_bo,
           best.skip,
@@ -1017,7 +1042,7 @@ pub fn rdo_mode_decision<T: Pixel>(
           fi,
           ts,
           cw,
-          wr,
+          &mut wr,
           best.pred_mode_luma,
           chroma_mode,
           angle_delta,
@@ -1088,11 +1113,11 @@ fn inter_frame_rdo_mode_decision<T: Pixel>(
   let mut best = PartitionParameters::default();
 
   // we can never have more than 7 reference frame sets
-  let mut ref_frames_set = ArrayVec::<[_; 7]>::new();
+  let mut ref_frames_set = ArrayVec::<_, 7>::new();
   // again, max of 7 ref slots
-  let mut ref_slot_set = ArrayVec::<[_; 7]>::new();
+  let mut ref_slot_set = ArrayVec::<_, 7>::new();
   // our implementation never returns more than 3 at the moment
-  let mut mvs_from_me = ArrayVec::<[_; 3]>::new();
+  let mut mvs_from_me = ArrayVec::<_, 3>::new();
   let mut fwdref = None;
   let mut bwdref = None;
 
@@ -1116,14 +1141,14 @@ fn inter_frame_rdo_mode_decision<T: Pixel>(
   }
   assert!(!ref_frames_set.is_empty());
 
-  let mut inter_mode_set = ArrayVec::<[(PredictionMode, usize); 20]>::new();
-  let mut mvs_set = ArrayVec::<[[MotionVector; 2]; 20]>::new();
-  let mut satds = ArrayVec::<[u32; 20]>::new();
-  let mut mv_stacks = ArrayVec::<[_; 20]>::new();
-  let mut mode_contexts = ArrayVec::<[_; 7]>::new();
+  let mut inter_mode_set = ArrayVec::<(PredictionMode, usize), 20>::new();
+  let mut mvs_set = ArrayVec::<[MotionVector; 2], 20>::new();
+  let mut satds = ArrayVec::<u32, 20>::new();
+  let mut mv_stacks = ArrayVec::<_, 20>::new();
+  let mut mode_contexts = ArrayVec::<_, 7>::new();
 
   for (i, &ref_frames) in ref_frames_set.iter().enumerate() {
-    let mut mv_stack = ArrayVec::<[CandidateMV; 9]>::new();
+    let mut mv_stack = ArrayVec::<CandidateMV, 9>::new();
     mode_contexts.push(cw.find_mvrefs(
       tile_bo,
       ref_frames,
@@ -1192,7 +1217,7 @@ fn inter_frame_rdo_mode_decision<T: Pixel>(
         let mv0 = mvs_from_me[r0][0];
         let mv1 = mvs_from_me[r1][0];
         mvs_from_me.push([mv0, mv1]);
-        let mut mv_stack = ArrayVec::<[CandidateMV; 9]>::new();
+        let mut mv_stack = ArrayVec::<CandidateMV, 9>::new();
         mode_contexts.push(cw.find_mvrefs(
           tile_bo,
           ref_frames,
@@ -1302,7 +1327,7 @@ fn inter_frame_rdo_mode_decision<T: Pixel>(
   });
 
   let mut sorted =
-    izip!(inter_mode_set, mvs_set, satds).collect::<ArrayVec<[_; 20]>>();
+    izip!(inter_mode_set, mvs_set, satds).collect::<ArrayVec<_, 20>>();
   if num_modes_rdo != sorted.len() {
     sorted.sort_by_key(|((_mode, _i), _mvs, satd)| *satd);
   }
@@ -1342,7 +1367,7 @@ fn intra_frame_rdo_mode_decision<T: Pixel>(
   mut best: PartitionParameters, is_chroma_block: bool,
 ) -> PartitionParameters {
   let num_modes_rdo: usize;
-  let mut modes = ArrayVec::<[_; INTRA_MODES]>::new();
+  let mut modes = ArrayVec::<_, INTRA_MODES>::new();
 
   // Reduce number of prediction modes at higher speed levels
   num_modes_rdo = if (fi.frame_type == FrameType::KEY
@@ -1373,7 +1398,7 @@ fn intra_frame_rdo_mode_decision<T: Pixel>(
       *z = a;
       Some(!d)
     })
-    .collect::<ArrayVec<[_; INTRA_MODES]>>();
+    .collect::<ArrayVec<_, INTRA_MODES>>();
 
     modes.try_extend_from_slice(intra_mode_set).unwrap();
     modes.sort_by_key(|&a| probs_all[a as usize]);
@@ -1458,7 +1483,7 @@ fn intra_frame_rdo_mode_decision<T: Pixel>(
   modes.iter().take(num_modes_rdo).for_each(|&luma_mode| {
     let mvs = [MotionVector::default(); 2];
     let ref_frames = [INTRA_FRAME, NONE_FRAME];
-    let mut mode_set_chroma = ArrayVec::<[_; 2]>::new();
+    let mut mode_set_chroma = ArrayVec::<_, 2>::new();
     mode_set_chroma.push(luma_mode);
     if is_chroma_block && luma_mode != PredictionMode::DC_PRED {
       mode_set_chroma.push(PredictionMode::DC_PRED);
@@ -1478,7 +1503,7 @@ fn intra_frame_rdo_mode_decision<T: Pixel>(
       &mode_set_chroma,
       true,
       0,
-      &ArrayVec::<[CandidateMV; 9]>::new(),
+      &ArrayVec::<CandidateMV, 9>::new(),
       AngleDelta::default(),
     );
   });
@@ -1493,7 +1518,7 @@ fn intra_frame_rdo_mode_decision<T: Pixel>(
     let mvs = [MotionVector::default(); 2];
     let ref_frames = [INTRA_FRAME, NONE_FRAME];
     let mode_set_chroma = [best.pred_mode_chroma];
-    let mv_stack = ArrayVec::<[_; 9]>::new();
+    let mv_stack = ArrayVec::<_, 9>::new();
     let mut best_angle_delta = best.angle_delta;
     let mut angle_delta_rdo = |y, uv| -> AngleDelta {
       if best.angle_delta.y != y || best.angle_delta.uv != uv {
@@ -1556,7 +1581,7 @@ pub fn rdo_cfl_alpha<T: Pixel>(
   };
   let mut ac: Aligned<[i16; 32 * 32]> = Aligned::uninitialized();
   luma_ac(&mut ac.data, ts, tile_bo, bsize, luma_tx_size, fi);
-  let best_alpha: ArrayVec<[i16; 2]> = (1..3)
+  let best_alpha: ArrayVec<i16, 2> = (1..3)
     .map(|p| {
       let &PlaneConfig { xdec, ydec, .. } = ts.rec.planes[p].plane_cfg;
       let tile_rect = ts.tile_rect().decimated(xdec, ydec);
@@ -1650,7 +1675,8 @@ pub fn rdo_tx_type_decision<T: Pixel>(
   if cw_checkpoint.is_none() {
     // Only run the first call
     // Prevents creating multiple checkpoints for own version of cw
-    *cw_checkpoint = Some(cw.checkpoint());
+    *cw_checkpoint =
+      Some(cw.checkpoint(&tile_bo, fi.sequence.chroma_sampling));
   }
 
   let rdo_type = if fi.use_tx_domain_distortion {
@@ -1672,14 +1698,14 @@ pub fn rdo_tx_type_decision<T: Pixel>(
       );
     }
 
-    let wr: &mut dyn Writer = &mut WriterCounter::new();
+    let mut wr = WriterCounter::new();
     let tell = wr.tell_frac();
     let (_, tx_dist) = if is_inter {
       write_tx_tree(
         fi,
         ts,
         cw,
-        wr,
+        &mut wr,
         mode,
         0,
         tile_bo,
@@ -1696,7 +1722,7 @@ pub fn rdo_tx_type_decision<T: Pixel>(
         fi,
         ts,
         cw,
-        wr,
+        &mut wr,
         mode,
         mode,
         AngleDelta::default(),
@@ -1743,8 +1769,8 @@ pub fn rdo_tx_type_decision<T: Pixel>(
 
 pub fn get_sub_partitions(
   four_partitions: &[TileBlockOffset; 4], partition: PartitionType,
-) -> ArrayVec<[TileBlockOffset; 4]> {
-  let mut partition_offsets = ArrayVec::<[TileBlockOffset; 4]>::new();
+) -> ArrayVec<TileBlockOffset, 4> {
+  let mut partition_offsets = ArrayVec::<TileBlockOffset, 4>::new();
 
   partition_offsets.push(four_partitions[0]);
 
@@ -1768,9 +1794,8 @@ pub fn get_sub_partitions(
 fn rdo_partition_none<T: Pixel>(
   fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>,
   cw: &mut ContextWriter, bsize: BlockSize, tile_bo: TileBlockOffset,
-  inter_cfg: &InterConfig,
-  child_modes: &mut ArrayVec<[PartitionParameters; 4]>,
-) -> Option<f64> {
+  inter_cfg: &InterConfig, child_modes: &mut ArrayVec<PartitionParameters, 4>,
+) -> f64 {
   debug_assert!(tile_bo.0.x < ts.mi_width && tile_bo.0.y < ts.mi_height);
 
   let mode = rdo_mode_decision(fi, ts, cw, bsize, tile_bo, inter_cfg);
@@ -1778,7 +1803,7 @@ fn rdo_partition_none<T: Pixel>(
 
   child_modes.push(mode);
 
-  Some(cost)
+  cost
 }
 
 // VERTICAL, HORIZONTAL or simple SPLIT
@@ -1788,7 +1813,7 @@ fn rdo_partition_simple<T: Pixel, W: Writer>(
   cw: &mut ContextWriter, w_pre_cdef: &mut W, w_post_cdef: &mut W,
   bsize: BlockSize, tile_bo: TileBlockOffset, inter_cfg: &InterConfig,
   partition: PartitionType, rdo_type: RDOType, best_rd: f64,
-  child_modes: &mut ArrayVec<[PartitionParameters; 4]>,
+  child_modes: &mut ArrayVec<PartitionParameters, 4>,
 ) -> Option<f64> {
   debug_assert!(tile_bo.0.x < ts.mi_width && tile_bo.0.y < ts.mi_height);
   let subsize = bsize.subsize(partition);
@@ -1879,7 +1904,7 @@ pub fn rdo_partition_decision<T: Pixel, W: Writer>(
   let mut best_rd = cached_block.rd_cost;
   let mut best_pred_modes = cached_block.part_modes.clone();
 
-  let cw_checkpoint = cw.checkpoint();
+  let cw_checkpoint = cw.checkpoint(&tile_bo, fi.sequence.chroma_sampling);
   let w_pre_checkpoint = w_pre_cdef.checkpoint();
   let w_post_checkpoint = w_post_cdef.checkpoint();
 
@@ -1889,18 +1914,20 @@ pub fn rdo_partition_decision<T: Pixel, W: Writer>(
       continue;
     }
 
-    let mut child_modes = ArrayVec::<[_; 4]>::new();
+    let mut child_modes = ArrayVec::<_, 4>::new();
 
     let cost = match partition {
-      PARTITION_NONE if bsize <= BlockSize::BLOCK_64X64 => rdo_partition_none(
-        fi,
-        ts,
-        cw,
-        bsize,
-        tile_bo,
-        inter_cfg,
-        &mut child_modes,
-      ),
+      PARTITION_NONE if bsize <= BlockSize::BLOCK_64X64 => {
+        Some(rdo_partition_none(
+          fi,
+          ts,
+          cw,
+          bsize,
+          tile_bo,
+          inter_cfg,
+          &mut child_modes,
+        ))
+      }
       PARTITION_SPLIT | PARTITION_HORZ | PARTITION_VERT => {
         rdo_partition_simple(
           fi,
@@ -2008,9 +2035,9 @@ fn rdo_loop_plane_error<T: Pixel>(
 // the LRU area we're optimizing.  This area covers the largest LRU in
 // any of the present planes, but may consist of a number of
 // superblocks and full, smaller LRUs in the other planes
-pub fn rdo_loop_decision<T: Pixel>(
+pub fn rdo_loop_decision<T: Pixel, W: Writer>(
   base_sbo: TileSuperBlockOffset, fi: &FrameInvariants<T>,
-  ts: &mut TileStateMut<'_, T>, cw: &mut ContextWriter, w: &mut dyn Writer,
+  ts: &mut TileStateMut<'_, T>, cw: &mut ContextWriter, w: &mut W,
   deblock_p: bool,
 ) {
   let planes = if fi.sequence.chroma_sampling == ChromaSampling::Cs400 {

@@ -29,7 +29,7 @@ use crate::util::ILog;
 use std::ops::{Index, IndexMut};
 use std::sync::Arc;
 
-use crate::hawktracer::*;
+use rust_hawktracer::*;
 
 #[derive(Debug, Copy, Clone)]
 pub struct MEStats {
@@ -59,6 +59,14 @@ impl FrameMEStats {
       cols,
       rows,
     }
+  }
+  pub fn new_arc_array(cols: usize, rows: usize) -> Arc<[Self; REF_FRAMES]> {
+    let stats = (0..REF_FRAMES)
+      .map(|_| FrameMEStats::new(cols, rows))
+      .collect::<ArrayVec<_, REF_FRAMES>>()
+      .into_inner()
+      .unwrap();
+    Arc::new(stats)
   }
 }
 
@@ -266,12 +274,12 @@ fn get_mv_range(
 struct MotionEstimationSubsets {
   min_sad: u32,
   median: Option<MotionVector>,
-  subset_b: ArrayVec<[MotionVector; 5]>,
-  subset_c: ArrayVec<[MotionVector; 5]>,
+  subset_b: ArrayVec<MotionVector, 5>,
+  subset_c: ArrayVec<MotionVector, 5>,
 }
 
 impl MotionEstimationSubsets {
-  fn all_mvs(&self) -> ArrayVec<[MotionVector; 11]> {
+  fn all_mvs(&self) -> ArrayVec<MotionVector, 11> {
     let mut all = ArrayVec::new();
     if let Some(median) = self.median {
       all.push(median);
@@ -294,8 +302,8 @@ fn get_subset_predictors<T: Pixel>(
   let ssdec = conf.ssdec;
 
   let mut min_sad: u32 = u32::MAX;
-  let mut subset_b = ArrayVec::<[MotionVector; 5]>::new();
-  let mut subset_c = ArrayVec::<[MotionVector; 5]>::new();
+  let mut subset_b = ArrayVec::<MotionVector, 5>::new();
+  let mut subset_c = ArrayVec::<MotionVector, 5>::new();
   let w = bsize.width_mi() << ssdec;
   let h = bsize.height_mi() << ssdec;
 
@@ -361,10 +369,8 @@ fn get_subset_predictors<T: Pixel>(
   } else if subset_b.len() != 3 {
     None
   } else {
-    let mut rows: ArrayVec<[i16; 3]> =
-      subset_b.iter().map(|&a| a.row).collect();
-    let mut cols: ArrayVec<[i16; 3]> =
-      subset_b.iter().map(|&a| a.col).collect();
+    let mut rows: ArrayVec<i16, 3> = subset_b.iter().map(|&a| a.row).collect();
+    let mut cols: ArrayVec<i16, 3> = subset_b.iter().map(|&a| a.col).collect();
     rows.as_mut_slice().sort_unstable();
     cols.as_mut_slice().sort_unstable();
     Some(MotionVector { row: rows[1], col: cols[1] })

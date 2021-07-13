@@ -64,7 +64,7 @@ pub(crate) unsafe fn cdef_filter_block<T: Pixel>(
   };
 
   // TODO: handle padding in the fast path
-  if edges != CDEF_HAVE_ALL {
+  if edges != CDEF_HAVE_ALL && matches!(T::type_enum(), PixelType::U16) {
     call_rust(dst);
   } else {
     #[cfg(feature = "check_asm")]
@@ -183,8 +183,12 @@ cpu_function_lookup_table!(
 
 type CdefDirLBDFn =
   unsafe extern fn(tmp: *const u8, tmp_stride: isize, var: *mut u32) -> i32;
-type CdefDirHBDFn =
-  unsafe extern fn(tmp: *const u16, tmp_stride: isize, var: *mut u32) -> i32;
+type CdefDirHBDFn = unsafe extern fn(
+  tmp: *const u16,
+  tmp_stride: isize,
+  var: *mut u32,
+  bitdepth_max: i32,
+) -> i32;
 
 #[inline(always)]
 #[allow(clippy::let_and_return)]
@@ -223,6 +227,7 @@ pub(crate) fn cdef_find_dir<T: Pixel>(
             img.as_ptr() as *const _,
             T::to_asm_stride(img.plane.cfg.stride),
             var as *mut u32,
+            (1 << (coeff_shift + 8)) - 1,
           )
         }
       } else {
@@ -241,21 +246,27 @@ pub(crate) fn cdef_find_dir<T: Pixel>(
 }
 
 extern {
-  fn rav1e_cdef_dir_8_avx2(
+  fn rav1e_cdef_dir_8bpc_avx2(
     tmp: *const u8, tmp_stride: isize, var: *mut u32,
+  ) -> i32;
+}
+
+extern {
+  fn rav1e_cdef_dir_16bpc_avx2(
+    tmp: *const u16, tmp_stride: isize, var: *mut u32, bitdepth_max: i32,
   ) -> i32;
 }
 
 cpu_function_lookup_table!(
   CDEF_DIR_LBD_FNS: [Option<CdefDirLBDFn>],
   default: None,
-  [(AVX2, Some(rav1e_cdef_dir_8_avx2))]
+  [(AVX2, Some(rav1e_cdef_dir_8bpc_avx2))]
 );
 
 cpu_function_lookup_table!(
   CDEF_DIR_HBD_FNS: [Option<CdefDirHBDFn>],
   default: None,
-  []
+  [(AVX2, Some(rav1e_cdef_dir_16bpc_avx2))]
 );
 
 #[cfg(test)]

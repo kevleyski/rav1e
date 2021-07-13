@@ -9,67 +9,89 @@
 
 use super::*;
 
+pub const CDF_LEN_MAX: usize = 16;
+
+#[derive(Clone)]
+pub struct CDFContextCheckpoint {
+  small: usize,
+  large: usize,
+}
+
 #[derive(Clone, Copy)]
+#[repr(C)]
 pub struct CDFContext {
-  pub partition_cdf: [[u16; EXT_PARTITION_TYPES + 1]; PARTITION_CONTEXTS],
-  pub kf_y_cdf: [[[u16; INTRA_MODES + 1]; KF_MODE_CONTEXTS]; KF_MODE_CONTEXTS],
-  pub y_mode_cdf: [[u16; INTRA_MODES + 1]; BLOCK_SIZE_GROUPS],
-  pub uv_mode_cdf: [[[u16; UV_INTRA_MODES + 1]; INTRA_MODES]; 2],
-  pub cfl_sign_cdf: [u16; CFL_JOINT_SIGNS + 1],
-  pub cfl_alpha_cdf: [[u16; CFL_ALPHABET_SIZE + 1]; CFL_ALPHA_CONTEXTS],
-  pub newmv_cdf: [[u16; 2 + 1]; NEWMV_MODE_CONTEXTS],
-  pub zeromv_cdf: [[u16; 2 + 1]; GLOBALMV_MODE_CONTEXTS],
-  pub refmv_cdf: [[u16; 2 + 1]; REFMV_MODE_CONTEXTS],
-  pub intra_tx_cdf: [[[[u16; TX_TYPES + 1]; INTRA_MODES];
-    TX_SIZE_SQR_CONTEXTS]; TX_SETS_INTRA],
-  pub inter_tx_cdf:
-    [[[u16; TX_TYPES + 1]; TX_SIZE_SQR_CONTEXTS]; TX_SETS_INTER],
-  pub tx_size_cdf:
-    [[[u16; MAX_TX_DEPTH + 1 + 1]; TX_SIZE_CONTEXTS]; MAX_TX_CATS],
-  pub txfm_partition_cdf: [[u16; 2 + 1]; TXFM_PARTITION_CONTEXTS],
-  pub skip_cdfs: [[u16; 3]; SKIP_CONTEXTS],
-  pub intra_inter_cdfs: [[u16; 3]; INTRA_INTER_CONTEXTS],
-  pub angle_delta_cdf: [[u16; 2 * MAX_ANGLE_DELTA + 1 + 1]; DIRECTIONAL_MODES],
-  pub filter_intra_cdfs: [[u16; 3]; BlockSize::BLOCK_SIZES_ALL],
-  pub palette_y_mode_cdfs:
-    [[[u16; 3]; PALETTE_Y_MODE_CONTEXTS]; PALETTE_BSIZE_CTXS],
-  pub palette_uv_mode_cdfs: [[u16; 3]; PALETTE_UV_MODE_CONTEXTS],
-  pub comp_mode_cdf: [[u16; 3]; COMP_INTER_CONTEXTS],
-  pub comp_ref_type_cdf: [[u16; 3]; COMP_REF_TYPE_CONTEXTS],
-  pub comp_ref_cdf: [[[u16; 3]; FWD_REFS - 1]; REF_CONTEXTS],
-  pub comp_bwd_ref_cdf: [[[u16; 3]; BWD_REFS - 1]; REF_CONTEXTS],
-  pub single_ref_cdfs: [[[u16; 2 + 1]; SINGLE_REFS - 1]; REF_CONTEXTS],
-  pub drl_cdfs: [[u16; 2 + 1]; DRL_MODE_CONTEXTS],
-  pub compound_mode_cdf:
-    [[u16; INTER_COMPOUND_MODES + 1]; INTER_MODE_CONTEXTS],
-  pub nmv_context: NMVContext,
-  pub deblock_delta_multi_cdf: [[u16; DELTA_LF_PROBS + 1 + 1]; FRAME_LF_COUNT],
-  pub deblock_delta_cdf: [u16; DELTA_LF_PROBS + 1 + 1],
-  pub spatial_segmentation_cdfs: [[u16; 8 + 1]; 3],
-  pub lrf_switchable_cdf: [u16; 3 + 1],
-  pub lrf_sgrproj_cdf: [u16; 2 + 1],
-  pub lrf_wiener_cdf: [u16; 2 + 1],
-
-  // lv_map
-  pub txb_skip_cdf: [[[u16; 3]; TXB_SKIP_CONTEXTS]; TxSize::TX_SIZES],
-  pub dc_sign_cdf: [[[u16; 3]; DC_SIGN_CONTEXTS]; PLANE_TYPES],
+  pub comp_bwd_ref_cdf: [[[u16; 2]; BWD_REFS - 1]; REF_CONTEXTS],
+  pub comp_mode_cdf: [[u16; 2]; COMP_INTER_CONTEXTS],
+  pub comp_ref_cdf: [[[u16; 2]; FWD_REFS - 1]; REF_CONTEXTS],
+  pub comp_ref_type_cdf: [[u16; 2]; COMP_REF_TYPE_CONTEXTS],
+  pub dc_sign_cdf: [[[u16; 2]; DC_SIGN_CONTEXTS]; PLANE_TYPES],
+  pub drl_cdfs: [[u16; 2]; DRL_MODE_CONTEXTS],
   pub eob_extra_cdf:
-    [[[[u16; 3]; EOB_COEF_CONTEXTS]; PLANE_TYPES]; TxSize::TX_SIZES],
-
-  pub eob_flag_cdf16: [[[u16; 5 + 1]; 2]; PLANE_TYPES],
-  pub eob_flag_cdf32: [[[u16; 6 + 1]; 2]; PLANE_TYPES],
-  pub eob_flag_cdf64: [[[u16; 7 + 1]; 2]; PLANE_TYPES],
-  pub eob_flag_cdf128: [[[u16; 8 + 1]; 2]; PLANE_TYPES],
-  pub eob_flag_cdf256: [[[u16; 9 + 1]; 2]; PLANE_TYPES],
-  pub eob_flag_cdf512: [[[u16; 10 + 1]; 2]; PLANE_TYPES],
-  pub eob_flag_cdf1024: [[[u16; 11 + 1]; 2]; PLANE_TYPES],
+    [[[[u16; 2]; EOB_COEF_CONTEXTS]; PLANE_TYPES]; TxSize::TX_SIZES],
+  pub filter_intra_cdfs: [[u16; 2]; BlockSize::BLOCK_SIZES_ALL],
+  pub intra_inter_cdfs: [[u16; 2]; INTRA_INTER_CONTEXTS],
+  pub lrf_sgrproj_cdf: [u16; 2],
+  pub lrf_wiener_cdf: [u16; 2],
+  pub newmv_cdf: [[u16; 2]; NEWMV_MODE_CONTEXTS],
+  pub palette_uv_mode_cdfs: [[u16; 2]; PALETTE_UV_MODE_CONTEXTS],
+  pub palette_y_mode_cdfs:
+    [[[u16; 2]; PALETTE_Y_MODE_CONTEXTS]; PALETTE_BSIZE_CTXS],
+  pub refmv_cdf: [[u16; 2]; REFMV_MODE_CONTEXTS],
+  pub single_ref_cdfs: [[[u16; 2]; SINGLE_REFS - 1]; REF_CONTEXTS],
+  pub skip_cdfs: [[u16; 2]; SKIP_CONTEXTS],
+  pub txb_skip_cdf: [[[u16; 2]; TXB_SKIP_CONTEXTS]; TxSize::TX_SIZES],
+  pub txfm_partition_cdf: [[u16; 2]; TXFM_PARTITION_CONTEXTS],
+  pub zeromv_cdf: [[u16; 2]; GLOBALMV_MODE_CONTEXTS],
+  pub tx_size_8x8_cdf: [[u16; MAX_TX_DEPTH]; TX_SIZE_CONTEXTS],
+  pub inter_tx_3_cdf: [[u16; 2]; TX_SIZE_SQR_CONTEXTS],
 
   pub coeff_base_eob_cdf:
-    [[[[u16; 3 + 1]; SIG_COEF_CONTEXTS_EOB]; PLANE_TYPES]; TxSize::TX_SIZES],
+    [[[[u16; 3]; SIG_COEF_CONTEXTS_EOB]; PLANE_TYPES]; TxSize::TX_SIZES],
+  pub lrf_switchable_cdf: [u16; 3],
+  pub tx_size_cdf: [[[u16; MAX_TX_DEPTH + 1]; TX_SIZE_CONTEXTS]; BIG_TX_CATS],
+
   pub coeff_base_cdf:
-    [[[[u16; 4 + 1]; SIG_COEF_CONTEXTS]; PLANE_TYPES]; TxSize::TX_SIZES],
-  pub coeff_br_cdf: [[[[u16; BR_CDF_SIZE + 1]; LEVEL_CONTEXTS]; PLANE_TYPES];
-    TxSize::TX_SIZES],
+    [[[[u16; 4]; SIG_COEF_CONTEXTS]; PLANE_TYPES]; TxSize::TX_SIZES],
+  pub coeff_br_cdf:
+    [[[[u16; BR_CDF_SIZE]; LEVEL_CONTEXTS]; PLANE_TYPES]; TxSize::TX_SIZES],
+  pub deblock_delta_cdf: [u16; DELTA_LF_PROBS + 1],
+  pub deblock_delta_multi_cdf: [[u16; DELTA_LF_PROBS + 1]; FRAME_LF_COUNT],
+  pub partition_w8_cdf: [[u16; 4]; PARTITION_TYPES],
+
+  pub eob_flag_cdf16: [[[u16; 5]; 2]; PLANE_TYPES],
+  pub intra_tx_2_cdf: [[[u16; 5]; INTRA_MODES]; TX_SIZE_SQR_CONTEXTS],
+
+  pub eob_flag_cdf32: [[[u16; 6]; 2]; PLANE_TYPES],
+
+  pub angle_delta_cdf: [[u16; 2 * MAX_ANGLE_DELTA + 1]; DIRECTIONAL_MODES],
+  pub eob_flag_cdf64: [[[u16; 7]; 2]; PLANE_TYPES],
+  pub intra_tx_1_cdf: [[[u16; 7]; INTRA_MODES]; TX_SIZE_SQR_CONTEXTS],
+
+  pub cfl_sign_cdf: [u16; CFL_JOINT_SIGNS],
+  pub compound_mode_cdf: [[u16; INTER_COMPOUND_MODES]; INTER_MODE_CONTEXTS],
+  pub eob_flag_cdf128: [[[u16; 8]; 2]; PLANE_TYPES],
+  pub spatial_segmentation_cdfs: [[u16; 8]; 3],
+  pub partition_w128_cdf: [[u16; 8]; PARTITION_TYPES],
+
+  pub eob_flag_cdf256: [[[u16; 9]; 2]; PLANE_TYPES],
+
+  pub eob_flag_cdf512: [[[u16; 10]; 2]; PLANE_TYPES],
+  pub partition_cdf: [[u16; EXT_PARTITION_TYPES]; 3 * PARTITION_TYPES],
+
+  pub eob_flag_cdf1024: [[[u16; 11]; 2]; PLANE_TYPES],
+
+  pub inter_tx_2_cdf: [[u16; 12]; TX_SIZE_SQR_CONTEXTS],
+
+  pub kf_y_cdf: [[[u16; INTRA_MODES]; KF_MODE_CONTEXTS]; KF_MODE_CONTEXTS],
+  pub y_mode_cdf: [[u16; INTRA_MODES]; BLOCK_SIZE_GROUPS],
+  pub uv_mode_cdf: [[u16; INTRA_MODES]; INTRA_MODES],
+
+  pub uv_mode_cfl_cdf: [[u16; UV_INTRA_MODES]; INTRA_MODES],
+
+  pub cfl_alpha_cdf: [[u16; CFL_ALPHABET_SIZE]; CFL_ALPHA_CONTEXTS],
+  pub inter_tx_1_cdf: [[u16; TX_TYPES]; TX_SIZE_SQR_CONTEXTS],
+
+  pub nmv_context: NMVContext,
 }
 
 impl CDFContext {
@@ -81,17 +103,24 @@ impl CDFContext {
       _ => 3,
     };
     CDFContext {
+      partition_w8_cdf: default_partition_w8_cdf,
+      partition_w128_cdf: default_partition_w128_cdf,
       partition_cdf: default_partition_cdf,
       kf_y_cdf: default_kf_y_mode_cdf,
       y_mode_cdf: default_if_y_mode_cdf,
       uv_mode_cdf: default_uv_mode_cdf,
+      uv_mode_cfl_cdf: default_uv_mode_cfl_cdf,
       cfl_sign_cdf: default_cfl_sign_cdf,
       cfl_alpha_cdf: default_cfl_alpha_cdf,
       newmv_cdf: default_newmv_cdf,
       zeromv_cdf: default_zeromv_cdf,
       refmv_cdf: default_refmv_cdf,
-      intra_tx_cdf: default_intra_ext_tx_cdf,
-      inter_tx_cdf: default_inter_ext_tx_cdf,
+      intra_tx_2_cdf: default_intra_tx_2_cdf,
+      intra_tx_1_cdf: default_intra_tx_1_cdf,
+      inter_tx_3_cdf: default_inter_tx_3_cdf,
+      inter_tx_2_cdf: default_inter_tx_2_cdf,
+      inter_tx_1_cdf: default_inter_tx_1_cdf,
+      tx_size_8x8_cdf: default_tx_size_8x8_cdf,
       tx_size_cdf: default_tx_size_cdf,
       txfm_partition_cdf: default_txfm_partition_cdf,
       skip_cdfs: default_skip_cdfs,
@@ -163,49 +192,32 @@ impl CDFContext {
       };
     }
 
-    for i in 0..4 {
-      self.partition_cdf[i][4] = 0;
-    }
-    for i in 4..16 {
-      self.partition_cdf[i][10] = 0;
-    }
-    for i in 16..20 {
-      self.partition_cdf[i][8] = 0;
-    }
+    reset_2d!(self.partition_w8_cdf);
+    reset_2d!(self.partition_w128_cdf);
+    reset_2d!(self.partition_cdf);
 
     reset_3d!(self.kf_y_cdf);
     reset_2d!(self.y_mode_cdf);
 
-    for i in 0..INTRA_MODES {
-      self.uv_mode_cdf[0][i][UV_INTRA_MODES - 1] = 0;
-      self.uv_mode_cdf[1][i][UV_INTRA_MODES] = 0;
-    }
+    reset_2d!(self.uv_mode_cdf);
+    reset_2d!(self.uv_mode_cfl_cdf);
     reset_1d!(self.cfl_sign_cdf);
     reset_2d!(self.cfl_alpha_cdf);
     reset_2d!(self.newmv_cdf);
     reset_2d!(self.zeromv_cdf);
     reset_2d!(self.refmv_cdf);
 
-    for i in 0..TX_SIZE_SQR_CONTEXTS {
-      for j in 0..INTRA_MODES {
-        self.intra_tx_cdf[1][i][j][7] = 0;
-        self.intra_tx_cdf[2][i][j][5] = 0;
-      }
-      self.inter_tx_cdf[1][i][16] = 0;
-      self.inter_tx_cdf[2][i][12] = 0;
-      self.inter_tx_cdf[3][i][2] = 0;
-    }
+    reset_3d!(self.intra_tx_2_cdf);
+    reset_3d!(self.intra_tx_1_cdf);
 
-    for i in 0..TX_SIZE_CONTEXTS {
-      self.tx_size_cdf[0][i][MAX_TX_DEPTH] = 0;
-    }
-    reset_2d!(self.tx_size_cdf[1]);
-    reset_2d!(self.tx_size_cdf[2]);
-    reset_2d!(self.tx_size_cdf[3]);
+    reset_2d!(self.inter_tx_3_cdf);
+    reset_2d!(self.inter_tx_2_cdf);
+    reset_2d!(self.inter_tx_1_cdf);
 
-    for i in 0..TXFM_PARTITION_CONTEXTS {
-      self.txfm_partition_cdf[i][2] = 0;
-    }
+    reset_2d!(self.tx_size_8x8_cdf);
+    reset_3d!(self.tx_size_cdf);
+
+    reset_2d!(self.txfm_partition_cdf);
 
     reset_2d!(self.skip_cdfs);
     reset_2d!(self.intra_inter_cdfs);
@@ -260,6 +272,14 @@ impl CDFContext {
   pub fn build_map(&self) -> Vec<(&'static str, usize, usize)> {
     use std::mem::size_of_val;
 
+    let partition_w8_cdf_start =
+      self.partition_w8_cdf.first().unwrap().as_ptr() as usize;
+    let partition_w8_cdf_end =
+      partition_w8_cdf_start + size_of_val(&self.partition_w8_cdf);
+    let partition_w128_cdf_start =
+      self.partition_w128_cdf.first().unwrap().as_ptr() as usize;
+    let partition_w128_cdf_end =
+      partition_w128_cdf_start + size_of_val(&self.partition_w128_cdf);
     let partition_cdf_start =
       self.partition_cdf.first().unwrap().as_ptr() as usize;
     let partition_cdf_end =
@@ -271,6 +291,10 @@ impl CDFContext {
     let uv_mode_cdf_start =
       self.uv_mode_cdf.first().unwrap().as_ptr() as usize;
     let uv_mode_cdf_end = uv_mode_cdf_start + size_of_val(&self.uv_mode_cdf);
+    let uv_mode_cfl_cdf_start =
+      self.uv_mode_cfl_cdf.first().unwrap().as_ptr() as usize;
+    let uv_mode_cfl_cdf_end =
+      uv_mode_cfl_cdf_start + size_of_val(&self.uv_mode_cfl_cdf);
     let cfl_sign_cdf_start = self.cfl_sign_cdf.as_ptr() as usize;
     let cfl_sign_cdf_end =
       cfl_sign_cdf_start + size_of_val(&self.cfl_sign_cdf);
@@ -278,14 +302,43 @@ impl CDFContext {
       self.cfl_alpha_cdf.first().unwrap().as_ptr() as usize;
     let cfl_alpha_cdf_end =
       cfl_alpha_cdf_start + size_of_val(&self.cfl_alpha_cdf);
-    let intra_tx_cdf_start =
-      self.intra_tx_cdf.first().unwrap().as_ptr() as usize;
-    let intra_tx_cdf_end =
-      intra_tx_cdf_start + size_of_val(&self.intra_tx_cdf);
-    let inter_tx_cdf_start =
-      self.inter_tx_cdf.first().unwrap().as_ptr() as usize;
-    let inter_tx_cdf_end =
-      inter_tx_cdf_start + size_of_val(&self.inter_tx_cdf);
+    let newmv_cdf_start = self.newmv_cdf.first().unwrap().as_ptr() as usize;
+    let newmv_cdf_end = newmv_cdf_start + size_of_val(&self.newmv_cdf);
+    let zeromv_cdf_start = self.zeromv_cdf.first().unwrap().as_ptr() as usize;
+    let zeromv_cdf_end = zeromv_cdf_start + size_of_val(&self.zeromv_cdf);
+    let refmv_cdf_start = self.refmv_cdf.first().unwrap().as_ptr() as usize;
+    let refmv_cdf_end = refmv_cdf_start + size_of_val(&self.refmv_cdf);
+    let intra_tx_2_cdf_start =
+      self.intra_tx_2_cdf.first().unwrap().as_ptr() as usize;
+    let intra_tx_2_cdf_end =
+      intra_tx_2_cdf_start + size_of_val(&self.intra_tx_2_cdf);
+    let intra_tx_1_cdf_start =
+      self.intra_tx_1_cdf.first().unwrap().as_ptr() as usize;
+    let intra_tx_1_cdf_end =
+      intra_tx_1_cdf_start + size_of_val(&self.intra_tx_1_cdf);
+    let inter_tx_3_cdf_start =
+      self.inter_tx_3_cdf.first().unwrap().as_ptr() as usize;
+    let inter_tx_3_cdf_end =
+      inter_tx_3_cdf_start + size_of_val(&self.inter_tx_3_cdf);
+    let inter_tx_2_cdf_start =
+      self.inter_tx_2_cdf.first().unwrap().as_ptr() as usize;
+    let inter_tx_2_cdf_end =
+      inter_tx_2_cdf_start + size_of_val(&self.inter_tx_2_cdf);
+    let inter_tx_1_cdf_start =
+      self.inter_tx_1_cdf.first().unwrap().as_ptr() as usize;
+    let inter_tx_1_cdf_end =
+      inter_tx_1_cdf_start + size_of_val(&self.inter_tx_1_cdf);
+    let tx_size_8x8_cdf_start =
+      self.tx_size_8x8_cdf.first().unwrap().as_ptr() as usize;
+    let tx_size_8x8_cdf_end =
+      tx_size_8x8_cdf_start + size_of_val(&self.tx_size_8x8_cdf);
+    let tx_size_cdf_start =
+      self.tx_size_cdf.first().unwrap().as_ptr() as usize;
+    let tx_size_cdf_end = tx_size_cdf_start + size_of_val(&self.tx_size_cdf);
+    let txfm_partition_cdf_start =
+      self.txfm_partition_cdf.first().unwrap().as_ptr() as usize;
+    let txfm_partition_cdf_end =
+      txfm_partition_cdf_start + size_of_val(&self.txfm_partition_cdf);
     let skip_cdfs_start = self.skip_cdfs.first().unwrap().as_ptr() as usize;
     let skip_cdfs_end = skip_cdfs_start + size_of_val(&self.skip_cdfs);
     let intra_inter_cdfs_start =
@@ -324,6 +377,18 @@ impl CDFContext {
       self.comp_bwd_ref_cdf.first().unwrap().as_ptr() as usize;
     let comp_bwd_ref_cdf_end =
       comp_bwd_ref_cdf_start + size_of_val(&self.comp_bwd_ref_cdf);
+    let single_ref_cdfs_start =
+      self.single_ref_cdfs.first().unwrap().as_ptr() as usize;
+    let single_ref_cdfs_end =
+      single_ref_cdfs_start + size_of_val(&self.single_ref_cdfs);
+    let drl_cdfs_start = self.drl_cdfs.first().unwrap().as_ptr() as usize;
+    let drl_cdfs_end = drl_cdfs_start + size_of_val(&self.drl_cdfs);
+    let compound_mode_cdf_start =
+      self.compound_mode_cdf.first().unwrap().as_ptr() as usize;
+    let compound_mode_cdf_end =
+      compound_mode_cdf_start + size_of_val(&self.compound_mode_cdf);
+    let nmv_context_start = &self.nmv_context as *const NMVContext as usize;
+    let nmv_context_end = nmv_context_start + size_of_val(&self.nmv_context);
     let deblock_delta_multi_cdf_start =
       self.deblock_delta_multi_cdf.first().unwrap().as_ptr() as usize;
     let deblock_delta_multi_cdf_end = deblock_delta_multi_cdf_start
@@ -398,14 +463,26 @@ impl CDFContext {
       coeff_br_cdf_start + size_of_val(&self.coeff_br_cdf);
 
     vec![
+      ("partition_w8_cdf", partition_w8_cdf_start, partition_w8_cdf_end),
+      ("partition_w128_cdf", partition_w128_cdf_start, partition_w128_cdf_end),
       ("partition_cdf", partition_cdf_start, partition_cdf_end),
       ("kf_y_cdf", kf_y_cdf_start, kf_y_cdf_end),
       ("y_mode_cdf", y_mode_cdf_start, y_mode_cdf_end),
       ("uv_mode_cdf", uv_mode_cdf_start, uv_mode_cdf_end),
+      ("uv_mode_cfl_cdf", uv_mode_cfl_cdf_start, uv_mode_cfl_cdf_end),
       ("cfl_sign_cdf", cfl_sign_cdf_start, cfl_sign_cdf_end),
       ("cfl_alpha_cdf", cfl_alpha_cdf_start, cfl_alpha_cdf_end),
-      ("intra_tx_cdf", intra_tx_cdf_start, intra_tx_cdf_end),
-      ("inter_tx_cdf", inter_tx_cdf_start, inter_tx_cdf_end),
+      ("newmv_cdf", newmv_cdf_start, newmv_cdf_end),
+      ("zeromv_cdf", zeromv_cdf_start, zeromv_cdf_end),
+      ("refmv_cdf", refmv_cdf_start, refmv_cdf_end),
+      ("intra_tx_2_cdf", intra_tx_2_cdf_start, intra_tx_2_cdf_end),
+      ("intra_tx_1_cdf", intra_tx_1_cdf_start, intra_tx_1_cdf_end),
+      ("inter_tx_3_cdf", inter_tx_3_cdf_start, inter_tx_3_cdf_end),
+      ("inter_tx_2_cdf", inter_tx_2_cdf_start, inter_tx_2_cdf_end),
+      ("inter_tx_1_cdf", inter_tx_1_cdf_start, inter_tx_1_cdf_end),
+      ("tx_size_8x8_cdf", tx_size_8x8_cdf_start, tx_size_8x8_cdf_end),
+      ("tx_size_cdf", tx_size_cdf_start, tx_size_cdf_end),
+      ("txfm_partition_cdf", txfm_partition_cdf_start, txfm_partition_cdf_end),
       ("skip_cdfs", skip_cdfs_start, skip_cdfs_end),
       ("intra_inter_cdfs", intra_inter_cdfs_start, intra_inter_cdfs_end),
       ("angle_delta_cdf", angle_delta_cdf_start, angle_delta_cdf_end),
@@ -424,6 +501,10 @@ impl CDFContext {
       ("comp_ref_type_cdf", comp_ref_type_cdf_start, comp_ref_type_cdf_end),
       ("comp_ref_cdf", comp_ref_cdf_start, comp_ref_cdf_end),
       ("comp_bwd_ref_cdf", comp_bwd_ref_cdf_start, comp_bwd_ref_cdf_end),
+      ("single_ref_cdfs", single_ref_cdfs_start, single_ref_cdfs_end),
+      ("drl_cdfs", drl_cdfs_start, drl_cdfs_end),
+      ("compound_mode_cdf", compound_mode_cdf_start, compound_mode_cdf_end),
+      ("nmv_context", nmv_context_start, nmv_context_end),
       (
         "deblock_delta_multi_cdf",
         deblock_delta_multi_cdf_start,
@@ -464,7 +545,10 @@ impl fmt::Debug for CDFContext {
 #[macro_use]
 macro_rules! symbol_with_update {
   ($self:ident, $w:ident, $s:expr, $cdf:expr) => {
-    $w.symbol_with_update($s, $cdf);
+    $w.symbol_with_update($s, $cdf, &mut $self.fc_log);
+    symbol_with_update!($self, $cdf);
+  };
+  ($self:ident, $cdf:expr) => {
     #[cfg(feature = "desync_finder")]
     {
       let cdf: &[_] = $cdf;
@@ -473,17 +557,140 @@ macro_rules! symbol_with_update {
       }
     }
   };
+  ($self:ident, $w:ident, $s:expr, $cdf:expr, $cdf_len:expr) => {
+    $w.symbol_with_update::<$cdf_len>($s, $cdf, &mut $self.fc_log);
+    symbol_with_update!($self, $cdf);
+  };
 }
 
 #[derive(Clone)]
 pub struct ContextWriterCheckpoint {
-  pub fc: CDFContext,
+  pub fc: CDFContextCheckpoint,
   pub bc: BlockContextCheckpoint,
+}
+
+struct CDFContextLogBase {
+  pub base: *const CDFContext,
+  pub data: Vec<u16>,
+}
+
+impl CDFContextLogBase {
+  fn new(fc: &CDFContext, capacity: usize) -> Self {
+    Self { base: fc as _, data: Vec::with_capacity(capacity) }
+  }
+}
+
+trait CDFContextLogSize {
+  const CDF_LEN_MAX: usize;
+}
+trait CDFContextLogOps: CDFContextLogSize {
+  #[inline(always)]
+  fn push(log: &mut CDFContextLogBase, cdf: &[u16]) {
+    debug_assert!(cdf.len() <= Self::CDF_LEN_MAX);
+    let offset = cdf.as_ptr() as usize - log.base as usize;
+    debug_assert!(offset <= u16::MAX.into());
+    unsafe {
+      // Maintain an invariant of non-zero spare capacity, so that branching
+      // may be deferred until writes are issued. Benchmarks indicate this is
+      // faster than first testing capacity and possibly reallocating.
+      let len = log.data.len();
+      let new_len = len + Self::CDF_LEN_MAX + 1;
+      let capacity = log.data.capacity();
+      debug_assert!(new_len <= capacity);
+      let dst = log.data.get_unchecked_mut(len) as *mut u16;
+      dst.copy_from_nonoverlapping(cdf.as_ptr(), Self::CDF_LEN_MAX);
+      *dst.add(Self::CDF_LEN_MAX) = offset as u16;
+      log.data.set_len(new_len);
+      if Self::CDF_LEN_MAX + 1 > capacity.wrapping_sub(new_len) {
+        log.data.reserve(Self::CDF_LEN_MAX + 1);
+      }
+    }
+  }
+  #[inline(always)]
+  fn rollback(
+    log: &mut CDFContextLogBase, fc: &mut CDFContext, checkpoint: usize,
+  ) {
+    let base = fc as *mut _ as *mut u8;
+    let mut len = log.data.len();
+    unsafe {
+      let mut src = log.data.get_unchecked_mut(len) as *mut u16;
+      while len > checkpoint {
+        len -= Self::CDF_LEN_MAX + 1;
+        src = src.sub(Self::CDF_LEN_MAX + 1);
+        let offset = *src.add(Self::CDF_LEN_MAX) as usize;
+        let dst = base.add(offset) as *mut u16;
+        dst.copy_from_nonoverlapping(src, Self::CDF_LEN_MAX);
+      }
+      log.data.set_len(len);
+    }
+  }
+}
+
+struct CDFContextLogSmall(CDFContextLogBase);
+struct CDFContextLogLarge(CDFContextLogBase);
+
+impl CDFContextLogOps for CDFContextLogSmall {}
+impl CDFContextLogOps for CDFContextLogLarge {}
+impl CDFContextLogSize for CDFContextLogSmall {
+  const CDF_LEN_MAX: usize = 4;
+}
+impl CDFContextLogSize for CDFContextLogLarge {
+  const CDF_LEN_MAX: usize = CDF_LEN_MAX;
+}
+impl CDFContextLogSmall {
+  fn new(fc: &CDFContext) -> Self {
+    Self(CDFContextLogBase::new(fc, 1 << 18))
+  }
+}
+impl CDFContextLogLarge {
+  fn new(fc: &CDFContext) -> Self {
+    Self(CDFContextLogBase::new(fc, 1 << 13))
+  }
+}
+
+pub struct CDFContextLog {
+  small: CDFContextLogSmall,
+  large: CDFContextLogLarge,
+}
+
+impl CDFContextLog {
+  pub fn new(fc: &CDFContext) -> Self {
+    Self {
+      small: CDFContextLogSmall::new(fc),
+      large: CDFContextLogLarge::new(fc),
+    }
+  }
+  fn checkpoint(&self) -> CDFContextCheckpoint {
+    CDFContextCheckpoint {
+      small: self.small.0.data.len(),
+      large: self.large.0.data.len(),
+    }
+  }
+  #[inline(always)]
+  pub fn push(&mut self, cdf: &[u16]) {
+    if cdf.len() <= CDFContextLogSmall::CDF_LEN_MAX {
+      CDFContextLogSmall::push(&mut self.small.0, cdf);
+    } else {
+      CDFContextLogLarge::push(&mut self.large.0, cdf);
+    }
+  }
+  #[inline(always)]
+  pub fn rollback(
+    &mut self, fc: &mut CDFContext, checkpoint: &CDFContextCheckpoint,
+  ) {
+    CDFContextLogSmall::rollback(&mut self.small.0, fc, checkpoint.small);
+    CDFContextLogLarge::rollback(&mut self.large.0, fc, checkpoint.large);
+  }
+  pub fn clear(&mut self) {
+    self.small.0.data.clear();
+    self.large.0.data.clear();
+  }
 }
 
 pub struct ContextWriter<'a> {
   pub bc: BlockContext<'a>,
   pub fc: &'a mut CDFContext,
+  pub fc_log: CDFContextLog,
   #[cfg(feature = "desync_finder")]
   pub fc_map: Option<FieldMap>, // For debugging purposes
 }
@@ -491,10 +698,12 @@ pub struct ContextWriter<'a> {
 impl<'a> ContextWriter<'a> {
   #[allow(clippy::let_and_return)]
   pub fn new(fc: &'a mut CDFContext, bc: BlockContext<'a>) -> Self {
+    let fc_log = CDFContextLog::new(fc);
     #[allow(unused_mut)]
     let mut cw = ContextWriter {
-      fc,
       bc,
+      fc,
+      fc_log,
       #[cfg(feature = "desync_finder")]
       fc_map: Default::default(),
     };
@@ -509,15 +718,21 @@ impl<'a> ContextWriter<'a> {
   }
 
   pub fn cdf_element_prob(cdf: &[u16], element: usize) -> u16 {
-    (if element > 0 { cdf[element - 1] } else { 32768 }) - cdf[element]
+    (if element > 0 { cdf[element - 1] } else { 32768 })
+      - (if element + 1 < cdf.len() { cdf[element] } else { 0 })
   }
 
-  pub const fn checkpoint(&self) -> ContextWriterCheckpoint {
-    ContextWriterCheckpoint { fc: *self.fc, bc: self.bc.checkpoint() }
+  pub fn checkpoint(
+    &self, tile_bo: &TileBlockOffset, chroma_sampling: ChromaSampling,
+  ) -> ContextWriterCheckpoint {
+    ContextWriterCheckpoint {
+      fc: self.fc_log.checkpoint(),
+      bc: self.bc.checkpoint(tile_bo, chroma_sampling),
+    }
   }
 
   pub fn rollback(&mut self, checkpoint: &ContextWriterCheckpoint) {
-    *self.fc = checkpoint.fc;
+    self.fc_log.rollback(&mut self.fc, &checkpoint.fc);
     self.bc.rollback(&checkpoint.bc);
     #[cfg(feature = "desync_finder")]
     {

@@ -30,13 +30,12 @@ rav1e is an AV1 video encoder. It is designed to eventually cover all use cases,
 ## Features
 * Intra, inter, and switch frames
 * 64x64 superblocks
-* 4x4 to 64x64 RDO-selected square and 2:1/1:2 rectangular blocks
+* 4x4 to 64x64 RDO-selected square and rectangular blocks
 * DC, H, V, Paeth, smooth, and all directional prediction modes
 * DCT, (FLIP-)ADST and identity transforms (up to 64x64, 16x16 and 32x32 respectively)
 * 8-, 10- and 12-bit depth color
-* 4:2:0 (full support), 4:2:2 and 4:4:4 (limited) chroma sampling
-* 11 speed settings (0-10)
-* Near real-time encoding at high speed levels
+* 4:2:0, 4:2:2 and 4:4:4 chroma sampling
+* 11 speed settings (0-10, exhaustive to near real-time)
 * Constant quantizer and target bitrate (single- and multi-pass) encoding modes
 * Still picture mode
 
@@ -47,6 +46,10 @@ Find the documentation in [`doc/`](doc/README.md)
 For the foreseeable future, a weekly pre-release of rav1e will be [published](https://github.com/xiph/rav1e/releases) every Tuesday.
 
 ## Building
+
+### Toolchain: Rust
+
+rav1e currently requires Rust 1.51.0 or later to build.
 
 ### Dependency: NASM
 Some `x86_64`-specific optimizations require [NASM](https://nasm.us/) `2.14.02` or newer and are enabled by default.
@@ -135,6 +138,8 @@ cargo install cargo-c
 cargo cinstall --release
 ```
 
+Please refer to the cargo-c [installation](https://github.com/lu-zero/cargo-c#installation) instructions.
+
 ## Usage
 ### Compressing video
 Input videos must be in [y4m format](https://wiki.multimedia.cx/index.php/YUV4MPEG2). The monochrome color format is not supported.
@@ -173,5 +178,4 @@ Find a full list in feature-table in [`Cargo.toml`](Cargo.toml)
 Please read our guide to [contributing to rav1e](CONTRIBUTING.md).
 
 ## Getting in Touch
-Come chat with us on the IRC channel #daala on Freenode! If you don't have IRC set
-up you can easily connect from your [web browser](http://webchat.freenode.net/?channels=%23daala).
+Come chat with us on the IRC channel #daala on [Libera.Chat](https://libera.chat/)! You can also use a [web client](https://web.libera.chat/?channel=#daala) to join with a web browser.

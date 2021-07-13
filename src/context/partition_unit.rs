@@ -232,11 +232,12 @@ impl<'a> ContextWriter<'a> {
   }
 
   #[inline]
-  pub fn write_skip(
-    &mut self, w: &mut dyn Writer, bo: TileBlockOffset, skip: bool,
+  pub fn write_skip<W: Writer>(
+    &mut self, w: &mut W, bo: TileBlockOffset, skip: bool,
   ) {
     let ctx = self.bc.skip_context(bo);
-    symbol_with_update!(self, w, skip as u32, &mut self.fc.skip_cdfs[ctx]);
+    let cdf = &mut self.fc.skip_cdfs[ctx];
+    symbol_with_update!(self, w, skip as u32, cdf, 2);
   }
 
   pub fn get_segment_pred(&self, bo: TileBlockOffset) -> (u8, u8) {
@@ -281,7 +282,7 @@ impl<'a> ContextWriter<'a> {
     (r as u8, cdf_index)
   }
 
-  pub fn write_cfl_alphas(&mut self, w: &mut dyn Writer, cfl: CFLParams) {
+  pub fn write_cfl_alphas<W: Writer>(&mut self, w: &mut W, cfl: CFLParams) {
     symbol_with_update!(self, w, cfl.joint_sign(), &mut self.fc.cfl_sign_cdf);
     for uv in 0..2 {
       if cfl.sign[uv] != CFL_SIGN_ZERO {
@@ -306,18 +307,22 @@ impl<'a> ContextWriter<'a> {
     let has_rows = (bo.0.y + hbs) < self.bc.blocks.rows();
     let ctx = self.bc.partition_plane_context(bo, bsize);
     assert!(ctx < PARTITION_CONTEXTS);
-    let partition_cdf = if bsize <= BlockSize::BLOCK_8X8 {
-      &mut self.fc.partition_cdf[ctx][..=PARTITION_TYPES]
-    } else {
-      &mut self.fc.partition_cdf[ctx]
-    };
 
     if !has_rows && !has_cols {
       return;
     }
 
     if has_rows && has_cols {
-      symbol_with_update!(self, w, p as u32, partition_cdf);
+      if ctx < PARTITION_TYPES {
+        let cdf = &mut self.fc.partition_w8_cdf[ctx];
+        symbol_with_update!(self, w, p as u32, cdf, 4);
+      } else if ctx < 4 * PARTITION_TYPES {
+        let cdf = &mut self.fc.partition_cdf[ctx - PARTITION_TYPES];
+        symbol_with_update!(self, w, p as u32, cdf);
+      } else {
+        let cdf = &mut self.fc.partition_w128_cdf[ctx - 4 * PARTITION_TYPES];
+        symbol_with_update!(self, w, p as u32, cdf);
+      }
     } else if !has_rows && has_cols {
       assert!(
         p == PartitionType::PARTITION_SPLIT
@@ -325,11 +330,29 @@ impl<'a> ContextWriter<'a> {
       );
       assert!(bsize > BlockSize::BLOCK_8X8);
       let mut cdf = [0u16; 2];
-      ContextWriter::partition_gather_vert_alike(
-        &mut cdf,
-        partition_cdf,
-        bsize,
-      );
+      if ctx < PARTITION_TYPES {
+        let partition_cdf = &mut self.fc.partition_w8_cdf[ctx];
+        ContextWriter::partition_gather_vert_alike(
+          &mut cdf,
+          partition_cdf,
+          bsize,
+        );
+      } else if ctx < 4 * PARTITION_TYPES {
+        let partition_cdf = &mut self.fc.partition_cdf[ctx - PARTITION_TYPES];
+        ContextWriter::partition_gather_vert_alike(
+          &mut cdf,
+          partition_cdf,
+          bsize,
+        );
+      } else {
+        let partition_cdf =
+          &mut self.fc.partition_w128_cdf[ctx - 4 * PARTITION_TYPES];
+        ContextWriter::partition_gather_vert_alike(
+          &mut cdf,
+          partition_cdf,
+          bsize,
+        );
+      }
       w.symbol((p == PartitionType::PARTITION_SPLIT) as u32, &cdf);
     } else {
       assert!(
@@ -338,11 +361,29 @@ impl<'a> ContextWriter<'a> {
       );
       assert!(bsize > BlockSize::BLOCK_8X8);
       let mut cdf = [0u16; 2];
-      ContextWriter::partition_gather_horz_alike(
-        &mut cdf,
-        partition_cdf,
-        bsize,
-      );
+      if ctx < PARTITION_TYPES {
+        let partition_cdf = &mut self.fc.partition_w8_cdf[ctx];
+        ContextWriter::partition_gather_horz_alike(
+          &mut cdf,
+          partition_cdf,
+          bsize,
+        );
+      } else if ctx < 4 * PARTITION_TYPES {
+        let partition_cdf = &mut self.fc.partition_cdf[ctx - PARTITION_TYPES];
+        ContextWriter::partition_gather_horz_alike(
+          &mut cdf,
+          partition_cdf,
+          bsize,
+        );
+      } else {
+        let partition_cdf =
+          &mut self.fc.partition_w128_cdf[ctx - 4 * PARTITION_TYPES];
+        ContextWriter::partition_gather_horz_alike(
+          &mut cdf,
+          partition_cdf,
+          bsize,
+        );
+      }
       w.symbol((p == PartitionType::PARTITION_SPLIT) as u32, &cdf);
     }
   }
@@ -376,9 +417,9 @@ impl<'a> ContextWriter<'a> {
     }
   }
 
-  pub fn write_segmentation(
-    &mut self, w: &mut dyn Writer, bo: TileBlockOffset, bsize: BlockSize,
-    skip: bool, last_active_segid: u8,
+  pub fn write_segmentation<W: Writer>(
+    &mut self, w: &mut W, bo: TileBlockOffset, bsize: BlockSize, skip: bool,
+    last_active_segid: u8,
   ) {
     let (pred, cdf_index) = self.get_segment_pred(bo);
     if skip {
@@ -465,10 +506,10 @@ impl<'a> BlockContext<'a> {
     let bw = bsize.width_mi();
     let bh = bsize.height_mi();
 
-    let above_ctx = &mut self.above_partition_context
-      [bo.0.x >> 1..(bo.0.x + bw) >> 1 as usize];
+    let above_ctx =
+      &mut self.above_partition_context[bo.0.x >> 1..(bo.0.x + bw) >> 1];
     let left_ctx = &mut self.left_partition_context
-      [bo.y_in_sb() >> 1..(bo.y_in_sb() + bh) >> 1 as usize];
+      [bo.y_in_sb() >> 1..(bo.y_in_sb() + bh) >> 1];
 
     // update the partition context at the end notes. set partition bits
     // of block sizes larger than the current one to be one, and partition
